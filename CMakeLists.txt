@@ -10,10 +10,19 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES native)
 endif()
 
-# TensorRT location (default: userland dpkg -x extract).
-set(AJI_TRT_ROOT "$ENV{HOME}/sdk/tensorrt/usr" CACHE PATH "TensorRT root")
-set(AJI_TRT_INCLUDE "${AJI_TRT_ROOT}/include/x86_64-linux-gnu")
-set(AJI_TRT_LIB "${AJI_TRT_ROOT}/lib/x86_64-linux-gnu")
+# TensorRT location (default: userland dpkg -x extract on Linux; on Windows
+# pass -DAJI_TRT_ROOT=<dir with nvinfer_10.dll, nvinfer_10.lib, include/>).
+if(WIN32)
+    set(AJI_TRT_ROOT "" CACHE PATH "TensorRT root")
+    set(AJI_TRT_INCLUDE "${AJI_TRT_ROOT}/include")
+    set(AJI_TRT_LIB "${AJI_TRT_ROOT}")
+    set(AJI_NVINFER nvinfer_10)
+else()
+    set(AJI_TRT_ROOT "$ENV{HOME}/sdk/tensorrt/usr" CACHE PATH "TensorRT root")
+    set(AJI_TRT_INCLUDE "${AJI_TRT_ROOT}/include/x86_64-linux-gnu")
+    set(AJI_TRT_LIB "${AJI_TRT_ROOT}/lib/x86_64-linux-gnu")
+    set(AJI_NVINFER nvinfer)
+endif()
 
 find_package(CUDAToolkit REQUIRED)
 
@@ -22,7 +31,7 @@ target_include_directories(aji
     PUBLIC include
     PRIVATE ${AJI_TRT_INCLUDE})
 target_link_directories(aji PRIVATE ${AJI_TRT_LIB})
-target_link_libraries(aji PRIVATE nvinfer CUDA::cuda_driver CUDA::cudart)
+target_link_libraries(aji PRIVATE ${AJI_NVINFER} CUDA::cuda_driver CUDA::cudart)
 set_target_properties(aji PROPERTIES
     BUILD_RPATH "${AJI_TRT_LIB}"
     INSTALL_RPATH "${AJI_TRT_LIB}"
