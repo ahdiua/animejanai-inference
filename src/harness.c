@@ -1,14 +1,18 @@
 /*
  * aji_harness — CLI test harness for the aji shim. No player involved.
  *
- * Reads raw NV12/P010 frames from a file, runs them through aji_infer on
- * the GPU, optionally writes the upscaled raw frames, and reports
- * per-frame device timing (CUDA events around the full pre+infer+post
- * enqueue, measured on the stream).
+ * Direct mode (--engine) or conf mode (--conf/--model-dir/--trtexec/--slot).
+ * Reads raw NV12/P010 frames, runs aji_infer on the GPU, optionally writes
+ * the upscaled raw frames, reports per-frame device timing.
  *
  * Usage:
- *   aji_harness --engine E.engine --input in.raw --width W --height H
- *               [--format nv12|p010] [--frames N] [--output out.raw]
+ *   aji_harness --input in.raw --width W --height H [--format nv12|p010]
+ *               [--matrix 601|709|2020] [--range limited|full]
+ *               [--siting left|center|topleft] [--fps F] [--frames N]
+ *               [--output out.raw] [--dump-rgb pre.f16]
+ *               ( --engine E.engine | --conf animejanai.conf
+ *                 --model-dir DIR --trtexec PATH [--trtexec-env K=V]
+ *                 [--slot N] )
  */
 
 #include <stdio.h>
@@ -31,29 +35,38 @@
 static void log_cb(void *opaque, int level, const char *msg)
 {
     (void)opaque;
-    if (level <= 2) // TRT INTERNAL_ERROR/ERROR/WARNING
+    if (level <= 2)
         fprintf(stderr, "[trt:%d] %s\n", level, msg);
 }
 
 int main(int argc, char **argv)
 {
     const char *engine = NULL, *input = NULL, *output = NULL;
-    const char *format = "nv12";
-    int w = 0, h = 0, max_frames = 1 << 30;
+    const char *conf = NULL, *model_dir = NULL, *trtexec = NULL, *trtexec_env = NULL;
+    const char *format = "nv12", *matrix = "709", *range = "limited", *siting = "left";
+    int w = 0, h = 0, max_frames = 1 << 30, slot = 1;
+    double fps = 23.976;
 
     for (int i = 1; i < argc - 1; i++) {
         if (!strcmp(argv[i], "--engine")) engine = argv[++i];
+        else if (!strcmp(argv[i], "--conf")) conf = argv[++i];
+        else if (!strcmp(argv[i], "--model-dir")) model_dir = argv[++i];
+        else if (!strcmp(argv[i], "--trtexec")) trtexec = argv[++i];
+        else if (!strcmp(argv[i], "--trtexec-env")) trtexec_env = argv[++i];
+        else if (!strcmp(argv[i], "--slot")) slot = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--input")) input = argv[++i];
         else if (!strcmp(argv[i], "--output")) output = argv[++i];
         else if (!strcmp(argv[i], "--format")) format = argv[++i];
+        else if (!strcmp(argv[i], "--matrix")) matrix = argv[++i];
+        else if (!strcmp(argv[i], "--range")) range = argv[++i];
+        else if (!strcmp(argv[i], "--siting")) siting = argv[++i];
+        else if (!strcmp(argv[i], "--fps")) fps = atof(argv[++i]);
         else if (!strcmp(argv[i], "--width")) w = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--height")) h = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--frames")) max_frames = atoi(argv[++i]);
     }
-    if (!engine || !input || w < 2 || h < 2) {
-        fprintf(stderr, "usage: %s --engine E --input raw --width W --height H"
-                        " [--format nv12|p010] [--frames N] [--output raw]\n",
-                argv[0]);
+    if ((!engine && !conf) || !input || w < 2 || h < 2) {
+        fprintf(stderr, "missing required args (see header comment)\n");
         return 2;
     }
 
@@ -65,7 +78,12 @@ int main(int argc, char **argv)
 
     aji_create_params params = {
         .api_version = AJI_API_VERSION,
-        .cuda_context = NULL, // primary ctx; harness uses the same via runtime
+        .cuda_context = NULL,
+        .conf_path = conf,
+        .model_dir = model_dir,
+        .trtexec = trtexec,
+        .trtexec_env = trtexec_env,
+        .slot = slot,
         .engine_path = engine,
         .max_width = w,
         .max_height = h,
@@ -76,11 +94,21 @@ int main(int argc, char **argv)
         fprintf(stderr, "aji_create failed\n");
         return 1;
     }
-    const int scale = aji_scale_factor(aji);
-    const int ow = w * scale, oh = h * scale;
+
+    int ow = 0, oh = 0;
+    int act = aji_configure(aji, w, h, fps, &ow, &oh);
+    if (act < 0) {
+        fprintf(stderr, "aji_configure: %d: %s\n", act, aji_last_error(aji));
+        return 1;
+    }
+    printf("%s\n", aji_current_log(aji));
+    if (act == 0) {
+        printf("no chain active (passthrough); nothing to do\n");
+        return 0;
+    }
+    printf("configured: %dx%d %s -> %dx%d\n", w, h, format, ow, oh);
+
     const size_t oy_sz = (size_t)ow * oh * bpp, ouv_sz = oy_sz / 2;
-    printf("engine: %s, scale %dx, %dx%d %s -> %dx%d\n", engine, scale, w, h,
-           format, ow, oh);
 
     FILE *fin = fopen(input, "rb");
     if (!fin) { perror(input); return 1; }
@@ -91,9 +119,17 @@ int main(int argc, char **argv)
     CK(cudaMallocHost(&h_in, frame_sz));
     CK(cudaMallocHost(&h_out, oy_sz + ouv_sz));
 
+    const int mat = !strcmp(matrix, "601") ? AJI_MATRIX_BT601 :
+                    !strcmp(matrix, "2020") ? AJI_MATRIX_BT2020 : AJI_MATRIX_BT709;
+    const int rng = !strcmp(range, "full") ? AJI_RANGE_FULL : AJI_RANGE_LIMITED;
+    const int sit = !strcmp(siting, "center") ? AJI_SITING_CENTER :
+                    !strcmp(siting, "topleft") ? AJI_SITING_TOPLEFT : AJI_SITING_LEFT;
+
     aji_frame in = {.width = w, .height = h, .format = fmt,
+                    .matrix = mat, .range = rng, .siting = sit,
                     .stride = {(ptrdiff_t)(w * bpp), (ptrdiff_t)(w * bpp)}};
     aji_frame out = {.width = ow, .height = oh, .format = fmt,
+                     .matrix = mat, .range = rng, .siting = sit,
                      .stride = {(ptrdiff_t)(ow * bpp), (ptrdiff_t)(ow * bpp)}};
     CK(cudaMalloc(&in.plane[0], y_sz));
     CK(cudaMalloc(&in.plane[1], uv_sz));
@@ -145,8 +181,8 @@ int main(int argc, char **argv)
         n++;
     }
 
-    printf("frames: %d, device pre+infer+post: %.3f ms/frame avg "
-           "(%d timed frames)\n", n, timed ? total_ms / timed : 0.0, timed);
+    printf("frames: %d, device chain time: %.3f ms/frame avg (%d timed)\n",
+           n, timed ? total_ms / timed : 0.0, timed);
 
     if (fout) fclose(fout);
     fclose(fin);

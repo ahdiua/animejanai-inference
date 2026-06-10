@@ -26,7 +26,7 @@ endif()
 
 find_package(CUDAToolkit REQUIRED)
 
-add_library(aji SHARED src/aji_trt.cpp src/kernels.cu)
+add_library(aji SHARED src/aji_trt.cpp src/aji_conf.cpp src/kernels.cu)
 target_include_directories(aji
     PUBLIC include
     PRIVATE ${AJI_TRT_INCLUDE})
