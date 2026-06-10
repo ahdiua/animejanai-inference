@@ -1,0 +1,7 @@
+build/
+models/
+fixtures/*.raw
+fixtures/*.png
+fixtures/*.mkv
+sanity/saxpy
+*.engine
