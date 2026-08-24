@@ -208,13 +208,13 @@ select_engine() {
     ENGINE_FILE=$(readlink -f "$ENGINE_FILE")
     echo -e "${GREEN}✔ 已选择 Engine: ${BOLD}${ENGINE_FILE}${NC}"
 
-    # 针对 1080p 输入与 4x 模型的显存与流水线优化
-    if [ "$SRC_HEIGHT" -ge 1080 ] || [ "$SRC_WIDTH" -ge 1920 ]; then
-        if [[ "$ENGINE_FILE" == *"realesrgan"* ]] || [[ "$ENGINE_FILE" == *"anime6b"* ]] || [[ "$ENGINE_FILE" == *"4x"* ]]; then
-            echo -e "\n${CYAN}ℹ️  [提示] 输入视频为 1080p (${SRC_WIDTH}x${SRC_HEIGHT})，所选模型为 4x Real-ESRGAN 模型（直推输出 8K 分辨率）。${NC}"
-            echo -e "${GREEN}   - 经过底层 CUDA 帧池瘦身与流水线优化，已自动为您加入 --pipeline-depth 2 保证 24GB 显存平稳运行。${NC}"
-            EXTRA_FLAGS+=("--pipeline-depth" "2")
-        fi
+    # 针对 4x / 2x 视频模型的适配与优化提示
+    if [[ "$ENGINE_FILE" == *"anime6b"* ]] || [[ "$ENGINE_FILE" == *"4x"* ]]; then
+        echo -e "\n${CYAN}ℹ️  [提示] 所选模型为 4x 模型（直推输出 4x 超高分辨率）。${NC}"
+        echo -e "${GREEN}   - 经过底层 CUDA 帧池瘦身与流水线优化，已自动为您加入 --pipeline-depth 2 保证显存平稳运行。${NC}"
+        EXTRA_FLAGS+=("--pipeline-depth" "2")
+    elif [[ "$ENGINE_FILE" == *"animevideov3"* ]] || [[ "$ENGINE_FILE" == *"animevideo"* ]]; then
+        echo -e "\n${GREEN}✔ [已选用] RealESRGAN AnimeVideoV3 动漫视频专用轻量模型。${NC}"
     fi
     echo ""
 }

@@ -915,6 +915,7 @@ download_and_build_engine() {
     local perf_sharp_onnx="${MODELS_DIR}/performance_sharp1.onnx"
     local balanced_sharp_onnx="${MODELS_DIR}/balanced_sharp1.onnx"
     local sd_compact_onnx="${MODELS_DIR}/sd_compact.onnx"
+    local animevideo_onnx="${MODELS_DIR}/realesr_animevideov3.onnx"
     local anime6b_onnx="${MODELS_DIR}/realesrgan_anime6b.onnx"
 
     echo -e "请选择操作："
@@ -923,9 +924,10 @@ download_and_build_engine() {
     echo -e "  ${BOLD}3)${NC} 获取 AnimeJaNai V3.1 Balanced (2x, 均衡推荐)"
     echo -e "  ${BOLD}4)${NC} 获取 AnimeJaNai V3.1 Sharp1 (2x, 清晰锐化增强版)"
     echo -e "  ${BOLD}5)${NC} 获取 AnimeJaNai SD Compact (2x, 标清老番修复版)"
-    echo -e "  ${BOLD}6)${NC} 下载 Real-ESRGAN Anime 6B (4x, 经典原版动漫模型)"
-    echo -e "  ${BOLD}7)${NC} 自定义 ONNX 模型下载链接 / 本地已有路径"
-    read -rp "请输入选项 [1-7, 默认 1]: " model_choice
+    echo -e "  ${BOLD}6)${NC} 获取 RealESRGAN AnimeVideoV3 (2x/4x, 专为动漫视频优化的轻量视频模型)"
+    echo -e "  ${BOLD}7)${NC} 下载 Real-ESRGAN Anime 6B (4x, 经典原版动漫模型)"
+    echo -e "  ${BOLD}8)${NC} 自定义 ONNX 模型下载链接 / 本地已有路径"
+    read -rp "请输入选项 [1-8, 默认 1]: " model_choice
     model_choice=${model_choice:-1}
 
     local target_onnx_list=()
@@ -953,10 +955,19 @@ download_and_build_engine() {
             target_onnx_list=("$sd_compact_onnx")
             ;;
         6)
+            read -rp "请输入 RealESRGAN AnimeVideoV3 ONNX 下载 URL 或本地已有路径: " v3_input
+            if [ -f "$v3_input" ]; then
+                target_onnx_list=("$v3_input")
+            else
+                download_model_file "$animevideo_onnx" "$v3_input" "" "RealESRGAN AnimeVideoV3"
+                target_onnx_list=("$animevideo_onnx")
+            fi
+            ;;
+        7)
             download_model_file "$anime6b_onnx" "$DEFAULT_ONNX_REALESRGAN_ANIME6B_URL" "$DEFAULT_ONNX_REALESRGAN_ANIME6B_MIRROR" "Real-ESRGAN Anime 6B (4x)"
             target_onnx_list=("$anime6b_onnx")
             ;;
-        7)
+        8)
             read -rp "请输入 ONNX 下载 URL 或本地绝对路径: " custom_input
             if [ -f "$custom_input" ]; then
                 target_onnx_list=("$custom_input")
