@@ -238,22 +238,21 @@ ls -lh build/libaji.so build/libaji_trt.so build/aji_harness build/aji_encode
 
 推荐常用超分模型：
 
-| 模型名称 | 用途 | 速度 / 倍率 |
-|----------|------|-------------|
-| `2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx` (`performance.onnx`) | 2× 超分（极速偏画质） | ⚡⚡⚡ 最快 (2x) |
-| `2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx` (`balanced.onnx`) | 2× 超分（画质与速度均衡） | ⚡⚡ 均衡 (2x) |
-| `RealESRGAN_x4plus_anime_6B.onnx` (`realesrgan_anime6b.onnx`) | 4× 经典原版动漫超分（线条强化与降噪） | ⚡ 经典 (4x) |
+| 模型名称 | 用途 | 速度 / 倍率 | 输入节点名 |
+|----------|------|-------------|------------|
+| `2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx` (`performance.onnx`) | 2× 超分（极速偏画质 - 推荐） | ⚡⚡⚡ 最快 (2x) | `input` |
+| `2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx` (`balanced.onnx`) | 2× 超分（画质与速度均衡） | ⚡⚡ 均衡 (2x) | `input` |
+| `2x_AnimeJaNai_HD_V3.1Sharp1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx` (`balanced_sharp1.onnx`) | 2× 超分（清晰锐化版） | ⚡⚡ 锐化 (2x) | `input` |
+| `2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo.onnx` (`sd_compact.onnx`) | 2× 标清修复（适合 480p/老番） | ⚡⚡ 标清 (2x) | `input` |
+| `RealESRGAN_x4plus_anime_6B.onnx` (`realesrgan_anime6b.onnx`) | 4× 经典原版动漫超分（线条强化与降噪） | ⚡ 经典 (4x) | `image.1` |
 
 ```bash
 # 创建模型目录
 mkdir -p ~/models
 
-# 1 & 2: 获取 AnimeJaNai 官方 V3.1 Performance & Balanced 模型 (从官方资源包解压)
-wget -O /tmp/animejanai_overlay.7z "https://github.com/the-database/mpv-AnimeJaNai/releases/download/3.6.0/mpv-upscale-2x_animejanai-overlay-3.6.0-linux-x64.7z"
-7z e -y /tmp/animejanai_overlay.7z -o/tmp/extracted_models "*SPANF3*"
-cp /tmp/extracted_models/*Performance_SPANF3*b5f48*.onnx ~/models/performance.onnx
-cp /tmp/extracted_models/*Balanced_SPANF3*b8f64*.onnx ~/models/balanced.onnx
-rm -rf /tmp/animejanai_overlay.7z /tmp/extracted_models
+# 1 & 2: 获取 AnimeJaNai 官方 V3.1 模型 (R2 CDN 高速直连秒级下载)
+wget -O ~/models/performance.onnx "https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx"
+wget -O ~/models/balanced.onnx "https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx"
 
 # 3: 下载原版 Real-ESRGAN Anime 6B (4x)
 wget -O ~/models/realesrgan_anime6b.onnx \
@@ -269,8 +268,7 @@ wget -O ~/models/realesrgan_anime6b.onnx \
 > 每台新机器必须用 `trtexec` 从 ONNX 重新构建。构建约需 1-2 分钟。
 
 ```bash
-# 为你的 GPU 构建 Engine（以 1080p 输入为例）
-# 注意：TensorRT 11+ 已默认开启强类型 FP16，无需且不支持 --fp16 选项；TensorRT 10 及以下版本可加上 --fp16
+# 1. 为 AnimeJaNai 构建 Engine（输入节点为 input，以 1080p 为例）
 trtexec \
   --onnx=~/models/performance.onnx \
   --minShapes=input:1x3x64x64 \
@@ -278,6 +276,15 @@ trtexec \
   --maxShapes=input:1x3x1080x1920 \
   --skipInference \
   --saveEngine=~/models/performance_1080p.engine
+
+# 2. 为 Real-ESRGAN 构建 Engine（注意：其输入节点名称为 image.1）
+trtexec \
+  --onnx=~/models/realesrgan_anime6b.onnx \
+  --minShapes=image.1:1x3x64x64 \
+  --optShapes=image.1:1x3x1080x1920 \
+  --maxShapes=image.1:1x3x1080x1920 \
+  --skipInference \
+  --saveEngine=~/models/realesrgan_anime6b_1080p.engine
 ```
 
 ### 构建参数说明
