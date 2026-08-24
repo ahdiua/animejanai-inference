@@ -37,6 +37,25 @@ FFMPEG_INSTALL_DIR="/opt/ffmpeg"
 NVENC_FIX_SO="/opt/libnvenc_fix.so"
 AJI_ENCODE_BIN="${PROJECT_ROOT}/build/aji_encode"
 
+# 全局配置变量初始化
+INPUT_VIDEO=""
+ENGINE_FILE=""
+OUTPUT_VIDEO=""
+SRC_WIDTH=1920
+SRC_HEIGHT=1080
+SRC_CODEC="未知"
+SRC_FPS="24"
+SRC_DURATION="未知"
+IS_CLIP=0
+CLIP_START="00:01:00"
+CLIP_DURATION="60"
+VCODEC="hevc_nvenc"
+VQUALITY="-cq 18 -preset p7 -tune hq"
+DECODER="nvdec"
+PIX_FMT="yuv420p10"
+OVERWRITE_FLAG=""
+EXTRA_FLAGS=()
+
 print_header() {
     clear 2>/dev/null || true
     echo -e "${CYAN}==============================================================================${NC}"
@@ -82,7 +101,7 @@ select_input_video() {
         mapfile -t found_videos < <(printf "%s\n" "${raw_found[@]}" | sort -u)
     fi
 
-    local input_video=""
+    INPUT_VIDEO=""
 
     if [ ${#found_videos[@]} -gt 0 ]; then
         echo -e "在系统中自动检索到以下视频文件："
@@ -96,37 +115,31 @@ select_input_video() {
         v_idx=${v_idx:-1}
 
         if [ "$v_idx" -le "${#found_videos[@]}" ] && [ "$v_idx" -ge 1 ]; then
-            input_video="${found_videos[$((v_idx-1))]}"
+            INPUT_VIDEO="${found_videos[$((v_idx-1))]}"
         fi
     fi
 
-    while [ -z "$input_video" ] || [ ! -f "$input_video" ]; do
+    while [ -z "$INPUT_VIDEO" ] || [ ! -f "$INPUT_VIDEO" ]; do
         read -rp "请输入待超分视频文件的绝对或相对路径: " manual_input
         manual_input=$(echo "$manual_input" | sed -e "s/^['\"]//" -e "s/['\"]$//")
         if [ -f "$manual_input" ]; then
-            input_video="$manual_input"
+            INPUT_VIDEO="$manual_input"
         else
             echo -e "${RED}[错误] 文件不存在: ${manual_input}，请重新输入！${NC}"
         fi
     done
 
-    input_video=$(readlink -f "$input_video")
-    echo -e "${GREEN}✔ 已选择输入视频: ${BOLD}${input_video}${NC}\n"
+    INPUT_VIDEO=$(readlink -f "$INPUT_VIDEO")
+    echo -e "${GREEN}✔ 已选择输入视频: ${BOLD}${INPUT_VIDEO}${NC}\n"
 
     # 使用 ffprobe 获取视频详细元数据
     export PATH="${FFMPEG_INSTALL_DIR}/bin:$PATH"
-    SRC_WIDTH=1920
-    SRC_HEIGHT=1080
-    SRC_CODEC="未知"
-    SRC_FPS="24"
-    SRC_DURATION="未知"
-
     if command -v ffprobe &>/dev/null; then
-        SRC_WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$input_video" 2>/dev/null || echo 1920)
-        SRC_HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$input_video" 2>/dev/null || echo 1080)
-        SRC_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$input_video" 2>/dev/null || echo "未知")
-        SRC_FPS=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$input_video" 2>/dev/null || echo "24")
-        SRC_DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$input_video" 2>/dev/null | awk '{printf "%.1f 分钟", $1/60}' || echo "未知")
+        SRC_WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$INPUT_VIDEO" 2>/dev/null || echo 1920)
+        SRC_HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$INPUT_VIDEO" 2>/dev/null || echo 1080)
+        SRC_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$INPUT_VIDEO" 2>/dev/null || echo "未知")
+        SRC_FPS=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$INPUT_VIDEO" 2>/dev/null || echo "24")
+        SRC_DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$INPUT_VIDEO" 2>/dev/null | awk '{printf "%.1f 分钟", $1/60}' || echo "未知")
     fi
 
     SRC_WIDTH=${SRC_WIDTH:-1920}
@@ -224,8 +237,8 @@ select_clip_mode() {
 select_output_path() {
     echo -e "${BOLD}${CYAN}[步骤 4/7] 设置输出文件路径 (Output Destination)${NC}"
 
-    local dir_name="$(dirname "$input_video")"
-    local base_name="$(basename "$input_video")"
+    local dir_name="$(dirname "$INPUT_VIDEO")"
+    local base_name="$(basename "$INPUT_VIDEO")"
     local raw_name="${base_name%.*}"
     local ext="${base_name##*.}"
 
@@ -379,7 +392,7 @@ select_optional_flags() {
 generate_final_command_and_script() {
     local gen_script_path="${PROJECT_ROOT}/run_encode.sh"
     local clip_intermediate="${PROJECT_ROOT}/temp_clip_for_test.mkv"
-    local effective_input="$input_video"
+    local effective_input="$INPUT_VIDEO"
 
     local preload_str=""
     if [ -f "$NVENC_FIX_SO" ]; then
@@ -419,7 +432,7 @@ ${preload_str}
 
 echo -e "\033[1;36m==============================================================================\033[0m"
 echo -e "\033[1;35m🚀 开始执行 AnimeJaNai 视频超分压制任务\033[0m"
-echo -e "  - 输入文件: ${input_video}"
+echo -e "  - 输入文件: ${INPUT_VIDEO}"
 echo -e "  - 输出文件: ${OUTPUT_VIDEO}"
 echo -e "  - Engine:   ${ENGINE_FILE}"
 echo -e "  - 编码器:   ${VCODEC} (${VQUALITY})"
@@ -432,7 +445,7 @@ EOF
         cat << EOF >> "$gen_script_path"
 # 2. 截取测试片段 (${CLIP_START}, 时长 ${CLIP_DURATION} 秒)
 echo -e "\033[0;33m[前置] 正在流拷贝无损快速截取 ${CLIP_DURATION} 秒测试片段...\033[0m"
-ffmpeg -y -ss "${CLIP_START}" -i "${input_video}" -t "${CLIP_DURATION}" -c copy "${clip_intermediate}"
+ffmpeg -y -ss "${CLIP_START}" -i "${INPUT_VIDEO}" -t "${CLIP_DURATION}" -c copy "${clip_intermediate}"
 
 # 3. 运行超分压制
 echo -e "\033[0;32m[核心] 启动 aji_encode 进行超分推理与编码...\033[0m"
@@ -484,7 +497,7 @@ EOF
 
     echo -e "\n${CYAN}# 2. 执行超分命令：${NC}"
     if [ "$IS_CLIP" -eq 1 ]; then
-        echo -e "${BOLD}ffmpeg -y -ss ${CLIP_START} -i \"${input_video}\" -t ${CLIP_DURATION} -c copy \"${clip_intermediate}\" && \\${NC}"
+        echo -e "${BOLD}ffmpeg -y -ss ${CLIP_START} -i \"${INPUT_VIDEO}\" -t ${CLIP_DURATION} -c copy \"${clip_intermediate}\" && \\${NC}"
     fi
     echo -e "${BOLD}${AJI_ENCODE_BIN} \\"
     for ((i=0; i<${#cmd_args[@]}; i+=2)); do
