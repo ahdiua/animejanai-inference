@@ -52,7 +52,7 @@ IS_CLIP=0
 CLIP_START="00:01:00"
 CLIP_DURATION="60"
 VCODEC="hevc_nvenc"
-VQUALITY="-cq 18 -preset p7 -tune hq"
+VQUALITY="-cq 18 -preset p7 -tune hq -split_encode_mode 2"
 DECODER="nvdec"
 PIX_FMT="yuv420p10"
 OVERWRITE_FLAG=""
@@ -302,22 +302,29 @@ select_encoder_and_quality() {
 
     echo -e "\n请选择画质与预设参数 (VQuality Preset)："
     if [[ "$VCODEC" == *"nvenc"* ]]; then
-        echo -e "  ${BOLD}1)${NC} ${GREEN}高质量动漫推荐: -cq 18 -preset p7 -tune hq${NC} (兼顾绝佳画质与合理体积)"
-        echo -e "  ${BOLD}2)${NC} 标准平衡预设:   -cq 20 -preset p6 (默认标准)"
-        echo -e "  ${BOLD}3)${NC} 高速压制预设:   -cq 23 -preset p4 (速度优先)"
+        local nvenc_extra="-tune hq"
+        if [[ "$VCODEC" == "hevc_nvenc" ]]; then
+            # Ada 等配有多个 NVENC 的 GPU 可借此并行编码同一 HEVC 帧；
+            # 单 NVENC GPU 会保持单路编码。H.264 不支持 split encode。
+            nvenc_extra+=" -split_encode_mode 2"
+        fi
+
+        echo -e "  ${BOLD}1)${NC} ${GREEN}高质量动漫推荐: -cq 18 -preset p7 ${nvenc_extra}${NC} (兼顾绝佳画质与合理体积)"
+        echo -e "  ${BOLD}2)${NC} 标准平衡预设:   -cq 20 -preset p6 ${nvenc_extra} (默认标准)"
+        echo -e "  ${BOLD}3)${NC} 高速压制预设:   -cq 23 -preset p4 ${nvenc_extra} (速度优先)"
         echo -e "  ${BOLD}4)${NC} 自定义输入参数"
         read -rp "请选择画质档位 [1-4, 默认 1]: " q_choice
         q_choice=${q_choice:-1}
 
         case "$q_choice" in
-            1) VQUALITY="-cq 18 -preset p7 -tune hq" ;;
-            2) VQUALITY="-cq 20 -preset p6" ;;
-            3) VQUALITY="-cq 23 -preset p4" ;;
+            1) VQUALITY="-cq 18 -preset p7 ${nvenc_extra}" ;;
+            2) VQUALITY="-cq 20 -preset p6 ${nvenc_extra}" ;;
+            3) VQUALITY="-cq 23 -preset p4 ${nvenc_extra}" ;;
             4)
                 read -rp "请输入自定义 FFmpeg 编码参数 (如 -cq 16 -preset p7): " custom_q
-                VQUALITY="${custom_q:--cq 18 -preset p7 -tune hq}"
+                VQUALITY="${custom_q:--cq 18 -preset p7 ${nvenc_extra}}"
                 ;;
-            *) VQUALITY="-cq 18 -preset p7 -tune hq" ;;
+            *) VQUALITY="-cq 18 -preset p7 ${nvenc_extra}" ;;
         esac
     else
         echo -e "  ${BOLD}1)${NC} CRF 18 (高质量) -preset slow"
