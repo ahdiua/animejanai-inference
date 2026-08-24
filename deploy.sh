@@ -31,9 +31,12 @@ NVENC_FIX_SO="/opt/libnvenc_fix.so"
 NVENC_FIX_SRC_URL="https://raw.githubusercontent.com/flexgrip/nvidia-gpu-enumeration/master/nvenc_fix.c"
 NVENC_FIX_SRC_MIRROR="https://ghproxy.net/https://raw.githubusercontent.com/flexgrip/nvidia-gpu-enumeration/master/nvenc_fix.c"
 
-# AnimeJaNai 官方发布资源包 (内含 V3.1 Performance 与 Balanced 等全部高清超分 ONNX 模型)
-ANIMEJANAI_OVERLAY_URL="https://github.com/the-database/mpv-AnimeJaNai/releases/download/3.6.0/mpv-upscale-2x_animejanai-overlay-3.6.0-linux-x64.7z"
-ANIMEJANAI_OVERLAY_MIRROR="https://ghproxy.net/https://github.com/the-database/mpv-AnimeJaNai/releases/download/3.6.0/mpv-upscale-2x_animejanai-overlay-3.6.0-linux-x64.7z"
+# AnimeJaNai 官方直链 (R2 CDN 高速直连下载，秒级获取无需解压)
+URL_ANIMEJANAI_V31_PERF="https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx"
+URL_ANIMEJANAI_V31_BAL="https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx"
+URL_ANIMEJANAI_V31_PERF_SHARP="https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1Sharp1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx"
+URL_ANIMEJANAI_V31_BAL_SHARP="https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1Sharp1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx"
+URL_ANIMEJANAI_SD_COMPACT="https://r2.ahdiua.com/2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo.onnx"
 
 # Real-ESRGAN Anime 6B 经典动漫模型 (Hugging Face / HF-Mirror)
 DEFAULT_ONNX_REALESRGAN_ANIME6B_URL="https://huggingface.co/deepghs/imgutils-models/resolve/main/real_esrgan/RealESRGAN_x4plus_anime_6B.onnx"
@@ -827,66 +830,14 @@ download_model_file() {
 }
 
 # 批量下载并提取 AnimeJaNai V3.1 官方高清超分模型
+# 批量下载 AnimeJaNai V3.1 官方超分模型 (直链秒级下载，无需解压)
 download_animejanai_models() {
     local perf_dest="${MODELS_DIR}/performance.onnx"
     local bal_dest="${MODELS_DIR}/balanced.onnx"
 
-    if [ -s "$perf_dest" ] && [ -s "$bal_dest" ]; then
-        echo -e "${GREEN}✔ AnimeJaNai Performance 与 Balanced 模型均已存在！${NC}"
-        return 0
-    fi
-
-    echo -e "${CYAN}正在下载 AnimeJaNai V3.1 官方模型资源包 (约 37MB)...${NC}"
-    local tmp_7z="/tmp/animejanai_overlay.7z"
-    local extract_dir="/tmp/animejanai_models_extracted"
-    
-    if ! wget -q --show-progress -O "$tmp_7z" "$ANIMEJANAI_OVERLAY_URL"; then
-        echo -e "${YELLOW}主链接下载失败，正在尝试镜像加速链接...${NC}"
-        wget -q --show-progress -O "$tmp_7z" "$ANIMEJANAI_OVERLAY_MIRROR" || true
-    fi
-
-    if [ ! -s "$tmp_7z" ]; then
-        echo -e "${RED}[错误] 下载 AnimeJaNai 官方资源包失败，请检查网络！${NC}"
-        rm -f "$tmp_7z"
-        return 1
-    fi
-
-    echo -e "${CYAN}正在提取 Performance 与 Balanced ONNX 模型...${NC}"
-    rm -rf "$extract_dir"
-    mkdir -p "$extract_dir"
-
-    if command -v 7z &>/dev/null; then
-        7z e -y "$tmp_7z" -o"$extract_dir" "*SPANF3*" &>/dev/null || 7z x -y "$tmp_7z" -o"$extract_dir" &>/dev/null
-    elif command -v 7zz &>/dev/null; then
-        7zz e -y "$tmp_7z" -o"$extract_dir" "*SPANF3*" &>/dev/null || 7zz x -y "$tmp_7z" -o"$extract_dir" &>/dev/null
-    else
-        python3 -m pip install py7zr -q 2>/dev/null || "$VENV_DIR/bin/pip" install py7zr -q 2>/dev/null || true
-        python3 -c "
-import py7zr
-with py7zr.SevenZipFile('$tmp_7z', mode='r') as z:
-    z.extractall(path='$extract_dir')
-" 2>/dev/null || "$VENV_DIR/bin/python3" -c "
-import py7zr
-with py7zr.SevenZipFile('$tmp_7z', mode='r') as z:
-    z.extractall(path='$extract_dir')
-" 2>/dev/null || true
-    fi
-
-    local found_perf=$(find "$extract_dir" -name "*Performance_SPANF3*b5f48*.onnx" 2>/dev/null | head -n 1)
-    local found_bal=$(find "$extract_dir" -name "*Balanced_SPANF3*b8f64*.onnx" 2>/dev/null | head -n 1)
-
-    if [ -s "$found_perf" ]; then
-        cp -f "$found_perf" "$perf_dest"
-        echo -e "${GREEN}✔ 成功获取 AnimeJaNai Performance (2x): ${perf_dest} ($(du -h "$perf_dest" | cut -f1))${NC}"
-    fi
-
-    if [ -s "$found_bal" ]; then
-        cp -f "$found_bal" "$bal_dest"
-        echo -e "${GREEN}✔ 成功获取 AnimeJaNai Balanced (2x): ${bal_dest} ($(du -h "$bal_dest" | cut -f1))${NC}"
-    fi
-
-    rm -f "$tmp_7z"
-    rm -rf "$extract_dir"
+    echo -e "\n${CYAN}>>> 正在下载 AnimeJaNai V3.1 官方模型 (R2 直链秒级极速下载)...${NC}"
+    download_model_file "$perf_dest" "$URL_ANIMEJANAI_V31_PERF" "" "AnimeJaNai V3.1 Performance (2x)"
+    download_model_file "$bal_dest" "$URL_ANIMEJANAI_V31_BAL" "" "AnimeJaNai V3.1 Balanced (2x)"
 }
 
 # 单模型 Engine 构建函数
@@ -961,39 +912,51 @@ download_and_build_engine() {
 
     local perf_onnx="${MODELS_DIR}/performance.onnx"
     local balanced_onnx="${MODELS_DIR}/balanced.onnx"
+    local perf_sharp_onnx="${MODELS_DIR}/performance_sharp1.onnx"
+    local balanced_sharp_onnx="${MODELS_DIR}/balanced_sharp1.onnx"
+    local sd_compact_onnx="${MODELS_DIR}/sd_compact.onnx"
     local anime6b_onnx="${MODELS_DIR}/realesrgan_anime6b.onnx"
 
     echo -e "请选择操作："
-    echo -e "  ${BOLD}1)${NC} ${GREEN}一键获取全部 3 个常用默认模型${NC} (AnimeJaNai Perf + Balanced + Real-ESRGAN Anime 6B)"
-    echo -e "  ${BOLD}2)${NC} 获取 AnimeJaNai V3.1 Performance (2x, 极速偏画质)"
+    echo -e "  ${BOLD}1)${NC} ${GREEN}一键获取 AnimeJaNai V3.1 Performance + Balanced 常用推荐模型 (2x, 极速推荐)${NC}"
+    echo -e "  ${BOLD}2)${NC} 获取 AnimeJaNai V3.1 Performance (2x, 极速偏画质 - 强烈推荐)"
     echo -e "  ${BOLD}3)${NC} 获取 AnimeJaNai V3.1 Balanced (2x, 均衡推荐)"
-    echo -e "  ${BOLD}4)${NC} 下载 Real-ESRGAN Anime 6B (4x, 经典原版动漫模型)"
-    echo -e "  ${BOLD}5)${NC} 自定义 ONNX 模型下载链接 / 本地已有路径"
-    read -rp "请输入选项 [1-5, 默认 1]: " model_choice
+    echo -e "  ${BOLD}4)${NC} 获取 AnimeJaNai V3.1 Sharp1 (2x, 清晰锐化增强版)"
+    echo -e "  ${BOLD}5)${NC} 获取 AnimeJaNai SD Compact (2x, 标清老番修复版)"
+    echo -e "  ${BOLD}6)${NC} 下载 Real-ESRGAN Anime 6B (4x, 经典原版动漫模型)"
+    echo -e "  ${BOLD}7)${NC} 自定义 ONNX 模型下载链接 / 本地已有路径"
+    read -rp "请输入选项 [1-7, 默认 1]: " model_choice
     model_choice=${model_choice:-1}
 
     local target_onnx_list=()
 
     case "$model_choice" in
         1)
-            echo -e "\n${CYAN}>>> 正在获取全部 3 个常用超分模型到 ${MODELS_DIR} ...${NC}\n"
             download_animejanai_models
-            download_model_file "$anime6b_onnx" "$DEFAULT_ONNX_REALESRGAN_ANIME6B_URL" "$DEFAULT_ONNX_REALESRGAN_ANIME6B_MIRROR" "Real-ESRGAN Anime 6B (4x)"
-            target_onnx_list=("$perf_onnx" "$balanced_onnx" "$anime6b_onnx")
+            target_onnx_list=("$perf_onnx" "$balanced_onnx")
             ;;
         2)
-            download_animejanai_models
+            download_model_file "$perf_onnx" "$URL_ANIMEJANAI_V31_PERF" "" "AnimeJaNai V3.1 Performance (2x)"
             target_onnx_list=("$perf_onnx")
             ;;
         3)
-            download_animejanai_models
+            download_model_file "$balanced_onnx" "$URL_ANIMEJANAI_V31_BAL" "" "AnimeJaNai V3.1 Balanced (2x)"
             target_onnx_list=("$balanced_onnx")
             ;;
         4)
+            download_model_file "$perf_sharp_onnx" "$URL_ANIMEJANAI_V31_PERF_SHARP" "" "AnimeJaNai V3.1 Sharp1 Perf (2x)"
+            download_model_file "$balanced_sharp_onnx" "$URL_ANIMEJANAI_V31_BAL_SHARP" "" "AnimeJaNai V3.1 Sharp1 Bal (2x)"
+            target_onnx_list=("$perf_sharp_onnx" "$balanced_sharp_onnx")
+            ;;
+        5)
+            download_model_file "$sd_compact_onnx" "$URL_ANIMEJANAI_SD_COMPACT" "" "AnimeJaNai SD Compact (2x)"
+            target_onnx_list=("$sd_compact_onnx")
+            ;;
+        6)
             download_model_file "$anime6b_onnx" "$DEFAULT_ONNX_REALESRGAN_ANIME6B_URL" "$DEFAULT_ONNX_REALESRGAN_ANIME6B_MIRROR" "Real-ESRGAN Anime 6B (4x)"
             target_onnx_list=("$anime6b_onnx")
             ;;
-        5)
+        7)
             read -rp "请输入 ONNX 下载 URL 或本地绝对路径: " custom_input
             if [ -f "$custom_input" ]; then
                 target_onnx_list=("$custom_input")
@@ -1045,22 +1008,21 @@ download_and_build_engine() {
     if [ ${#target_onnx_list[@]} -gt 1 ]; then
         echo -e "\n检测到已获取多个模型，请选择构建策略："
         echo -e "  ${BOLD}1)${NC} 为全部已获取模型构建 ${engine_suffix} Engine"
-        echo -e "  ${BOLD}2)${NC} 仅为 AnimeJaNai Performance 构建 Engine (最快)"
-        echo -e "  ${BOLD}3)${NC} 仅为 AnimeJaNai Balanced 构建 Engine"
-        echo -e "  ${BOLD}4)${NC} 仅为 Real-ESRGAN Anime 6B 构建 Engine"
-        read -rp "请输入选项 [1-4, 默认 1]: " build_strat
+        for i in "${!target_onnx_list[@]}"; do
+            local item_name="$(basename "${target_onnx_list[$i]}" .onnx)"
+            echo -e "  ${BOLD}$((i+2)))${NC} 仅为 ${item_name} 构建 Engine"
+        done
+        read -rp "请输入选项 [1-$(( ${#target_onnx_list[@]} + 1 )), 默认 1]: " build_strat
         build_strat=${build_strat:-1}
 
-        case "$build_strat" in
-            1)
-                for onnx_item in "${target_onnx_list[@]}"; do
-                    [ -s "$onnx_item" ] && build_single_engine "$onnx_item" "$opt_w" "$opt_h" "$engine_suffix"
-                done
-                ;;
-            2) build_single_engine "$perf_onnx" "$opt_w" "$opt_h" "$engine_suffix" ;;
-            3) build_single_engine "$balanced_onnx" "$opt_w" "$opt_h" "$engine_suffix" ;;
-            4) build_single_engine "$anime6b_onnx" "$opt_w" "$opt_h" "$engine_suffix" ;;
-        esac
+        if [ "$build_strat" -eq 1 ]; then
+            for onnx_item in "${target_onnx_list[@]}"; do
+                [ -s "$onnx_item" ] && build_single_engine "$onnx_item" "$opt_w" "$opt_h" "$engine_suffix"
+            done
+        elif [ "$build_strat" -ge 2 ] && [ "$build_strat" -le "$(( ${#target_onnx_list[@]} + 1 ))" ]; then
+            local selected_onnx="${target_onnx_list[$((build_strat-2))]}"
+            build_single_engine "$selected_onnx" "$opt_w" "$opt_h" "$engine_suffix"
+        fi
     elif [ ${#target_onnx_list[@]} -eq 1 ]; then
         build_single_engine "${target_onnx_list[0]}" "$opt_w" "$opt_h" "$engine_suffix"
     fi
