@@ -206,7 +206,27 @@ select_engine() {
     done
 
     ENGINE_FILE=$(readlink -f "$ENGINE_FILE")
-    echo -e "${GREEN}✔ 已选择 Engine: ${BOLD}${ENGINE_FILE}${NC}\n"
+    echo -e "${GREEN}✔ 已选择 Engine: ${BOLD}${ENGINE_FILE}${NC}"
+
+    # 针对 1080p 输入与 4x 模型的显存预警与智能诊断
+    if [ "$SRC_HEIGHT" -ge 1080 ] || [ "$SRC_WIDTH" -ge 1920 ]; then
+        if [[ "$ENGINE_FILE" == *"realesrgan"* ]] || [[ "$ENGINE_FILE" == *"anime6b"* ]] || [[ "$ENGINE_FILE" == *"4x"* ]]; then
+            echo -e "\n${YELLOW}⚠️  [显存严重预警] 检测到输入视频为 1080p (${SRC_WIDTH}x${SRC_HEIGHT})，而所选模型为 4x 倍率模型！${NC}"
+            echo -e "${YELLOW}   - 4x 模型输入 1080p 将生成 ${BOLD}8K (${SRC_WIDTH*4:-7680}x${SRC_HEIGHT*4:-4320})${NC}${YELLOW} 超高分辨率。${NC}"
+            echo -e "${YELLOW}   - 该模型内部包含大量深度卷积特征图，在 8K 推理时显存需求高达 26GB+，极易触发 ${RED}out of memory${NC}${YELLOW} 报错！${NC}"
+            echo -e "${GREEN}   - 💡 解决方案推荐：${NC}"
+            echo -e "${GREEN}     1. 强烈推荐改用专为 1080p 动漫设计的 2x 模型：${BOLD}performance_1080p.engine${NC}${GREEN} 或 ${BOLD}balanced_1080p.engine${NC}${GREEN}（输出 4K，显存仅需 ~3GB，速度超 100 FPS）；${NC}"
+            echo -e "${GREEN}     2. 若必须使用 Real-ESRGAN，请在部署脚本选项 [9] 中构建 720p/540p 优化 Engine 并先对视频做降采样。${NC}"
+            read -rp "是否仍要强行继续使用此 4x 模型？[y/N, 默认 N]: " force_4x
+            force_4x=${force_4x:-N}
+            if [[ ! "$force_4x" =~ ^[Yy]$ ]]; then
+                echo -e "${CYAN}已取消，请重新选择合适的 Engine 模型：${NC}\n"
+                select_engine
+                return
+            fi
+        fi
+    fi
+    echo ""
 }
 
 # 4. 选择压制范围（全片或截取片段测试）

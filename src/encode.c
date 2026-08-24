@@ -488,8 +488,8 @@ static int init_aji_pool(enc_ctx *c)
     fc->width             = c->up_w;     /* aji writes at the upscale dims */
     fc->height            = c->up_h;
     /* cover in-flight ring/RIFE frames plus those the encoder holds
-     * (NVENC async depth + B-frames) — the pool is fixed-size */
-    fc->initial_pool_size = c->ring_depth + 48;
+     * (NVENC async depth + B-frames) — 16 extra frames is ample for NVENC surface queue */
+    fc->initial_pool_size = c->ring_depth + 16;
     if (av_hwframe_ctx_init(c->aji_pool) < 0) {
         loge("CUDA frame pool init failed for sw_format=%s",
              av_get_pix_fmt_name(c->sw_fmt));
