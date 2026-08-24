@@ -160,28 +160,39 @@ export PATH=~/sdk/tensorrt/usr/bin:$PATH
 
 ---
 
-## 6. Step 4：安装编译工具与 ffmpeg 开发库
+## 6. Step 4：安装编译工具与 BtbN FFmpeg Shared 开发库
+
+由于 Ubuntu 官方 apt 源的 FFmpeg 版本较旧且缺少部分硬件加速支持，推荐安装最新的 **BtbN FFmpeg Shared** 构建：
 
 ```bash
+# 1. 安装基础编译工具
 sudo apt update
-sudo apt install -y \
-    build-essential \
-    cmake \
-    pkg-config \
-    git \
-    libavformat-dev \
-    libavcodec-dev \
-    libavutil-dev \
-    libavfilter-dev \
-    libswscale-dev
+sudo apt install -y build-essential cmake pkg-config git wget tar xz-utils
 
-# 安装 ffmpeg CLI 工具（用于截取测试片段和验证输出）
-sudo apt install -y ffmpeg
+# 2. 下载并安装 BtbN FFmpeg Shared 构建
+# 强烈推荐 n8.1 版本（与驱动 570~595 的 NVENC API 完美适配）：
+wget -O /tmp/ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-shared-8.1.tar.xz
+sudo mkdir -p /opt/ffmpeg
+sudo tar -xJf /tmp/ffmpeg.tar.xz -C /opt/ffmpeg --strip-components=1
+
+# 3. 修正 pkg-config 中的 prefix 路径
+for pc in /opt/ffmpeg/lib/pkgconfig/*.pc; do
+    sudo sed -i 's|^prefix=.*|prefix=/opt/ffmpeg|' "$pc"
+done
+
+# 4. 配置系统动态链接器与环境变量
+echo "/opt/ffmpeg/lib" | sudo tee /etc/ld.so.conf.d/ffmpeg.conf
+sudo ldconfig
+sudo ln -sf /opt/ffmpeg/bin/ffmpeg /usr/local/bin/ffmpeg
+sudo ln -sf /opt/ffmpeg/bin/ffprobe /usr/local/bin/ffprobe
+
+export PKG_CONFIG_PATH="/opt/ffmpeg/lib/pkgconfig:$PKG_CONFIG_PATH"
+export LD_LIBRARY_PATH="/opt/ffmpeg/lib:$LD_LIBRARY_PATH"
+export PATH="/opt/ffmpeg/bin:$PATH"
 ```
 
 > [!NOTE]
-> `libav*-dev` 是 `aji_encode` 编码工具的编译依赖。如果缺少这些库，CMake 会跳过
-> `aji_encode` 目标的编译（只编译 libaji.so / libaji_trt.so / aji_harness）。
+> `libav*-dev` 是 `aji_encode` 编码工具的编译依赖。配置好 `PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig` 后，CMake 会自动识别 BtbN 的完整 FFmpeg 共享库。
 
 ---
 
@@ -223,31 +234,28 @@ ls -lh build/libaji.so build/libaji_trt.so build/aji_harness build/aji_encode
 
 ---
 
-## 8. Step 6：下载超分模型（ONNX）
+## 8. Step 6：获取超分模型（ONNX）
 
-从 [AnimeJaNai Releases](https://github.com/the-database/AnimeJaNai/releases) 或 Hugging Face 下载 ONNX 模型文件。
-
-推荐常用模型：
+推荐常用超分模型：
 
 | 模型名称 | 用途 | 速度 / 倍率 |
 |----------|------|-------------|
-| `2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx` | 2× 超分（画质偏速度） | ⚡⚡⚡ 最快 (2x) |
-| `2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx` | 2× 超分（画质与速度均衡） | ⚡⚡ 均衡 (2x) |
-| `RealESRGAN_x4plus_anime_6B.onnx` | 4× 经典动漫模型（线条强化与降噪） | ⚡ 原版经典 (4x) |
+| `2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx` (`performance.onnx`) | 2× 超分（极速偏画质） | ⚡⚡⚡ 最快 (2x) |
+| `2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx` (`balanced.onnx`) | 2× 超分（画质与速度均衡） | ⚡⚡ 均衡 (2x) |
+| `RealESRGAN_x4plus_anime_6B.onnx` (`realesrgan_anime6b.onnx`) | 4× 经典原版动漫超分（线条强化与降噪） | ⚡ 经典 (4x) |
 
 ```bash
 # 创建模型目录
 mkdir -p ~/models
 
-# 1. AnimeJaNai V3.1 Performance (2x)
-wget -O ~/models/performance.onnx \
-  "https://github.com/the-database/AnimeJaNai/releases/download/v3.1/2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx"
+# 1 & 2: 获取 AnimeJaNai 官方 V3.1 Performance & Balanced 模型 (从官方资源包解压)
+wget -O /tmp/animejanai_overlay.7z "https://github.com/the-database/mpv-AnimeJaNai/releases/download/3.6.0/mpv-upscale-2x_animejanai-overlay-3.6.0-linux-x64.7z"
+7z e -y /tmp/animejanai_overlay.7z -o/tmp/extracted_models "*SPANF3*"
+cp /tmp/extracted_models/*Performance_SPANF3*b5f48*.onnx ~/models/performance.onnx
+cp /tmp/extracted_models/*Balanced_SPANF3*b8f64*.onnx ~/models/balanced.onnx
+rm -rf /tmp/animejanai_overlay.7z /tmp/extracted_models
 
-# 2. AnimeJaNai V3.1 Balanced (2x)
-wget -O ~/models/balanced.onnx \
-  "https://github.com/the-database/AnimeJaNai/releases/download/v3.1/2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx"
-
-# 3. Real-ESRGAN Anime 6B (4x)
+# 3: 下载原版 Real-ESRGAN Anime 6B (4x)
 wget -O ~/models/realesrgan_anime6b.onnx \
   "https://huggingface.co/deepghs/imgutils-models/resolve/main/real_esrgan/RealESRGAN_x4plus_anime_6B.onnx"
 ```
@@ -262,12 +270,12 @@ wget -O ~/models/realesrgan_anime6b.onnx \
 
 ```bash
 # 为你的 GPU 构建 Engine（以 1080p 输入为例）
+# 注意：TensorRT 11+ 已默认开启强类型 FP16，无需且不支持 --fp16 选项；TensorRT 10 及以下版本可加上 --fp16
 trtexec \
   --onnx=~/models/performance.onnx \
   --minShapes=input:1x3x64x64 \
   --optShapes=input:1x3x1080x1920 \
   --maxShapes=input:1x3x1080x1920 \
-  --fp16 \
   --skipInference \
   --saveEngine=~/models/performance_1080p.engine
 ```
@@ -276,11 +284,11 @@ trtexec \
 
 | 参数 | 说明 |
 |------|------|
-| `--minShapes` | 最小输入分辨率（保持 `1x3x64x64` 即可） |
+| `--minShapes` | 最小输入分辨率（保持 `input:1x3x64x64` 即可） |
 | `--optShapes` | 优化目标分辨率（设为你主要的源视频分辨率） |
 | `--maxShapes` | 最大输入分辨率（≥ optShapes，设为相同值即可） |
-| `--fp16` | 启用 FP16 推理（速度翻倍，质量无肉眼差异） |
 | `--skipInference` | 仅构建 Engine，跳过推理基准 |
+| `--fp16` | （仅适用于 TensorRT 10 及以下版本）在 TensorRT 11+ 中已废弃 |
 
 ### 不同源分辨率的 Engine 示例
 
@@ -290,7 +298,7 @@ trtexec --onnx=~/models/performance.onnx \
   --minShapes=input:1x3x64x64 \
   --optShapes=input:1x3x720x1280 \
   --maxShapes=input:1x3x720x1280 \
-  --fp16 --skipInference \
+  --skipInference \
   --saveEngine=~/models/performance_720p.engine
 
 # 1080p 输入
@@ -298,7 +306,7 @@ trtexec --onnx=~/models/performance.onnx \
   --minShapes=input:1x3x64x64 \
   --optShapes=input:1x3x1080x1920 \
   --maxShapes=input:1x3x1080x1920 \
-  --fp16 --skipInference \
+  --skipInference \
   --saveEngine=~/models/performance_1080p.engine
 ```
 
