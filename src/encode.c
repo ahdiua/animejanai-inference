@@ -652,8 +652,9 @@ static int open_output(enc_ctx *c)
         enum AVMediaType t = in->codecpar->codec_type;
         if (t == AVMEDIA_TYPE_AUDIO && c->o.no_audio) continue;
         if (t == AVMEDIA_TYPE_SUBTITLE && c->o.no_subs) continue;
-        if (t != AVMEDIA_TYPE_AUDIO && t != AVMEDIA_TYPE_SUBTITLE &&
-            t != AVMEDIA_TYPE_ATTACHMENT && t != AVMEDIA_TYPE_DATA)
+        /* Matroska and standard containers only support video, audio, and subtitle streams.
+         * Filter out non-audio non-subtitle streams (e.g. data streams, timed metadata, tmcd) */
+        if (t != AVMEDIA_TYPE_AUDIO && t != AVMEDIA_TYPE_SUBTITLE)
             continue;
         AVStream *out = avformat_new_stream(c->ofmt, NULL);
         if (!out) { loge("new aux stream failed"); return -1; }
