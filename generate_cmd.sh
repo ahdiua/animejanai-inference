@@ -56,21 +56,31 @@ check_binaries() {
     fi
 }
 
-# 2. 视频输入选择
+# 2. 视频输入选择 (自动真实路径去重)
 select_input_video() {
     echo -e "${BOLD}${CYAN}[步骤 1/7] 选择输入视频文件 (Input Video)${NC}"
     
-    # 自动搜索当前目录和用户主目录下常见的视频文件
-    local search_dirs=("." "$PROJECT_ROOT" "/root" "$HOME" "$HOME/videos" "$HOME/autodl-tmp")
-    local found_videos=()
-    
+    # 自动搜索常见目录下的视频文件（自动规范化为真实绝对路径并严格去重）
+    local search_dirs=("$PWD" "$PROJECT_ROOT" "$HOME" "/root" "$HOME/videos" "$HOME/autodl-tmp" "/root/autodl-tmp" "/root/autodl-fs")
+    local raw_found=()
+
     for d in "${search_dirs[@]}"; do
         if [ -d "$d" ]; then
+            local abs_dir="$(readlink -f "$d" 2>/dev/null || echo "$d")"
             while IFS= read -r f; do
-                [ -f "$f" ] && found_videos+=("$f")
-            done < <(find "$d" -maxdepth 2 -type f \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.mov" -o -iname "*.flv" -o -iname "*.ts" -o -iname "*.webm" \) ! -iname "*_upscaled*" ! -iname "*_aji*" ! -iname "test_clip*" 2>/dev/null | sort -u | head -n 15)
+                if [ -f "$f" ]; then
+                    local abs_file="$(readlink -f "$f")"
+                    raw_found+=("$abs_file")
+                fi
+            done < <(find -L "$abs_dir" -maxdepth 2 -type f \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.mov" -o -iname "*.flv" -o -iname "*.ts" -o -iname "*.webm" \) ! -iname "*_upscaled*" ! -iname "*_aji*" ! -iname "test_clip*" ! -iname "temp_clip*" 2>/dev/null | head -n 30)
         fi
     done
+
+    # 严格去重
+    local found_videos=()
+    if [ ${#raw_found[@]} -gt 0 ]; then
+        mapfile -t found_videos < <(printf "%s\n" "${raw_found[@]}" | sort -u)
+    fi
 
     local input_video=""
 
@@ -92,7 +102,6 @@ select_input_video() {
 
     while [ -z "$input_video" ] || [ ! -f "$input_video" ]; do
         read -rp "请输入待超分视频文件的绝对或相对路径: " manual_input
-        # 去除前后引号和多余空格
         manual_input=$(echo "$manual_input" | sed -e "s/^['\"]//" -e "s/['\"]$//")
         if [ -f "$manual_input" ]; then
             input_video="$manual_input"
@@ -130,11 +139,30 @@ select_input_video() {
     echo -e "  - 视频时长:     ${SRC_DURATION}\n"
 }
 
-# 3. 选择/匹配 TensorRT Engine 模型
+# 3. 选择/匹配 TensorRT Engine 模型 (自动真实路径去重)
 select_engine() {
     echo -e "${BOLD}${CYAN}[步骤 2/7] 选择超分 TensorRT Engine 模型${NC}"
 
-    local found_engines=($(find "$MODELS_DIR" "$PROJECT_ROOT" "$HOME" -maxdepth 2 -type f -name "*.engine" 2>/dev/null | sort -u))
+    local search_dirs=("$MODELS_DIR" "$PROJECT_ROOT" "$HOME" "/root/models" "/root")
+    local raw_engines=()
+
+    for d in "${search_dirs[@]}"; do
+        if [ -d "$d" ]; then
+            local abs_dir="$(readlink -f "$d" 2>/dev/null || echo "$d")"
+            while IFS= read -r f; do
+                if [ -f "$f" ]; then
+                    local abs_file="$(readlink -f "$f")"
+                    raw_engines+=("$abs_file")
+                fi
+            done < <(find -L "$abs_dir" -maxdepth 2 -type f -name "*.engine" 2>/dev/null | head -n 30)
+        fi
+    done
+
+    local found_engines=()
+    if [ ${#raw_engines[@]} -gt 0 ]; then
+        mapfile -t found_engines < <(printf "%s\n" "${raw_engines[@]}" | sort -u)
+    fi
+
     ENGINE_FILE=""
 
     if [ ${#found_engines[@]} -gt 0 ]; then
