@@ -22,12 +22,14 @@ NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # 定位项目根目录
-if [ -f "${SCRIPT_DIR}/build/aji_encode" ]; then
+if [ -f "${SCRIPT_DIR}/CMakeLists.txt" ] || [ -f "${SCRIPT_DIR}/build/aji_encode" ]; then
     PROJECT_ROOT="${SCRIPT_DIR}"
-elif [ -d "/root/animejanai-inference/build" ]; then
-    PROJECT_ROOT="/root/animejanai-inference"
-elif [ -d "$HOME/animejanai-inference/build" ]; then
+elif [ -f "CMakeLists.txt" ] || [ -f "build/aji_encode" ]; then
+    PROJECT_ROOT="$(pwd)"
+elif [ -d "$HOME/animejanai-inference" ]; then
     PROJECT_ROOT="$HOME/animejanai-inference"
+elif [ -d "/root/animejanai-inference" ]; then
+    PROJECT_ROOT="/root/animejanai-inference"
 else
     PROJECT_ROOT="${SCRIPT_DIR}"
 fi
