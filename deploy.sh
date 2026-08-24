@@ -1282,9 +1282,10 @@ main_menu() {
         echo -e "  ${BOLD}[10]${NC} ${MAGENTA}截取 1 分钟 example.mkv 进行超分测试${NC} (Run 1-Min Encode Test)"
         echo -e "  ----------------------------------------------------------------------"
         echo -e "  ${BOLD}[11]${NC} ${CYAN}一键清理系统中多余旧版 CUDA 软件包 (释放空间)${NC} (Purge Old CUDA Packages)"
+        echo -e "  ${BOLD}[12]${NC} ${GREEN}交互式超分任务配置向导与命令生成器 (不自动执行)${NC} (Task Wizard & Generator)"
         echo -e "  ${BOLD}[0]${NC}  退出 (Exit)"
         echo -e "${CYAN}------------------------------------------------------------------------------${NC}"
-        read -rp "请输入选项数字 [0-11]: " choice
+        read -rp "请输入选项数字 [0-12]: " choice
 
         case "$choice" in
             1) diagnose_all ;;
@@ -1298,6 +1299,15 @@ main_menu() {
             9) download_and_build_engine ;;
             10) run_test_clip ;;
             11) purge_old_cuda_packages ;;
+            12) 
+                if [ -f "${PROJECT_ROOT}/generate_cmd.sh" ]; then
+                    bash "${PROJECT_ROOT}/generate_cmd.sh"
+                elif [ -f "/root/generate_cmd.sh" ]; then
+                    bash "/root/generate_cmd.sh"
+                else
+                    echo -e "${RED}[错误] 未找到 generate_cmd.sh 脚本！${NC}"
+                fi
+                ;;
             0) echo -e "\n${GREEN}感谢使用，再见！${NC}"; exit 0 ;;
             *) echo -e "\n${RED}无效选项，请重新输入！${NC}" ;;
         esac
@@ -1323,6 +1333,13 @@ if [ $# -gt 0 ]; then
         --engine|--models) download_and_build_engine ;;
         --clean-cuda|--purge-cuda) purge_old_cuda_packages ;;
         --test) run_test_clip ;;
+        --run|--gen|--generate|--wizard)
+            if [ -f "${PROJECT_ROOT}/generate_cmd.sh" ]; then
+                bash "${PROJECT_ROOT}/generate_cmd.sh"
+            else
+                bash "/root/generate_cmd.sh"
+            fi
+            ;;
         --help|-h)
             echo "用法: $0 [选项]"
             echo "选项:"
@@ -1338,6 +1355,7 @@ if [ $# -gt 0 ]; then
             echo "  --engine        下载模型并构建 TensorRT Engine"
             echo "  --clean-cuda    清理系统中的多余旧版本 CUDA 软件包"
             echo "  --test          截取 1 分钟 example.mkv 进行超分测试"
+            echo "  --gen / --run   启动交互式超分任务配置向导与命令生成器 (不自动执行)"
             ;;
         *) echo -e "${RED}未知参数: $1${NC}，请使用 --help 查看帮助。"; exit 1 ;;
     esac

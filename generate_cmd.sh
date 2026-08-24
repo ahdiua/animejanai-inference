@@ -1,0 +1,487 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# AnimeJaNai-Inference 交互式任务配置与命令生成器 (Command Generator)
+# 功能说明：
+#   通过向导式问答收集输入视频、模型 Engine、编码器、画质、位深等参数，
+#   生成标准高效的 aji_encode 运行命令与独立执行脚本 (.sh)，
+#   默认不自动执行，支持直接复制命令或手动运行生成的脚本。
+# ==============================================================================
+
+set -o pipefail
+
+# 终端颜色
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# 定位项目根目录
+if [ -f "${SCRIPT_DIR}/build/aji_encode" ]; then
+    PROJECT_ROOT="${SCRIPT_DIR}"
+elif [ -d "/root/animejanai-inference/build" ]; then
+    PROJECT_ROOT="/root/animejanai-inference"
+elif [ -d "$HOME/animejanai-inference/build" ]; then
+    PROJECT_ROOT="$HOME/animejanai-inference"
+else
+    PROJECT_ROOT="${SCRIPT_DIR}"
+fi
+
+MODELS_DIR="${HOME}/models"
+FFMPEG_INSTALL_DIR="/opt/ffmpeg"
+NVENC_FIX_SO="/opt/libnvenc_fix.so"
+AJI_ENCODE_BIN="${PROJECT_ROOT}/build/aji_encode"
+
+print_header() {
+    clear 2>/dev/null || true
+    echo -e "${CYAN}==============================================================================${NC}"
+    echo -e "${BOLD}${MAGENTA}      AnimeJaNai-Inference 交互式超分任务配置向导与命令生成器${NC}"
+    echo -e "${CYAN}==============================================================================${NC}"
+    echo -e " 核心工具: ${BOLD}${AJI_ENCODE_BIN}${NC}"
+    echo -e " 系统时间: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo -e "${CYAN}------------------------------------------------------------------------------${NC}\n"
+}
+
+# 1. 检查 aji_encode 二进制是否存在
+check_binaries() {
+    if [ ! -f "$AJI_ENCODE_BIN" ]; then
+        echo -e "${RED}[错误] 未找到 aji_encode 编译产物: ${AJI_ENCODE_BIN}${NC}"
+        echo -e "${YELLOW}请先运行 ./deploy.sh 选项 [8] 或 [2] 编译项目后再使用此生成器。${NC}"
+        exit 1
+    fi
+}
+
+# 2. 视频输入选择
+select_input_video() {
+    echo -e "${BOLD}${CYAN}[步骤 1/7] 选择输入视频文件 (Input Video)${NC}"
+    
+    # 自动搜索当前目录和用户主目录下常见的视频文件
+    local search_dirs=("." "$PROJECT_ROOT" "/root" "$HOME" "$HOME/videos" "$HOME/autodl-tmp")
+    local found_videos=()
+    
+    for d in "${search_dirs[@]}"; do
+        if [ -d "$d" ]; then
+            while IFS= read -r f; do
+                [ -f "$f" ] && found_videos+=("$f")
+            done < <(find "$d" -maxdepth 2 -type f \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.mov" -o -iname "*.flv" -o -iname "*.ts" -o -iname "*.webm" \) ! -iname "*_upscaled*" ! -iname "*_aji*" ! -iname "test_clip*" 2>/dev/null | sort -u | head -n 15)
+        fi
+    done
+
+    local input_video=""
+
+    if [ ${#found_videos[@]} -gt 0 ]; then
+        echo -e "在系统中自动检索到以下视频文件："
+        for i in "${!found_videos[@]}"; do
+            local fsize=$(ls -lh "${found_videos[$i]}" 2>/dev/null | awk '{print $5}')
+            echo -e "  ${BOLD}$((i+1)))${NC} ${found_videos[$i]} (${GREEN}${fsize}${NC})"
+        done
+        echo -e "  ${BOLD}$(( ${#found_videos[@]} + 1 )))${NC} 手动输入自定义路径"
+        
+        read -rp "请选择视频编号 [1-$(( ${#found_videos[@]} + 1 )), 默认 1]: " v_idx
+        v_idx=${v_idx:-1}
+
+        if [ "$v_idx" -le "${#found_videos[@]}" ] && [ "$v_idx" -ge 1 ]; then
+            input_video="${found_videos[$((v_idx-1))]}"
+        fi
+    fi
+
+    while [ -z "$input_video" ] || [ ! -f "$input_video" ]; do
+        read -rp "请输入待超分视频文件的绝对或相对路径: " manual_input
+        # 去除前后引号和多余空格
+        manual_input=$(echo "$manual_input" | sed -e "s/^['\"]//" -e "s/['\"]$//")
+        if [ -f "$manual_input" ]; then
+            input_video="$manual_input"
+        else
+            echo -e "${RED}[错误] 文件不存在: ${manual_input}，请重新输入！${NC}"
+        fi
+    done
+
+    input_video=$(readlink -f "$input_video")
+    echo -e "${GREEN}✔ 已选择输入视频: ${BOLD}${input_video}${NC}\n"
+
+    # 使用 ffprobe 获取视频详细元数据
+    export PATH="${FFMPEG_INSTALL_DIR}/bin:$PATH"
+    SRC_WIDTH=1920
+    SRC_HEIGHT=1080
+    SRC_CODEC="未知"
+    SRC_FPS="24"
+    SRC_DURATION="未知"
+
+    if command -v ffprobe &>/dev/null; then
+        SRC_WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$input_video" 2>/dev/null || echo 1920)
+        SRC_HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$input_video" 2>/dev/null || echo 1080)
+        SRC_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$input_video" 2>/dev/null || echo "未知")
+        SRC_FPS=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$input_video" 2>/dev/null || echo "24")
+        SRC_DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$input_video" 2>/dev/null | awk '{printf "%.1f 分钟", $1/60}' || echo "未知")
+    fi
+
+    SRC_WIDTH=${SRC_WIDTH:-1920}
+    SRC_HEIGHT=${SRC_HEIGHT:-1080}
+
+    echo -e "${CYAN}视频元信息解析：${NC}"
+    echo -e "  - 原始分辨率:   ${BOLD}${SRC_WIDTH} x ${SRC_HEIGHT}${NC}"
+    echo -e "  - 编码格式:     ${SRC_CODEC}"
+    echo -e "  - 原始帧率:     ${SRC_FPS}"
+    echo -e "  - 视频时长:     ${SRC_DURATION}\n"
+}
+
+# 3. 选择/匹配 TensorRT Engine 模型
+select_engine() {
+    echo -e "${BOLD}${CYAN}[步骤 2/7] 选择超分 TensorRT Engine 模型${NC}"
+
+    local found_engines=($(find "$MODELS_DIR" "$PROJECT_ROOT" "$HOME" -maxdepth 2 -type f -name "*.engine" 2>/dev/null | sort -u))
+    ENGINE_FILE=""
+
+    if [ ${#found_engines[@]} -gt 0 ]; then
+        echo -e "检测到以下已构建好的 TensorRT Engine 文件："
+        for i in "${!found_engines[@]}"; do
+            local esize=$(ls -lh "${found_engines[$i]}" 2>/dev/null | awk '{print $5}')
+            echo -e "  ${BOLD}$((i+1)))${NC} ${found_engines[$i]} (${GREEN}${esize}${NC})"
+        done
+        echo -e "  ${BOLD}$(( ${#found_engines[@]} + 1 )))${NC} 手动输入自定义 Engine 路径"
+
+        read -rp "请选择 Engine 编号 [1-$(( ${#found_engines[@]} + 1 )), 默认 1]: " e_idx
+        e_idx=${e_idx:-1}
+
+        if [ "$e_idx" -le "${#found_engines[@]}" ] && [ "$e_idx" -ge 1 ]; then
+            ENGINE_FILE="${found_engines[$((e_idx-1))]}"
+        fi
+    fi
+
+    while [ -z "$ENGINE_FILE" ] || [ ! -f "$ENGINE_FILE" ]; do
+        echo -e "${YELLOW}未检测到现成 Engine，请手动输入路径或先运行 deploy.sh 选项 [9] 生成：${NC}"
+        read -rp "请输入 .engine 文件的绝对路径: " manual_engine
+        manual_engine=$(echo "$manual_engine" | sed -e "s/^['\"]//" -e "s/['\"]$//")
+        if [ -f "$manual_engine" ]; then
+            ENGINE_FILE="$manual_engine"
+        else
+            echo -e "${RED}[错误] Engine 文件不存在: ${manual_engine}${NC}"
+        fi
+    done
+
+    ENGINE_FILE=$(readlink -f "$ENGINE_FILE")
+    echo -e "${GREEN}✔ 已选择 Engine: ${BOLD}${ENGINE_FILE}${NC}\n"
+}
+
+# 4. 选择压制范围（全片或截取片段测试）
+select_clip_mode() {
+    echo -e "${BOLD}${CYAN}[步骤 3/7] 压制范围选择 (Full Video or Clip Test)${NC}"
+    echo -e "  ${BOLD}1)${NC} ${GREEN}整片完整超分压制${NC} (Full Encode - 标准输出整部影片)"
+    echo -e "  ${BOLD}2)${NC} ${YELLOW}截取指定时间段进行测试${NC} (Clip Slice Test - 快速验证画质与压制速度)"
+    read -rp "请选择 [1-2, 默认 1]: " clip_choice
+    clip_choice=${clip_choice:-1}
+
+    IS_CLIP=0
+    CLIP_START="00:01:00"
+    CLIP_DURATION="60"
+
+    if [ "$clip_choice" -eq 2 ]; then
+        IS_CLIP=1
+        read -rp "请输入测试片段开始时间 (格式如 00:00:30 或 00:01:00, 默认 00:01:00): " input_start
+        CLIP_START=${input_start:-00:01:00}
+        read -rp "请输入测试片段持续时长 (单位: 秒, 默认 60): " input_dur
+        CLIP_DURATION=${input_dur:-60}
+        echo -e "${GREEN}✔ 已设置为截取测试模式: 从 ${CLIP_START} 开始截取 ${CLIP_DURATION} 秒${NC}\n"
+    else
+        echo -e "${GREEN}✔ 已设置为整片完整超分模式${NC}\n"
+    fi
+}
+
+# 5. 输出文件路径设置
+select_output_path() {
+    echo -e "${BOLD}${CYAN}[步骤 4/7] 设置输出文件路径 (Output Destination)${NC}"
+
+    local dir_name="$(dirname "$input_video")"
+    local base_name="$(basename "$input_video")"
+    local raw_name="${base_name%.*}"
+    local ext="${base_name##*.}"
+
+    local default_out=""
+    if [ "$IS_CLIP" -eq 1 ]; then
+        default_out="${dir_name}/${raw_name}_clip_${CLIP_DURATION}s_upscaled.mkv"
+    else
+        default_out="${dir_name}/${raw_name}_upscaled.mkv"
+    fi
+
+    echo -e "默认推荐输出路径: ${BOLD}${default_out}${NC}"
+    read -rp "是否使用此输出路径？回车默认确认，或直接输入新路径: " user_out
+    if [ -n "$user_out" ]; then
+        OUTPUT_VIDEO=$(echo "$user_out" | sed -e "s/^['\"]//" -e "s/['\"]$//")
+    else
+        OUTPUT_VIDEO="$default_out"
+    fi
+
+    read -rp "若输出文件已存在，是否默认自动覆盖？[Y/n, 默认 Y]: " overwrite_choice
+    overwrite_choice=${overwrite_choice:-Y}
+    if [[ "$overwrite_choice" =~ ^[Yy]$ ]]; then
+        OVERWRITE_FLAG="--overwrite"
+    else
+        OVERWRITE_FLAG=""
+    fi
+
+    echo -e "${GREEN}✔ 输出路径: ${BOLD}${OUTPUT_VIDEO}${NC}\n"
+}
+
+# 6. 选择编码器与画质配置
+select_encoder_and_quality() {
+    echo -e "${BOLD}${CYAN}[步骤 5/7] 选择视频编码器与画质参数 (Video Encoder & Quality)${NC}"
+    echo -e "  ${BOLD}1)${NC} ${GREEN}hevc_nvenc (NVIDIA NVENC H.265 硬件编码 - 强烈推荐，极速高画质)${NC}"
+    echo -e "  ${BOLD}2)${NC} h264_nvenc (NVIDIA NVENC H.264 硬件编码 - 兼容性好)"
+    echo -e "  ${BOLD}3)${NC} libx265   (CPU H.265 软件编码 - 极致压缩率，但速度慢)"
+    echo -e "  ${BOLD}4)${NC} libx264   (CPU H.264 软件编码)"
+    echo -e "  ${BOLD}5)${NC} ffv1      (无损归档编码)"
+    read -rp "请选择编码器 [1-5, 默认 1]: " enc_choice
+    enc_choice=${enc_choice:-1}
+
+    case "$enc_choice" in
+        1) VCODEC="hevc_nvenc" ;;
+        2) VCODEC="h264_nvenc" ;;
+        3) VCODEC="libx265" ;;
+        4) VCODEC="libx264" ;;
+        5) VCODEC="ffv1" ;;
+        *) VCODEC="hevc_nvenc" ;;
+    esac
+
+    echo -e "\n请选择画质与预设参数 (VQuality Preset)："
+    if [[ "$VCODEC" == *"nvenc"* ]]; then
+        echo -e "  ${BOLD}1)${NC} ${GREEN}高质量动漫推荐: -cq 18 -preset p7 -tune hq${NC} (兼顾绝佳画质与合理体积)"
+        echo -e "  ${BOLD}2)${NC} 标准平衡预设:   -cq 20 -preset p6 (默认标准)"
+        echo -e "  ${BOLD}3)${NC} 高速压制预设:   -cq 23 -preset p4 (速度优先)"
+        echo -e "  ${BOLD}4)${NC} 自定义输入参数"
+        read -rp "请选择画质档位 [1-4, 默认 1]: " q_choice
+        q_choice=${q_choice:-1}
+
+        case "$q_choice" in
+            1) VQUALITY="-cq 18 -preset p7 -tune hq" ;;
+            2) VQUALITY="-cq 20 -preset p6" ;;
+            3) VQUALITY="-cq 23 -preset p4" ;;
+            4)
+                read -rp "请输入自定义 FFmpeg 编码参数 (如 -cq 16 -preset p7): " custom_q
+                VQUALITY="${custom_q:--cq 18 -preset p7 -tune hq}"
+                ;;
+            *) VQUALITY="-cq 18 -preset p7 -tune hq" ;;
+        esac
+    else
+        echo -e "  ${BOLD}1)${NC} CRF 18 (高质量) -preset slow"
+        echo -e "  ${BOLD}2)${NC} CRF 20 (标准)   -preset medium"
+        echo -e "  ${BOLD}3)${NC} 自定义输入参数"
+        read -rp "请选择画质档位 [1-3, 默认 1]: " q_choice
+        q_choice=${q_choice:-1}
+
+        case "$q_choice" in
+            1) VQUALITY="-crf 18 -preset slow" ;;
+            2) VQUALITY="-crf 20 -preset medium" ;;
+            3)
+                read -rp "请输入自定义 FFmpeg 编码参数: " custom_q
+                VQUALITY="${custom_q:--crf 18 -preset slow}"
+                ;;
+            *) VQUALITY="-crf 18 -preset slow" ;;
+        esac
+    fi
+
+    echo -e "${GREEN}✔ 编码器: ${BOLD}${VCODEC}${NC} | 参数: ${BOLD}${VQUALITY}${NC}\n"
+}
+
+# 7. 选择解码器与像素格式
+select_decoder_and_pixfmt() {
+    echo -e "${BOLD}${CYAN}[步骤 6/7] 硬件解码器与色彩像素格式 (Decoder & Pixel Format)${NC}"
+
+    echo -e "解码器选择 (--decoder)："
+    echo -e "  ${BOLD}1)${NC} ${GREEN}nvdec (NVIDIA 硬件加速解码 - 推荐，显存零拷贝极速)${NC}"
+    echo -e "  ${BOLD}2)${NC} auto  (自动根据格式探测)"
+    echo -e "  ${BOLD}3)${NC} cpu   (CPU 软件解码，兼容奇特封装格式)"
+    read -rp "请选择解码器 [1-3, 默认 1]: " dec_choice
+    dec_choice=${dec_choice:-1}
+    case "$dec_choice" in
+        1) DECODER="nvdec" ;;
+        2) DECODER="auto" ;;
+        3) DECODER="cpu" ;;
+        *) DECODER="nvdec" ;;
+    esac
+
+    echo -e "\n色彩像素位深格式 (--pix-fmt)："
+    echo -e "  ${BOLD}1)${NC} ${GREEN}yuv420p10 (10-bit 色深 - 强烈推荐，彻底杜绝动漫暗部色带断层)${NC}"
+    echo -e "  ${BOLD}2)${NC} yuv420p   (8-bit 色深 - 通用兼容)"
+    echo -e "  ${BOLD}3)${NC} yuv444p10 (4:4:4 10-bit 无抽样，需软编支持)"
+    read -rp "请选择色彩格式 [1-3, 默认 1]: " pix_choice
+    pix_choice=${pix_choice:-1}
+    case "$pix_choice" in
+        1) PIX_FMT="yuv420p10" ;;
+        2) PIX_FMT="yuv420p" ;;
+        3) PIX_FMT="yuv444p10" ;;
+        *) PIX_FMT="yuv420p10" ;;
+    esac
+
+    echo -e "${GREEN}✔ 解码器: ${BOLD}${DECODER}${NC} | 像素格式: ${BOLD}${PIX_FMT}${NC}\n"
+}
+
+# 8. 音轨/字幕与降采样选项
+select_optional_flags() {
+    echo -e "${BOLD}${CYAN}[步骤 7/7] 音频、字幕与输出缩放附加选项${NC}"
+    
+    EXTRA_FLAGS=()
+
+    read -rp "是否保留原视频中的全部音频流？[Y/n, 默认 Y]: " keep_audio
+    keep_audio=${keep_audio:-Y}
+    if [[ ! "$keep_audio" =~ ^[Yy]$ ]]; then
+        EXTRA_FLAGS+=("--no-audio")
+    fi
+
+    read -rp "是否保留原视频中的全部字幕流？[Y/n, 默认 Y]: " keep_subs
+    keep_subs=${keep_subs:-Y}
+    if [[ ! "$keep_subs" =~ ^[Yy]$ ]]; then
+        EXTRA_FLAGS+=("--no-subs")
+    fi
+
+    read -rp "是否在超分后下采样回特定高度？(如输入 1080 实现 2x 超分再降采样超采样抗锯齿，留空表示不缩放): " resize_h
+    if [ -n "$resize_h" ] && [ "$resize_h" -gt 0 ] 2>/dev/null; then
+        EXTRA_FLAGS+=("--final-resize-height" "$resize_h")
+        echo -e "${GREEN}✔ 已开启后处理下采样至高度: ${resize_h}p${NC}"
+    fi
+
+    echo ""
+}
+
+# 9. 生成最终命令与独立脚本
+generate_final_command_and_script() {
+    local gen_script_path="${PROJECT_ROOT}/run_encode.sh"
+    local clip_intermediate="${PROJECT_ROOT}/temp_clip_for_test.mkv"
+    local effective_input="$input_video"
+
+    local preload_str=""
+    if [ -f "$NVENC_FIX_SO" ]; then
+        preload_str="export LD_PRELOAD=\"${NVENC_FIX_SO}\${LD_PRELOAD:+ \$LD_PRELOAD}\""
+    fi
+
+    # 组装 aji_encode 命令参数
+    local cmd_args=()
+    if [ "$IS_CLIP" -eq 1 ]; then
+        effective_input="$clip_intermediate"
+    fi
+
+    cmd_args+=("--input" "\"${effective_input}\"")
+    cmd_args+=("--output" "\"${OUTPUT_VIDEO}\"")
+    cmd_args+=("--engine" "\"${ENGINE_FILE}\"")
+    cmd_args+=("--max-width" "${SRC_WIDTH}")
+    cmd_args+=("--max-height" "${SRC_HEIGHT}")
+    cmd_args+=("--decoder" "${DECODER}")
+    cmd_args+=("--vcodec" "${VCODEC}")
+    cmd_args+=("--vquality" "\"${VQUALITY}\"")
+    cmd_args+=("--pix-fmt" "${PIX_FMT}")
+    [ -n "$OVERWRITE_FLAG" ] && cmd_args+=("${OVERWRITE_FLAG}")
+    [ ${#EXTRA_FLAGS[@]} -gt 0 ] && cmd_args+=("${EXTRA_FLAGS[@]}")
+
+    # 写入独立的执行脚本 run_encode.sh
+    cat << EOF > "$gen_script_path"
+#!/usr/bin/env bash
+# ==============================================================================
+# AnimeJaNai-Inference 独立执行脚本 (自动生成于 $(date '+%Y-%m-%d %H:%M:%S'))
+# ==============================================================================
+set -e
+
+# 1. 配置运行时动态库与环境变量
+export PATH="/usr/local/cuda/bin:${FFMPEG_INSTALL_DIR}/bin:\$PATH"
+export LD_LIBRARY_PATH="${PROJECT_ROOT}/build:${FFMPEG_INSTALL_DIR}/lib:/usr/local/cuda/lib64:\${LD_LIBRARY_PATH:-}"
+${preload_str}
+
+echo -e "\033[1;36m==============================================================================\033[0m"
+echo -e "\033[1;35m🚀 开始执行 AnimeJaNai 视频超分压制任务\033[0m"
+echo -e "  - 输入文件: ${input_video}"
+echo -e "  - 输出文件: ${OUTPUT_VIDEO}"
+echo -e "  - Engine:   ${ENGINE_FILE}"
+echo -e "  - 编码器:   ${VCODEC} (${VQUALITY})"
+echo -e "  - 像素格式: ${PIX_FMT}"
+echo -e "\033[1;36m------------------------------------------------------------------------------\033[0m"
+
+EOF
+
+    if [ "$IS_CLIP" -eq 1 ]; then
+        cat << EOF >> "$gen_script_path"
+# 2. 截取测试片段 (${CLIP_START}, 时长 ${CLIP_DURATION} 秒)
+echo -e "\033[0;33m[前置] 正在流拷贝无损快速截取 ${CLIP_DURATION} 秒测试片段...\033[0m"
+ffmpeg -y -ss "${CLIP_START}" -i "${input_video}" -t "${CLIP_DURATION}" -c copy "${clip_intermediate}"
+
+# 3. 运行超分压制
+echo -e "\033[0;32m[核心] 启动 aji_encode 进行超分推理与编码...\033[0m"
+${AJI_ENCODE_BIN} \\
+    ${cmd_args[*]}
+
+# 4. 清理临时测试片段
+rm -f "${clip_intermediate}"
+EOF
+    else
+        cat << EOF >> "$gen_script_path"
+# 2. 启动 aji_encode 进行全视频超分压制
+${AJI_ENCODE_BIN} \\
+    ${cmd_args[*]}
+EOF
+    fi
+
+    cat << 'EOF' >> "$gen_script_path"
+
+echo -e "\n\033[1;32m==============================================================================\033[0m"
+echo -e "\033[1;32m🎉 视频超分压制任务圆满完成！\033[0m"
+echo -e "\033[1;32m==============================================================================\033[0m"
+EOF
+
+    chmod +x "$gen_script_path"
+
+    # 打印最终生成展示区
+    print_header
+    echo -e "${BOLD}${GREEN}==============================================================================${NC}"
+    echo -e "${BOLD}${GREEN}🎉 任务配置完成！独立脚本已生成，未自动执行，请查看以下信息：${NC}"
+    echo -e "${BOLD}${GREEN}==============================================================================${NC}\n"
+
+    echo -e "${BOLD}${YELLOW}📄 方式一：直接运行为您生成的独立脚本 (推荐)${NC}"
+    echo -e "${CYAN}------------------------------------------------------------------------------${NC}"
+    echo -e "  ${BOLD}bash ${gen_script_path}${NC}"
+    echo -e "  或后台挂起执行 (防止断连):"
+    echo -e "  ${BOLD}nohup bash ${gen_script_path} > encode.log 2>&1 &${NC}"
+    echo -e "  (查看实时进度: ${BOLD}tail -f encode.log${NC})\n"
+
+    echo -e "${BOLD}${YELLOW}📋 方式二：手动复制以下完整单行/多行 Shell 命令到终端执行${NC}"
+    echo -e "${CYAN}------------------------------------------------------------------------------${NC}"
+    
+    echo -e "${CYAN}# 1. 导入环境变量：${NC}"
+    echo -e "${BOLD}export PATH=\"/usr/local/cuda/bin:${FFMPEG_INSTALL_DIR}/bin:\$PATH\""
+    echo -e "export LD_LIBRARY_PATH=\"${PROJECT_ROOT}/build:${FFMPEG_INSTALL_DIR}/lib:/usr/local/cuda/lib64:\$LD_LIBRARY_PATH\"${NC}"
+    if [ -n "$preload_str" ]; then
+        echo -e "${BOLD}${preload_str}${NC}"
+    fi
+
+    echo -e "\n${CYAN}# 2. 执行超分命令：${NC}"
+    if [ "$IS_CLIP" -eq 1 ]; then
+        echo -e "${BOLD}ffmpeg -y -ss ${CLIP_START} -i \"${input_video}\" -t ${CLIP_DURATION} -c copy \"${clip_intermediate}\" && \\${NC}"
+    fi
+    echo -e "${BOLD}${AJI_ENCODE_BIN} \\"
+    for ((i=0; i<${#cmd_args[@]}; i+=2)); do
+        if [ $((i+1)) -lt ${#cmd_args[@]} ]; then
+            echo -e "    ${cmd_args[$i]} ${cmd_args[$((i+1))]} \\"
+        else
+            echo -e "    ${cmd_args[$i]} \\"
+        fi
+    done | sed '$ s/ \\$//'
+    echo -e "${NC}"
+    echo -e "${CYAN}==============================================================================${NC}"
+}
+
+# 主执行流
+main() {
+    check_binaries
+    print_header
+    select_input_video
+    select_engine
+    select_clip_mode
+    select_output_path
+    select_encoder_and_quality
+    select_decoder_and_pixfmt
+    select_optional_flags
+    generate_final_command_and_script
+}
+
+main
