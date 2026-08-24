@@ -714,9 +714,14 @@ static int finalize_output(enc_ctx *c)
     av_dict_free(&mopt);
     if (r < 0) { AV(r); }
     c->opened = 1;
-
     for (int i = 0; i < c->aux_n; i++) {
-        av_interleaved_write_frame(c->ofmt, c->aux_buf[i]);
+        AVPacket *out = c->aux_buf[i];
+        int in_idx = out->stream_index;
+        int oidx = c->smap[in_idx];
+        out->stream_index = oidx;
+        av_packet_rescale_ts(out, c->ifmt->streams[in_idx]->time_base,
+                             c->ofmt->streams[oidx]->time_base);
+        av_interleaved_write_frame(c->ofmt, out);
         av_packet_free(&c->aux_buf[i]);
     }
     c->aux_n = 0;
@@ -1101,15 +1106,14 @@ static int run(enc_ctx *c)
             AVStream *in = c->ifmt->streams[pkt->stream_index];
             int oidx = c->smap[pkt->stream_index];
             AVPacket *out = av_packet_clone(pkt);
-            out->stream_index = oidx;
-            av_packet_rescale_ts(out, in->time_base,
-                                 c->opened ? c->ofmt->streams[oidx]->time_base
-                                           : in->time_base);
             if (c->opened) {
+                out->stream_index = oidx;
+                av_packet_rescale_ts(out, in->time_base, c->ofmt->streams[oidx]->time_base);
                 av_interleaved_write_frame(c->ofmt, out);
                 av_packet_free(&out);
             } else {
-                /* header not written yet: buffer */
+                /* header not written yet: buffer with input stream_index */
+                out->stream_index = pkt->stream_index;
                 if (c->aux_n == c->aux_cap) {
                     c->aux_cap = c->aux_cap ? c->aux_cap * 2 : 16;
                     c->aux_buf = av_realloc_f(c->aux_buf, c->aux_cap,
