@@ -98,6 +98,12 @@ typedef struct {
     int no_zerocopy;
     int pipeline_depth;
 
+    /* optional RIFE in direct-engine mode */
+    const char *rife_model;
+    int rife_factor;
+    int rife_before;
+    double rife_scd_threshold;
+
     /* direct mode (testing) */
     const char *engine;
     int max_w, max_h;
@@ -210,9 +216,13 @@ typedef struct {
     enum AVPixelFormat out_pixfmt;   /* final software-encoder pix_fmt */
     int             passthrough;     /* no chain active: transcode only */
     int             rife;            /* RIFE active */
+    int             rife_first;      /* interpolate source, then upscale */
+    int             rife_w, rife_h;  /* RIFE working resolution */
+    int             rife_pre_resize; /* source -> work resize before RIFE */
     int             rnum, rden;
     enum AVPixelFormat sw_fmt;       /* pool sw_format: NV12/P010LE/YUV444P16LE */
     AVBufferRef    *aji_pool;        /* CUDA frames pool aji writes into */
+    AVBufferRef    *rife_pool;       /* source/work-res RIFE output pool */
 
     /* output */
     AVFormatContext *ofmt;
@@ -244,6 +254,7 @@ typedef struct {
     /* bookkeeping */
     int64_t  out_frames;
     int64_t  src_frames_est;
+    int64_t  src_frames_seen;
     int64_t  scene_dupes;
     int64_t  start_time_us;
     int      color_space, color_range, color_pri, color_trc, chroma_loc;
@@ -436,6 +447,11 @@ static int init_aji(enc_ctx *c)
         .max_width      = c->src_w,
         .max_height     = c->src_h,
         .log            = aji_log_cb,
+        .rife_model     = c->o.rife_model,
+        .rife_factor_num = c->o.rife_factor,
+        .rife_factor_den = 1,
+        .rife_before_upscale = c->o.rife_before,
+        .rife_scene_detect_threshold = c->o.rife_scd_threshold,
     };
     c->aji = aji_create(&p);
     if (!c->aji) { loge("aji_create failed"); return -1; }
@@ -472,6 +488,12 @@ static int init_aji(enc_ctx *c)
             return -1;
         }
         c->rife = 1;
+        c->rife_first = aji_rife_before_upscale(c->aji);
+        c->rife_w = c->src_w;
+        c->rife_h = c->src_h;
+        if (c->rife_first &&
+            aji_pre_resize(c->aji, &c->rife_w, &c->rife_h))
+            c->rife_pre_resize = 1;
         c->out_fps = av_mul_q(c->out_fps, (AVRational){c->rnum, c->rden});
     }
     return 0;
@@ -495,6 +517,31 @@ static int init_aji_pool(enc_ctx *c)
     if (av_hwframe_ctx_init(c->aji_pool) < 0) {
         loge("CUDA frame pool init failed for sw_format=%s",
              av_get_pix_fmt_name(c->sw_fmt));
+        return -1;
+    }
+    return 0;
+}
+
+/* RIFE-before-upscale needs a source/work-resolution CUDA pool for the
+ * interpolated frame. It deliberately uses the source format: interpolation
+ * stays NV12/P010, and the following upscale converts to the requested output
+ * format in the normal aji_pool. */
+static int init_rife_pool(enc_ctx *c)
+{
+    if (!c->rife || !c->rife_first)
+        return 0;
+    c->rife_pool = av_hwframe_ctx_alloc(c->hw_device);
+    if (!c->rife_pool) { loge("av_hwframe_ctx_alloc (RIFE) failed"); return -1; }
+    AVHWFramesContext *fc = (AVHWFramesContext *)c->rife_pool->data;
+    fc->format = AV_PIX_FMT_CUDA;
+    fc->sw_format = c->src_aji_fmt == AJI_FMT_P010
+                        ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
+    fc->width = c->rife_w;
+    fc->height = c->rife_h;
+    fc->initial_pool_size = 8;
+    if (av_hwframe_ctx_init(c->rife_pool) < 0) {
+        loge("CUDA RIFE frame pool init failed for %dx%d", c->rife_w,
+             c->rife_h);
         return -1;
     }
     return 0;
@@ -989,7 +1036,7 @@ static int push_upscale(enc_ctx *c, AVFrame *dec)
     return 0;
 }
 
-/* ---- RIFE: synchronous upscale of neighbors + interpolation -------------- */
+/* ---- RIFE: one decode -> interpolate/upscale -> one encode ---------------- */
 
 static AVFrame *upscale_one(enc_ctx *c, AVFrame *dec)
 {
@@ -1015,7 +1062,10 @@ static AVFrame *upscale_one(enc_ctx *c, AVFrame *dec)
     return out;
 }
 
-static int push_rife(enc_ctx *c, AVFrame *dec)
+/* Default/legacy order: upscale each source frame, then interpolate the
+ * upscaled pair. This preserves maximum detail at the cost of running RIFE at
+ * the (usually much larger) output resolution. */
+static int push_rife_after(enc_ctx *c, AVFrame *dec)
 {
     if (!dec) {
         /* emit the final upscaled frame, no successor to interpolate with */
@@ -1077,6 +1127,115 @@ static int push_rife(enc_ctx *c, AVFrame *dec)
     return 0;
 }
 
+/* Apply a configured pre-RIFE resize, if present. Ownership of `dec` is
+ * consumed either way; without a resize the same frame is returned. */
+static AVFrame *prepare_rife_input(enc_ctx *c, AVFrame *dec)
+{
+    if (!c->rife_pre_resize)
+        return dec;
+
+    AVFrame *work = av_frame_alloc();
+    if (!work || av_hwframe_get_buffer(c->rife_pool, work, 0) < 0) {
+        loge("hwframe_get_buffer (pre-RIFE resize) failed");
+        av_frame_free(&work);
+        av_frame_free(&dec);
+        return NULL;
+    }
+    aji_frame in_f, out_f;
+    fill_aji_frame(c, &in_f, dec, 0);
+    fill_aji_frame(c, &out_f, work, 0);
+    int ret = aji_resize(c->aji, &in_f, &out_f, c->stream);
+    av_frame_free(&dec);
+    if (ret != AJI_OK) {
+        loge("aji_resize: %d: %s", ret, aji_last_error(c->aji));
+        av_frame_free(&work);
+        return NULL;
+    }
+    uint64_t ticket = aji_flush(c->aji, c->stream);
+    if (ticket && aji_wait(c->aji, ticket) != AJI_OK) {
+        loge("aji_wait after pre-RIFE resize failed: %s",
+             aji_last_error(c->aji));
+        av_frame_free(&work);
+        return NULL;
+    }
+    return work;
+}
+
+/* Fast default order: interpolate source/work-resolution neighbors first,
+ * then send every real and generated frame through the selected upscale
+ * engine. All frames remain CUDA-resident throughout. */
+static int push_rife_before(enc_ctx *c, AVFrame *dec)
+{
+    if (!dec) {
+        if (c->have_prev) {
+            AVFrame *up = upscale_one(c, c->up_prev);
+            if (!up) return -1;
+            int er = emit_output(c, up);
+            av_frame_free(&up);
+            if (er < 0) return -1;
+        }
+        return 0;
+    }
+
+    AVFrame *work = prepare_rife_input(c, dec);
+    if (!work) return -1;
+    if (!c->have_prev) {
+        c->up_prev = work;
+        c->have_prev = 1;
+        return 0;
+    }
+    c->up_cur = work;
+
+    AVFrame *base_up = upscale_one(c, c->up_prev);
+    if (!base_up) return -1;
+    int er = emit_output(c, base_up);
+    av_frame_free(&base_up);
+    if (er < 0) return -1;
+
+    const int phases = c->rnum / c->rden;
+    for (int k = 1; k < phases; k++) {
+        AVFrame *interp = av_frame_alloc();
+        if (!interp || av_hwframe_get_buffer(c->rife_pool, interp, 0) < 0) {
+            loge("hwframe_get_buffer (source RIFE) failed");
+            av_frame_free(&interp);
+            return -1;
+        }
+        aji_frame a, b, o;
+        fill_aji_frame(c, &a, c->up_prev, 0);
+        fill_aji_frame(c, &b, c->up_cur, 0);
+        fill_aji_frame(c, &o, interp, 0);
+        int ret = aji_infer_rife(c->aji, &a, &b,
+                                 (double)k / phases, &o, c->stream);
+        AVFrame *source = interp;
+        if (ret == AJI_SCENE) {
+            source = c->up_prev;
+            c->scene_dupes++;
+        } else if (ret != AJI_OK) {
+            loge("aji_infer_rife: %d: %s", ret, aji_last_error(c->aji));
+            av_frame_free(&interp);
+            return -1;
+        }
+
+        AVFrame *up = upscale_one(c, source);
+        av_frame_free(&interp);
+        if (!up) return -1;
+        er = emit_output(c, up);
+        av_frame_free(&up);
+        if (er < 0) return -1;
+    }
+
+    av_frame_free(&c->up_prev);
+    c->up_prev = c->up_cur;
+    c->up_cur = NULL;
+    return 0;
+}
+
+static int push_rife(enc_ctx *c, AVFrame *dec)
+{
+    return c->rife_first ? push_rife_before(c, dec)
+                         : push_rife_after(c, dec);
+}
+
 /* ---- main demux/decode loop ---------------------------------------------- */
 
 static int run(enc_ctx *c)
@@ -1096,6 +1255,7 @@ static int run(enc_ctx *c)
                 }
                 if (r < 0) { av_frame_free(&fr); AV(r); }
                 /* fr is owned by the pipeline now */
+                c->src_frames_seen++;
                 if (c->rife) {
                     if (push_rife(c, fr) < 0) goto done;
                 } else {
@@ -1132,6 +1292,7 @@ static int run(enc_ctx *c)
         int r = avcodec_receive_frame(c->dec, fr);
         if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) { av_frame_free(&fr); break; }
         if (r < 0) { av_frame_free(&fr); AV(r); }
+        c->src_frames_seen++;
         if (c->rife) { if (push_rife(c, fr) < 0) goto done; }
         else         { if (push_upscale(c, fr) < 0) goto done; }
     }
@@ -1147,9 +1308,11 @@ static int run(enc_ctx *c)
     AV(av_write_trailer(c->ofmt));
 
     if (c->rife) {
-        int64_t expect = (int64_t)(c->src_frames_est *
-                         (double)c->rnum / c->rden + 0.5);
-        loge("rife: produced %lld frames (~expected %lld), %lld scene dupes",
+        const int phases = c->rnum / c->rden;
+        int64_t expect = c->src_frames_seen > 0
+                             ? c->src_frames_seen * phases - (phases - 1)
+                             : 0;
+        loge("rife: produced %lld frames (expected %lld), %lld scene dupes",
              (long long)c->out_frames, (long long)expect,
              (long long)c->scene_dupes);
     }
@@ -1184,6 +1347,7 @@ static void cleanup(enc_ctx *c)
     if (c->aji) aji_destroy(&c->aji);
     if (c->stream) cudaStreamDestroy(c->stream);
     av_buffer_unref(&c->aji_pool);
+    av_buffer_unref(&c->rife_pool);
     if (c->enc) avcodec_free_context(&c->enc);
     if (c->dec) avcodec_free_context(&c->dec);
     if (c->ofmt) {
@@ -1213,7 +1377,11 @@ static void usage(void)
 " [--progress none|line|json]\n"
 "           [--build-only] [--log <f>] [--decoder auto|nvdec|cpu]"
 " [--backend tensorrt]\n"
-"           (direct mode: --engine <e> --max-width W --max-height H)\n");
+"           (direct mode: --engine <e> --max-width W --max-height H\n"
+"            [--rife-model <basename> --rife-model-dir <d>]"
+" [--rife-factor N]\n"
+"            [--rife-order before|after]"
+" [--rife-scene-threshold 0.15])\n");
 }
 
 int main(int argc, char **argv)
@@ -1225,6 +1393,9 @@ int main(int argc, char **argv)
     c.o.progress = PROG_LINE;
     c.o.decoder = DEC_AUTO;
     c.o.pipeline_depth = 4;
+    c.o.rife_factor = 2;
+    c.o.rife_before = 1;
+    c.o.rife_scd_threshold = 0.150;
     c.o.pix_fmt = OUT_420P10;     /* default: 10-bit 4:2:0 (matches old pipeline) */
     g_log = stderr;
 
@@ -1244,6 +1415,16 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--slot")) c.o.slot = atoi(argv[++i]);
         else if (!strcmp(a, "--model-dir")) c.o.model_dir = argv[++i];
         else if (!strcmp(a, "--rife-model-dir")) c.o.rife_model_dir = argv[++i];
+        else if (!strcmp(a, "--rife-model")) c.o.rife_model = argv[++i];
+        else if (!strcmp(a, "--rife-factor")) c.o.rife_factor = atoi(argv[++i]);
+        else if (!strcmp(a, "--rife-order")) {
+            const char *v = argv[++i];
+            if (!strcmp(v, "before")) c.o.rife_before = 1;
+            else if (!strcmp(v, "after")) c.o.rife_before = 0;
+            else { loge("unknown --rife-order '%s' (before|after)", v); return 2; }
+        }
+        else if (!strcmp(a, "--rife-scene-threshold"))
+            c.o.rife_scd_threshold = atof(argv[++i]);
         else if (!strcmp(a, "--trtexec")) c.o.trtexec = argv[++i];
         else if (!strcmp(a, "--trtexec-env")) c.o.trtexec_env = argv[++i];
         else if (!strcmp(a, "--backend")) c.o.backend = argv[++i];
@@ -1295,6 +1476,18 @@ int main(int argc, char **argv)
         usage(); return 2;
     }
     if (!c.o.conf && !c.o.engine) { loge("need --conf or --engine"); return 2; }
+    if (c.o.rife_model && !c.o.engine) {
+        loge("--rife-model is for direct --engine mode; conf mode reads RIFE from its chain");
+        return 2;
+    }
+    if (c.o.rife_model && !c.o.rife_model_dir) {
+        loge("--rife-model requires --rife-model-dir");
+        return 2;
+    }
+    if (c.o.rife_model && (c.o.rife_factor < 2 || c.o.rife_factor > 8)) {
+        loge("--rife-factor must be an integer from 2 to 8");
+        return 2;
+    }
     if (c.o.final_h > 0 && c.o.final_pct > 0) {
         loge("--final-resize-height and --final-resize-factor are exclusive");
         return 2;
@@ -1322,6 +1515,7 @@ int main(int argc, char **argv)
 
     if (resize_needed(&c)) compute_final_dims(&c);
     if (!c.passthrough && init_aji_pool(&c) < 0) goto out;
+    if (init_rife_pool(&c) < 0) goto out;
     if (open_decoder(&c) < 0) goto out;
     if (open_output(&c) < 0) goto out;
     if (run(&c) < 0) goto out;

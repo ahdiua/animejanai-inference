@@ -1,5 +1,5 @@
 /*
- * aji.h — AnimeJaNai inference shim, C ABI (version 8).
+ * aji.h — AnimeJaNai inference shim, C ABI (version 9).
  *
  * Boundary between the mpv filter (mingw/gcc world) and the inference
  * backends (MSVC world on Windows). Only C types and opaque handles
@@ -39,7 +39,7 @@ extern "C" {
 #  define AJI_EXPORT __attribute__((visibility("default")))
 #endif
 
-#define AJI_API_VERSION 8
+#define AJI_API_VERSION 9
 
 typedef struct aji_ctx aji_ctx;
 
@@ -114,6 +114,16 @@ typedef struct aji_create_params {
 
     aji_log_fn log;
     void *log_opaque;
+
+    /* optional RIFE in direct mode (appended in ABI v9). `rife_model` is
+     * the ONNX basename without .onnx, found below rife_model_dir. A factor
+     * numerator <= denominator disables interpolation. Conf mode continues
+     * to take these values from the selected chain and ignores these fields. */
+    const char *rife_model;
+    int rife_factor_num;
+    int rife_factor_den;
+    int rife_before_upscale;
+    double rife_scene_detect_threshold;
 } aji_create_params;
 
 typedef struct aji_frame {

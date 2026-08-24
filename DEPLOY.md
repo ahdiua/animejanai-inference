@@ -401,6 +401,13 @@ aji_encode --input <f> --output <f> [选项...]
   --log <file>            日志输出到文件
   --build-only            仅构建 Engine，不执行编码
 
+直连 Engine 模式的可选 RIFE 参数（与超分同一管道）:
+  --rife-model <name>     RIFE ONNX 文件名（不含 .onnx，如 rife_v4.26）
+  --rife-model-dir <dir>  RIFE ONNX 与 Engine 缓存目录
+  --rife-factor <N>       整数插帧倍率 2-8（默认 2）
+  --rife-order <order>    before（先插帧再超分，默认）或 after
+  --rife-scene-threshold  转场检测阈值（默认 0.150）
+
 配置模式（替代 --engine 直连模式）:
   --conf <file>           animejanai.conf 配置文件路径
   --slot <N>              配置 Slot 编号
@@ -409,6 +416,18 @@ aji_encode --input <f> --output <f> [选项...]
   --rife-model-dir <dir>  RIFE 插帧模型目录
   --backend tensorrt      推理后端（默认 tensorrt）
 ```
+
+例如，使用同一次解码/编码完成 RIFE 2x 插帧与 2x 超分：
+
+```sh
+aji_encode --input input.mkv --output output.mkv \
+  --engine models/balanced_1080p.engine --max-width 1920 --max-height 1080 \
+  --rife-model-dir onnx/rife --rife-model rife_v4.26 \
+  --rife-factor 2 --rife-order before \
+  --decoder nvdec --vcodec hevc_nvenc --pix-fmt yuv420p10
+```
+
+首次运行会按 RIFE 工作分辨率构建并缓存 TensorRT Engine；后续任务直接复用。
 
 ---
 

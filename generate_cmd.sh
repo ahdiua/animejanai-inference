@@ -57,6 +57,12 @@ DECODER="nvdec"
 PIX_FMT="yuv420p10"
 OVERWRITE_FLAG=""
 EXTRA_FLAGS=()
+RIFE_ENABLED=0
+RIFE_MODEL=""
+RIFE_MODEL_DIR="${PROJECT_ROOT}/onnx/rife"
+RIFE_FACTOR=2
+RIFE_ORDER="before"
+RIFE_SCD_THRESHOLD="0.150"
 
 print_header() {
     clear 2>/dev/null || true
@@ -79,7 +85,7 @@ check_binaries() {
 
 # 2. 视频输入选择 (自动真实路径去重)
 select_input_video() {
-    echo -e "${BOLD}${CYAN}[步骤 1/7] 选择输入视频文件 (Input Video)${NC}"
+    echo -e "${BOLD}${CYAN}[步骤 1/8] 选择输入视频文件 (Input Video)${NC}"
     
     # 自动搜索常见目录下的视频文件（自动规范化为真实绝对路径并严格去重）
     local search_dirs=("$PWD" "$PROJECT_ROOT" "$HOME" "/root" "$HOME/videos" "$HOME/autodl-tmp" "/root/autodl-tmp" "/root/autodl-fs")
@@ -156,7 +162,7 @@ select_input_video() {
 
 # 3. 选择/匹配 TensorRT Engine 模型 (自动真实路径去重)
 select_engine() {
-    echo -e "${BOLD}${CYAN}[步骤 2/7] 选择超分 TensorRT Engine 模型${NC}"
+    echo -e "${BOLD}${CYAN}[步骤 2/8] 选择超分 TensorRT Engine 模型${NC}"
 
     local search_dirs=("$MODELS_DIR" "$PROJECT_ROOT" "$HOME" "/root/models" "/root")
     local raw_engines=()
@@ -221,9 +227,77 @@ select_engine() {
     echo ""
 }
 
-# 4. 选择压制范围（全片或截取片段测试）
+# 4. 可选 RIFE 插帧（与超分在同一 aji_encode 管道内执行）
+select_rife() {
+    echo -e "${BOLD}${CYAN}[步骤 3/8] RIFE AI 插帧设置 (单次解码/编码管道)${NC}"
+
+    local search_dirs=("${PROJECT_ROOT}/onnx/rife" "${MODELS_DIR}/rife" "${HOME}/onnx/rife")
+    local raw_models=()
+    for d in "${search_dirs[@]}"; do
+        [ -d "$d" ] || continue
+        while IFS= read -r f; do
+            raw_models+=("$(readlink -f "$f")")
+        done < <(find -L "$d" -maxdepth 1 -type f -name 'rife_v*.onnx' 2>/dev/null)
+    done
+
+    local found_models=()
+    if [ ${#raw_models[@]} -gt 0 ]; then
+        mapfile -t found_models < <(printf "%s\n" "${raw_models[@]}" | sort -uV)
+    fi
+    if [ ${#found_models[@]} -eq 0 ]; then
+        echo -e "${YELLOW}未找到 RIFE ONNX（预期目录：${PROJECT_ROOT}/onnx/rife），本次不启用插帧。${NC}\n"
+        RIFE_ENABLED=0
+        return
+    fi
+
+    read -rp "是否同时启用 RIFE AI 插帧？[y/N, 默认 N]: " enable_rife
+    enable_rife=${enable_rife:-N}
+    if [[ ! "$enable_rife" =~ ^[Yy]$ ]]; then
+        RIFE_ENABLED=0
+        echo -e "${GREEN}✔ 本次仅执行超分，不插帧。${NC}\n"
+        return
+    fi
+
+    RIFE_ENABLED=1
+    echo -e "检测到以下 RIFE 模型："
+    local default_idx=1
+    for i in "${!found_models[@]}"; do
+        local name="$(basename "${found_models[$i]}")"
+        if [ "$name" = "rife_v4.26.onnx" ]; then
+            default_idx=$((i + 1))
+        fi
+        echo -e "  ${BOLD}$((i+1)))${NC} ${name}"
+    done
+    read -rp "请选择 RIFE 模型 [1-${#found_models[@]}, 默认 ${default_idx}]: " rife_idx
+    rife_idx=${rife_idx:-$default_idx}
+    if [[ ! "$rife_idx" =~ ^[0-9]+$ ]] ||
+       [ "$rife_idx" -lt 1 ] || [ "$rife_idx" -gt "${#found_models[@]}" ]; then
+        rife_idx=$default_idx
+    fi
+    local rife_file="${found_models[$((rife_idx-1))]}"
+    RIFE_MODEL_DIR="$(dirname "$rife_file")"
+    RIFE_MODEL="$(basename "$rife_file" .onnx)"
+
+    echo -e "\n插帧倍率："
+    echo -e "  ${BOLD}1)${NC} ${GREEN}2x（推荐，如 24→48 / 30→60 fps）${NC}"
+    echo -e "  ${BOLD}2)${NC} 4x（如 24→96 fps，耗时和输出体积显著增加）"
+    read -rp "请选择 [1-2, 默认 1]: " factor_choice
+    [ "${factor_choice:-1}" = "2" ] && RIFE_FACTOR=4 || RIFE_FACTOR=2
+
+    echo -e "\n处理顺序："
+    echo -e "  ${BOLD}1)${NC} ${GREEN}先插帧、再超分（推荐；RIFE 在源分辨率运行）${NC}"
+    echo -e "  ${BOLD}2)${NC} 先超分、再插帧（细节优先；RIFE 在输出分辨率运行，通常很慢）"
+    read -rp "请选择 [1-2, 默认 1]: " order_choice
+    [ "${order_choice:-1}" = "2" ] && RIFE_ORDER="after" || RIFE_ORDER="before"
+
+    read -rp "转场检测阈值 [默认 0.150]: " scd_input
+    RIFE_SCD_THRESHOLD=${scd_input:-0.150}
+    echo -e "${GREEN}✔ RIFE: ${BOLD}${RIFE_MODEL}${NC} | ${RIFE_FACTOR}x | ${RIFE_ORDER} upscale | SCD ${RIFE_SCD_THRESHOLD}${NC}\n"
+}
+
+# 5. 选择压制范围（全片或截取片段测试）
 select_clip_mode() {
-    echo -e "${BOLD}${CYAN}[步骤 3/7] 压制范围选择 (Full Video or Clip Test)${NC}"
+    echo -e "${BOLD}${CYAN}[步骤 4/8] 压制范围选择 (Full Video or Clip Test)${NC}"
     echo -e "  ${BOLD}1)${NC} ${GREEN}整片完整超分压制${NC} (Full Encode - 标准输出整部影片)"
     echo -e "  ${BOLD}2)${NC} ${YELLOW}截取指定时间段进行测试${NC} (Clip Slice Test - 快速验证画质与压制速度)"
     read -rp "请选择 [1-2, 默认 1]: " clip_choice
@@ -245,9 +319,9 @@ select_clip_mode() {
     fi
 }
 
-# 5. 输出文件路径设置
+# 6. 输出文件路径设置
 select_output_path() {
-    echo -e "${BOLD}${CYAN}[步骤 4/7] 设置输出文件路径 (Output Destination)${NC}"
+    echo -e "${BOLD}${CYAN}[步骤 5/8] 设置输出文件路径 (Output Destination)${NC}"
 
     local dir_name="$(dirname "$INPUT_VIDEO")"
     local base_name="$(basename "$INPUT_VIDEO")"
@@ -256,9 +330,17 @@ select_output_path() {
 
     local default_out=""
     if [ "$IS_CLIP" -eq 1 ]; then
-        default_out="${dir_name}/${raw_name}_clip_${CLIP_DURATION}s_upscaled.mkv"
+        if [ "$RIFE_ENABLED" -eq 1 ]; then
+            default_out="${dir_name}/${raw_name}_clip_${CLIP_DURATION}s_rife${RIFE_FACTOR}x_upscaled.mkv"
+        else
+            default_out="${dir_name}/${raw_name}_clip_${CLIP_DURATION}s_upscaled.mkv"
+        fi
     else
-        default_out="${dir_name}/${raw_name}_upscaled.mkv"
+        if [ "$RIFE_ENABLED" -eq 1 ]; then
+            default_out="${dir_name}/${raw_name}_rife${RIFE_FACTOR}x_upscaled.mkv"
+        else
+            default_out="${dir_name}/${raw_name}_upscaled.mkv"
+        fi
     fi
 
     echo -e "默认推荐输出路径: ${BOLD}${default_out}${NC}"
@@ -280,9 +362,9 @@ select_output_path() {
     echo -e "${GREEN}✔ 输出路径: ${BOLD}${OUTPUT_VIDEO}${NC}\n"
 }
 
-# 6. 选择编码器与画质配置
+# 7. 选择编码器与画质配置
 select_encoder_and_quality() {
-    echo -e "${BOLD}${CYAN}[步骤 5/7] 选择视频编码器与画质参数 (Video Encoder & Quality)${NC}"
+    echo -e "${BOLD}${CYAN}[步骤 6/8] 选择视频编码器与画质参数 (Video Encoder & Quality)${NC}"
     echo -e "  ${BOLD}1)${NC} ${GREEN}hevc_nvenc (NVIDIA NVENC H.265 硬件编码 - 强烈推荐，极速高画质)${NC}"
     echo -e "  ${BOLD}2)${NC} h264_nvenc (NVIDIA NVENC H.264 硬件编码 - 兼容性好)"
     echo -e "  ${BOLD}3)${NC} libx265   (CPU H.265 软件编码 - 极致压缩率，但速度慢)"
@@ -347,9 +429,9 @@ select_encoder_and_quality() {
     echo -e "${GREEN}✔ 编码器: ${BOLD}${VCODEC}${NC} | 参数: ${BOLD}${VQUALITY}${NC}\n"
 }
 
-# 7. 选择解码器与像素格式
+# 8. 选择解码器与像素格式
 select_decoder_and_pixfmt() {
-    echo -e "${BOLD}${CYAN}[步骤 6/7] 硬件解码器与色彩像素格式 (Decoder & Pixel Format)${NC}"
+    echo -e "${BOLD}${CYAN}[步骤 7/8] 硬件解码器与色彩像素格式 (Decoder & Pixel Format)${NC}"
 
     echo -e "解码器选择 (--decoder)："
     echo -e "  ${BOLD}1)${NC} ${GREEN}nvdec (NVIDIA 硬件加速解码 - 推荐，显存零拷贝极速)${NC}"
@@ -380,11 +462,9 @@ select_decoder_and_pixfmt() {
     echo -e "${GREEN}✔ 解码器: ${BOLD}${DECODER}${NC} | 像素格式: ${BOLD}${PIX_FMT}${NC}\n"
 }
 
-# 8. 音轨/字幕与降采样选项
+# 9. 音轨/字幕与降采样选项
 select_optional_flags() {
-    echo -e "${BOLD}${CYAN}[步骤 7/7] 音频、字幕与输出缩放附加选项${NC}"
-    
-    EXTRA_FLAGS=()
+    echo -e "${BOLD}${CYAN}[步骤 8/8] 音频、字幕与输出缩放附加选项${NC}"
 
     read -rp "是否保留原视频中的全部音频流？[Y/n, 默认 Y]: " keep_audio
     keep_audio=${keep_audio:-Y}
@@ -433,6 +513,13 @@ generate_final_command_and_script() {
     cmd_args+=("--vcodec" "${VCODEC}")
     cmd_args+=("--vquality" "\"${VQUALITY}\"")
     cmd_args+=("--pix-fmt" "${PIX_FMT}")
+    if [ "$RIFE_ENABLED" -eq 1 ]; then
+        cmd_args+=("--rife-model-dir" "\"${RIFE_MODEL_DIR}\"")
+        cmd_args+=("--rife-model" "${RIFE_MODEL}")
+        cmd_args+=("--rife-factor" "${RIFE_FACTOR}")
+        cmd_args+=("--rife-order" "${RIFE_ORDER}")
+        cmd_args+=("--rife-scene-threshold" "${RIFE_SCD_THRESHOLD}")
+    fi
     [ -n "$OVERWRITE_FLAG" ] && cmd_args+=("${OVERWRITE_FLAG}")
     [ ${#EXTRA_FLAGS[@]} -gt 0 ] && cmd_args+=("${EXTRA_FLAGS[@]}")
 
@@ -454,6 +541,9 @@ echo -e "\033[1;35m🚀 开始执行 AnimeJaNai 视频超分压制任务\033[0m"
 echo -e "  - 输入文件: ${INPUT_VIDEO}"
 echo -e "  - 输出文件: ${OUTPUT_VIDEO}"
 echo -e "  - Engine:   ${ENGINE_FILE}"
+if [ "${RIFE_ENABLED}" -eq 1 ]; then
+    echo -e "  - RIFE:     ${RIFE_MODEL} (${RIFE_FACTOR}x, ${RIFE_ORDER} upscale, SCD ${RIFE_SCD_THRESHOLD})"
+fi
 echo -e "  - 编码器:   ${VCODEC} (${VQUALITY})"
 echo -e "  - 像素格式: ${PIX_FMT}"
 echo -e "\033[1;36m------------------------------------------------------------------------------\033[0m"
@@ -466,8 +556,8 @@ EOF
 echo -e "\033[0;33m[前置] 正在流拷贝无损快速截取 ${CLIP_DURATION} 秒测试片段...\033[0m"
 ffmpeg -y -ss "${CLIP_START}" -i "${INPUT_VIDEO}" -t "${CLIP_DURATION}" -c copy "${clip_intermediate}"
 
-# 3. 运行超分压制
-echo -e "\033[0;32m[核心] 启动 aji_encode 进行超分推理与编码...\033[0m"
+# 3. 运行单管道超分/插帧压制
+echo -e "\033[0;32m[核心] 启动 aji_encode 进行 AI 推理与编码...\033[0m"
 ${AJI_ENCODE_BIN} \\
     ${cmd_args[*]}
 
@@ -476,7 +566,7 @@ rm -f "${clip_intermediate}"
 EOF
     else
         cat << EOF >> "$gen_script_path"
-# 2. 启动 aji_encode 进行全视频超分压制
+# 2. 启动 aji_encode 进行全视频单管道超分/插帧压制
 ${AJI_ENCODE_BIN} \\
     ${cmd_args[*]}
 EOF
@@ -536,6 +626,7 @@ main() {
     print_header
     select_input_video
     select_engine
+    select_rife
     select_clip_mode
     select_output_path
     select_encoder_and_quality

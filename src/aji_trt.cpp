@@ -275,6 +275,10 @@ struct aji_ctx {
     ModelEngine direct;
     int scale = 0;
     int max_w = 0, max_h = 0;
+    std::string direct_rife_model;
+    int direct_rife_num = 1, direct_rife_den = 1;
+    bool direct_rife_before = true;
+    double direct_rife_scd_threshold = 0.150;
 
     void *buf[2] = {nullptr, nullptr};
     size_t buf_bytes = 0;
@@ -977,7 +981,13 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
     R.scd_threshold = chain->rife_scd_threshold;
 
     const std::string model =
-        rife_model_name(chain->rife_model, chain->rife_ensemble);
+        (!c->conf_mode && !c->direct_rife_model.empty())
+            ? c->direct_rife_model
+            : rife_model_name(chain->rife_model, chain->rife_ensemble);
+    if (model.empty()) {
+        c->set_error("invalid RIFE model name");
+        return false;
+    }
     char dims[64];
     snprintf(dims, sizeof(dims), "1x11x%dx%d", R.ph, R.pw);
     // strongly-typed build from the fp16-typed rife onnx (the shipped
@@ -1015,14 +1025,14 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
     const double factor = (double)R.num / R.den;
     if (R.pw != w || R.ph != h) {
         snprintf(buf, sizeof(buf),
-                 "Padded to %dx%d, applied RIFE v%d Interpolation %.3fx, "
+                 "Padded to %dx%d, applied RIFE %s Interpolation %.3fx, "
                  "cropped back to %dx%d;    New Video FPS: %.3f",
-                 R.pw, R.ph, chain->rife_model, factor, w, h, fps * factor);
+                 R.pw, R.ph, model.c_str(), factor, w, h, fps * factor);
     } else {
         snprintf(buf, sizeof(buf),
-                 "Applied RIFE v%d Interpolation %.3fx;    "
+                 "Applied RIFE %s Interpolation %.3fx;    "
                  "New Video FPS: %.3f",
-                 chain->rife_model, factor, fps * factor);
+                 model.c_str(), factor, fps * factor);
     }
     // RIFE-first runs after any hoisted pre-RIFE resize but before the upscale
     // models, so its step goes right after the pre-resize line (if one was
@@ -1127,6 +1137,27 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
     }
     c->max_w = params->max_width;
     c->max_h = params->max_height;
+    c->trtexec = params->trtexec ? params->trtexec : "trtexec";
+    c->trtexec_env = params->trtexec_env ? params->trtexec_env : "";
+    c->rife_model_dir = params->rife_model_dir ? params->rife_model_dir : "";
+    c->direct_rife_model = params->rife_model ? params->rife_model : "";
+    c->direct_rife_num = params->rife_factor_num;
+    c->direct_rife_den = params->rife_factor_den;
+    c->direct_rife_before = params->rife_before_upscale != 0;
+    c->direct_rife_scd_threshold =
+        params->rife_scene_detect_threshold > 0
+            ? params->rife_scene_detect_threshold
+            : 0.150;
+    if (!c->direct_rife_model.empty() && c->rife_model_dir.empty()) {
+        c->set_error("direct RIFE requires rife_model_dir");
+        return nullptr;
+    }
+    if (!c->direct_rife_model.empty() &&
+        (c->direct_rife_num <= c->direct_rife_den ||
+         c->direct_rife_den <= 0)) {
+        c->set_error("direct RIFE factor must be greater than 1");
+        return nullptr;
+    }
     {
         CtxGuard guard(c->cu_ctx);
         if (!guard.ok) {
@@ -1166,6 +1197,11 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         return AJI_ERR_SHAPE;
 
     if (!c->conf_mode) {
+        CtxGuard guard(c->cu_ctx);
+        if (!guard.ok) {
+            c->set_error("cuCtxPushCurrent failed");
+            return AJI_ERR_CUDA;
+        }
         if (w > c->max_w || h > c->max_h) {
             c->set_error("input %dx%d exceeds direct-mode max %dx%d", w, h,
                          c->max_w, c->max_h);
@@ -1180,6 +1216,37 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         c->in_w = w; c->in_h = h;
         c->out_w = (int)od.d[3]; c->out_h = (int)od.d[2];
         c->active = true;
+
+        rife_teardown(c);
+        c->log_info.clear();
+        c->log_steps.clear();
+        {
+            char buf[160];
+            snprintf(buf, sizeof(buf),
+                     "Original Video Resolution: %dx%d;    Original Video FPS: %.3f",
+                     w, h, fps);
+            c->log_info.push_back(buf);
+            snprintf(buf, sizeof(buf),
+                     "Applied direct upscale engine;    New Video Resolution: %dx%d",
+                     c->out_w, c->out_h);
+            c->log_steps.push_back(buf);
+        }
+        if (!c->direct_rife_model.empty()) {
+            AjiChainConf chain;
+            chain.rife = true;
+            chain.rife_factor_num = c->direct_rife_num;
+            chain.rife_factor_den = c->direct_rife_den;
+            chain.rife_before_upscale = c->direct_rife_before;
+            chain.rife_scd_threshold = c->direct_rife_scd_threshold;
+            const int rw = chain.rife_before_upscale ? w : c->out_w;
+            const int rh = chain.rife_before_upscale ? h : c->out_h;
+            if (!setup_rife(c, &chain, rw, rh, fps)) {
+                finalize_log(c);
+                return AJI_ERR_ENGINE;
+            }
+            c->rife.before_upscale = chain.rife_before_upscale;
+        }
+        finalize_log(c);
         if (out_w) *out_w = c->out_w;
         if (out_h) *out_h = c->out_h;
         return 1;
