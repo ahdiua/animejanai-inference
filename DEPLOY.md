@@ -56,17 +56,17 @@ ffmpeg/NVENC 硬件编码
 
 | 组件 | 最低版本 | 推荐版本 | 说明 |
 |------|---------|---------|------|
-| NVIDIA Driver | 535+ | 570+ | 需支持 CUDA 12.x+ |
-| CUDA Toolkit | 12.x | 13.x | 项目使用 CUDA C++ 编译 .cu 内核 |
-| TensorRT | 10.x | 10.12+ / 11.x | 超分模型推理引擎 |
+| NVIDIA Driver | 570+ | 570+ / 580+ | 需支持 CUDA 13.x+ |
+| CUDA Toolkit | 13.x | 13.x (严格要求) | 项目编译 sm_100 / sm_120 .cu 内核 |
+| TensorRT | 11.x | 11.x (严格要求) | 超分模型推理引擎 (强类型) |
 | CMake | 3.24+ | 3.28+ | 构建系统 |
 | GCC/G++ | 11+ | 13+ | C17 / C++17 编译器 |
-| ffmpeg (libav*) | 6.x | 7.x+ | aji_encode 需要开发库 |
+| ffmpeg (libav*) | 6.x | 7.x+ / 8.x (BtbN) | aji_encode 需要开发库 |
 | GPU 显存 | 4 GB | 8 GB+ | 4K 超分推理约需 3-4 GB |
 
 > [!IMPORTANT]
 > AutoDL 等平台的 GPU 容器通常已预装 NVIDIA 驱动和 CUDA Toolkit，可跳过 Step 1-2，直接从 Step 3 开始。
-> 启动容器时请选择 **CUDA 12.x 或 13.x 版本的镜像**。
+> 启动容器时请选择 **CUDA 13.x 版本的镜像**。
 
 ---
 
@@ -86,10 +86,10 @@ sudo reboot
 
 ---
 
-## 4. Step 2：安装 CUDA Toolkit
+## 4. Step 2：安装 CUDA Toolkit 13.x
 
 > [!NOTE]
-> AutoDL 镜像通常已有 CUDA。检查方法：`nvcc --version`。如已安装 12.x+ 可跳过。
+> AutoDL 镜像通常已有 CUDA。检查方法：`nvcc --version`。如已安装 13.x 可跳过。
 
 ### 方式 A：通过 NVIDIA 官方 .run 安装器（推荐，版本可控）
 
@@ -109,35 +109,34 @@ source ~/.bashrc
 nvcc --version
 ```
 
-### 方式 B：通过 apt（Ubuntu 官方源，版本可能较旧）
+### 方式 B：通过 deploy.sh 自动化脚本安装（推荐）
 
 ```bash
-sudo apt update
-sudo apt install -y nvidia-cuda-toolkit
+./deploy.sh --cuda
 ```
 
 ---
 
-## 5. Step 3：安装 TensorRT
+## 5. Step 3：安装 TensorRT 11.x
 
 ### 方式 A：通过 NVIDIA apt 仓库安装到系统路径（推荐，最简单）
 
 ```bash
 # 1. 添加 NVIDIA apt 仓库（如还没有）
 #    参考：https://docs.nvidia.com/tensorrt/install-guide/index.html
-#    以 CUDA 12.x 为例（请根据实际 CUDA 版本选择对应仓库）：
+#    以 CUDA 13.x 为例：
 
 # 安装 NVIDIA keyring
 wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
 sudo dpkg -i cuda-keyring_1.1-1_all.deb
 sudo apt update
 
-# 2. 安装 TensorRT（开发库 + 运行时 + trtexec 工具）
+# 2. 安装 TensorRT 11（开发库 + 运行时 + trtexec 工具）
 sudo apt install -y tensorrt tensorrt-dev
 
 # 3. 验证
 trtexec --help | head -1
-# 应输出类似：&&&& RUNNING TensorRT.trtexec [TensorRT v101200]
+# 应输出类似：&&&& RUNNING TensorRT.trtexec [TensorRT v110100]
 dpkg -l | grep nvinfer
 ```
 
@@ -148,10 +147,10 @@ dpkg -l | grep nvinfer
 ### 方式 B：手动下载 deb/tar 包解压
 
 ```bash
-# 从 https://developer.nvidia.com/tensorrt 下载对应 CUDA 版本的 tar 包
+# 从 https://developer.nvidia.com/tensorrt 下载对应 CUDA 13.x 版本的 tar 包
 # 解压到任意位置，例如 ~/sdk/tensorrt
 mkdir -p ~/sdk/tensorrt
-tar -xzf TensorRT-10.x.x.x.Linux.x86_64-gnu.cuda-12.x.tar.gz -C ~/sdk/tensorrt --strip-components=1
+tar -xzf TensorRT-11.x.x.x.Linux.x86_64-gnu.cuda-13.x.tar.gz -C ~/sdk/tensorrt --strip-components=1
 
 # 此时默认的 CMake 路径 ~/sdk/tensorrt/usr 即可用，无需额外参数
 # 或者将 trtexec 加入 PATH：
@@ -515,7 +514,7 @@ trtexec \
     --minShapes=input:1x3x64x64 \
     --optShapes=input:1x3x1080x1920 \
     --maxShapes=input:1x3x1080x1920 \
-    --fp16 --skipInference \
+    --skipInference \
     --saveEngine=~/models/performance_1080p.engine
 
 # 6. 超分测试

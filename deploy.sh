@@ -2,8 +2,8 @@
 # ==============================================================================
 # AnimeJaNai-Inference 交互式环境检测、安装与部署脚本
 # 适用环境：Ubuntu 24.04 / 22.04 LTS (AutoDL / 云 GPU 容器 / 本地 GPU 服务器)
-# 特别集成：AutoDL 旧源清理、动态匹配最高 CUDA Toolkit (支持 13.x / 12.8 / 多版本共存与保留)、
-#          NVIDIA 官方源配置、TensorRT 11 自动适配 (Strongly-Typed 无需 --fp16)、
+# 特别集成：AutoDL 旧源清理、严格要求 CUDA Toolkit 13.x 与 TensorRT 11.x 自动部署、
+#          NVIDIA 官方源配置、TensorRT 11 强类型自动适配、
 #          BtbN FFmpeg (n8.1/master) Shared、NVENC 容器多卡修复补丁 (libnvenc_fix)、
 #          Python venv、3 大常用超分模型与 1 分钟快速验证
 # ==============================================================================
@@ -117,8 +117,8 @@ get_available_cuda_packages() {
 
 # 卸载并彻底清理旧版 CUDA 软件包（用户主动选择清理时调用）
 purge_old_cuda_packages() {
-    echo -e "${CYAN}正在扫描并清理系统中残留的旧版本 CUDA 软件包...${NC}"
-    local old_pkgs=$(dpkg -l 2>/dev/null | awk '/^ii/ {print $2}' | grep -E '^(cuda|libcu|nsight)' | grep -E -- '-(12-[0-7]|11-[0-9]|10-[0-9])' || echo "")
+    echo -e "${CYAN}正在扫描并清理系统中残留的旧版本 CUDA 软件包 (CUDA < 13.x)...${NC}"
+    local old_pkgs=$(dpkg -l 2>/dev/null | awk '/^ii/ {print $2}' | grep -E '^(cuda|libcu|nsight)' | grep -E -- '-(12-[0-9]|11-[0-9]|10-[0-9])' || echo "")
     
     if [ -n "$old_pkgs" ]; then
         echo -e "${YELLOW}检测到以下旧版本 CUDA 软件包，正在通过 apt 彻底卸载以释放空间：${NC}"
@@ -131,7 +131,7 @@ purge_old_cuda_packages() {
         echo -e "${GREEN}✔ 系统中未发现冗余的早期 CUDA 软件包。${NC}"
     fi
 
-    for old_dir in /usr/local/cuda-12.[0-7] /usr/local/cuda-11.*; do
+    for old_dir in /usr/local/cuda-12.* /usr/local/cuda-11.* /usr/local/cuda-10.*; do
         if [ -d "$old_dir" ]; then
             echo -e "${CYAN}清理旧残留目录: ${old_dir}${NC}"
             run_as_root rm -rf "$old_dir"
@@ -176,6 +176,12 @@ check_nvidia_driver() {
     echo -e "  - GPU 型号:       ${BOLD}${GPU_NAME}${NC}"
     echo -e "  - 驱动版本:       ${BOLD}${DRIVER_VER}${NC}"
     echo -e "  - 支持最高 CUDA:  ${BOLD}${CUDA_MAX_VER}${NC}"
+
+    local drv_cuda_major=$(echo "$CUDA_MAX_VER" | cut -d. -f1)
+    if [ -n "$drv_cuda_major" ] && [ "$drv_cuda_major" -lt 13 ]; then
+        echo -e "${YELLOW}  ! 警告: 显卡驱动支持最高 CUDA 为 ${CUDA_MAX_VER} (< 13.0)。${NC}"
+        echo -e "${YELLOW}    项目严格要求 CUDA Toolkit 13.x，建议升级显卡驱动至 570+ / 580+。${NC}"
+    fi
 }
 
 # 检查系统信息
@@ -210,7 +216,16 @@ check_cuda_toolkit() {
 
     if [ -n "$nvcc_bin" ] && [ -x "$nvcc_bin" ]; then
         NVCC_VER=$("$nvcc_bin" --version | grep "release" | sed -E 's/.*release ([0-9]+\.[0-9]+).*/\1/')
-        echo -e "${GREEN}✔ 当前激活 CUDA Toolkit: ${BOLD}${NVCC_VER}${NC} (${nvcc_bin})"
+        local cuda_major=$(echo "$NVCC_VER" | cut -d. -f1)
+        
+        if [ -n "$cuda_major" ] && [ "$cuda_major" -ge 13 ]; then
+            echo -e "${GREEN}✔ 当前激活 CUDA Toolkit: ${BOLD}${NVCC_VER}${NC} (${nvcc_bin}) [符合 13.x 严格要求]"
+        else
+            echo -e "${RED}✖ 当前激活 CUDA Toolkit: ${BOLD}${NVCC_VER}${NC} (${nvcc_bin})"
+            echo -e "${RED}  [不符合要求] 作者严格要求 CUDA Toolkit 13.x (因需支持 sm_100 / sm_120 Blackwell 等架构)。${NC}"
+            echo -e "${YELLOW}  请在主菜单选择 [4] 安装 CUDA Toolkit 13.x。${NC}"
+        fi
+
         if [ -n "$active_target" ]; then
             echo -e "  - 软链接路径:     /usr/local/cuda -> ${active_target}"
         fi
@@ -223,9 +238,15 @@ check_cuda_toolkit() {
             done
             echo -e "  - 系统共存版本:   ${BOLD}${ver_list[*]}${NC} (已激活最高版本 ${NVCC_VER})"
         fi
-        return 0
+
+        if [ -n "$cuda_major" ] && [ "$cuda_major" -ge 13 ]; then
+            return 0
+        else
+            return 1
+        fi
     else
         echo -e "${YELLOW}✖ 未找到可用的 nvcc (CUDA Toolkit 未安装或未正确链接)。${NC}"
+        echo -e "${YELLOW}  项目严格要求 CUDA Toolkit 13.x，请通过菜单 [4] 安装。${NC}"
         return 1
     fi
 }
@@ -233,23 +254,37 @@ check_cuda_toolkit() {
 # 检查 TensorRT
 check_tensorrt() {
     echo -e "\n${BOLD}[4/9] 检查 TensorRT...${NC}"
-    local trt_ok=0
+    local trt_ok=1
+    local trt_major=""
 
     if command -v trtexec &>/dev/null; then
         TRT_VER=$(trtexec --help 2>&1 | head -n 2 | grep -o "TensorRT v[0-9]*" || echo "已安装")
         echo -e "${GREEN}✔ 已安装 trtexec 工具: ${BOLD}${TRT_VER}${NC}"
-        trt_ok=1
+        local trt_num=$(echo "$TRT_VER" | grep -oE "[0-9]+")
+        if [ -n "$trt_num" ] && [ ${#trt_num} -ge 2 ]; then
+            trt_major="${trt_num:0:2}"
+        fi
     elif [ -x "/usr/src/tensorrt/bin/trtexec" ]; then
         echo -e "${GREEN}✔ 找到 trtexec: /usr/src/tensorrt/bin/trtexec${NC}"
-        trt_ok=1
     else
         echo -e "${YELLOW}✖ 未在 PATH 找到 trtexec 工具。${NC}"
+        trt_ok=0
     fi
 
-    if [ -f "/usr/include/NvInfer.h" ] || [ -f "/usr/include/x86_64-linux-gnu/NvInfer.h" ] || [ -f "$HOME/sdk/tensorrt/usr/include/NvInfer.h" ]; then
-        echo -e "${GREEN}✔ 找到 NvInfer.h 头文件${NC}"
-    else
-        echo -e "${YELLOW}✖ 未检测到 TensorRT C++ 开发头文件 (NvInfer.h)${NC}"
+    local header_found=0
+    for h in "/usr/include/NvInferVersion.h" "/usr/include/x86_64-linux-gnu/NvInferVersion.h" "$HOME/sdk/tensorrt/usr/include/NvInferVersion.h" "/usr/include/NvInfer.h" "/usr/include/x86_64-linux-gnu/NvInfer.h" "$HOME/sdk/tensorrt/usr/include/NvInfer.h"; do
+        if [ -f "$h" ]; then
+            echo -e "${GREEN}✔ 找到 TensorRT 头文件: ${h}${NC}"
+            header_found=1
+            if [ -z "$trt_major" ] && grep -q "NV_TENSORRT_MAJOR" "$h"; then
+                trt_major=$(grep "NV_TENSORRT_MAJOR" "$h" | awk '{print $3}' | head -n 1)
+            fi
+            break
+        fi
+    done
+
+    if [ "$header_found" -eq 0 ]; then
+        echo -e "${YELLOW}✖ 未检测到 TensorRT C++ 开发头文件 (NvInfer.h / NvInferVersion.h)${NC}"
         trt_ok=0
     fi
 
@@ -258,6 +293,15 @@ check_tensorrt() {
     else
         echo -e "${YELLOW}✖ 未在动态链接器路径找到 libnvinfer.so${NC}"
         trt_ok=0
+    fi
+
+    if [ -n "$trt_major" ]; then
+        if [ "$trt_major" -ge 11 ]; then
+            echo -e "${GREEN}✔ TensorRT 版本符合要求: ${BOLD}v${trt_major}.x${NC} (>= 11.x)"
+        else
+            echo -e "${RED}✖ 当前 TensorRT 版本为 v${trt_major}.x，但作者严格要求 TensorRT 11.x！${NC}"
+            trt_ok=0
+        fi
     fi
 
     return $((1 - trt_ok))
@@ -462,41 +506,48 @@ EOF
     echo -e "\n${GREEN}✔ NVIDIA 官方 Network 源配置完成！${NC}"
 }
 
-# 步骤 B: 动态匹配显卡驱动支持上限安装最高 CUDA Toolkit 与 TensorRT (支持 12.8 / 13.x 并保留已有版本)
+# 步骤 B: 安装严格要求的 CUDA Toolkit 13.x 与 TensorRT 11.x
 install_cuda_and_tensorrt() {
     print_header
-    echo -e "${BOLD}${MAGENTA}[步骤] 自动检测显卡驱动并安装最高匹配 CUDA Toolkit 与 TensorRT${NC}\n"
+    echo -e "${BOLD}${MAGENTA}[步骤] 自动检测并安装严格要求的 CUDA Toolkit 13.x 与 TensorRT 11.x${NC}\n"
 
     # 1. 驱动检查并获取最高支持 CUDA 版本
     check_nvidia_driver
 
-    echo -e "\n${CYAN}1. 正在扫描 NVIDIA 官方源中可安装的 CUDA Toolkit 版本...${NC}"
+    local drv_cuda_major=$(echo "$CUDA_MAX_VER" | cut -d. -f1)
+    if [ -n "$drv_cuda_major" ] && [ "$drv_cuda_major" -lt 13 ]; then
+        echo -e "${RED}✖ 警告: 当前显卡驱动支持最高 CUDA 版本为 ${CUDA_MAX_VER} (< 13.0)。${NC}"
+        echo -e "${YELLOW}  作者严格要求 CUDA Toolkit 13.x 与 TensorRT 11.x。建议优先将显卡驱动升级到 570+ / 580+。${NC}"
+    fi
+
+    echo -e "\n${CYAN}1. 正在扫描 NVIDIA 官方源中可安装的 CUDA Toolkit 13.x 版本...${NC}"
     local avail_vers=($(get_available_cuda_packages))
     
-    # 过滤出不超过驱动支持上限的版本
+    # 筛选 13.x 系列版本
     local valid_vers=()
     for v in "${avail_vers[@]}"; do
-        if [ "$(printf '%s\n%s' "$v" "$CUDA_MAX_VER" | sort -V | tail -n 1)" = "$CUDA_MAX_VER" ]; then
+        if [[ "$v" == 13.* ]]; then
             valid_vers+=("$v")
         fi
     done
 
-    # 备选回退
+    # 备选回退 (13.x 系列)
     if [ ${#valid_vers[@]} -eq 0 ]; then
-        valid_vers=("12.8")
+        valid_vers=("13.2" "13.1" "13.0")
     fi
 
     local target_cuda="${valid_vers[0]}"
 
-    echo -e "当前显卡驱动支持最高 CUDA: ${BOLD}${CUDA_MAX_VER}${NC}"
-    echo -e "官方软件源支持的可选版本:  ${BOLD}${valid_vers[*]}${NC}"
-    echo -e "\n请选择要安装的 CUDA Toolkit 版本："
+    echo -e "作者环境要求:                ${BOLD}${GREEN}CUDA Toolkit 13.x & TensorRT 11.x (严格要求)${NC}"
+    echo -e "当前显卡驱动支持最高 CUDA:   ${BOLD}${CUDA_MAX_VER}${NC}"
+    echo -e "官方软件源支持的可选版本:    ${BOLD}${valid_vers[*]}${NC}"
+    echo -e "\n请选择要安装的 CUDA Toolkit 13.x 版本："
     for i in "${!valid_vers[@]}"; do
         local note=""
-        [ $i -eq 0 ] && note=" (官方源最高适配版本 - 推荐)"
+        [ $i -eq 0 ] && note=" (官方源推荐版本 - 严格要求 13.x)"
         echo -e "  ${BOLD}$((i+1)))${NC} CUDA ${valid_vers[$i]}${note}"
     done
-    echo -e "  ${BOLD}$(( ${#valid_vers[@]} + 1 )))${NC} 手动输入特定版本 (如 13.2 / 12.8)"
+    echo -e "  ${BOLD}$(( ${#valid_vers[@]} + 1 )))${NC} 手动输入特定版本 (严格要求 13.x, 如 13.2 / 13.0)"
     
     read -rp "请输入选项 [1-$(( ${#valid_vers[@]} + 1 )), 默认 1]: " v_choice
     v_choice=${v_choice:-1}
@@ -504,26 +555,26 @@ install_cuda_and_tensorrt() {
     if [ "$v_choice" -le "${#valid_vers[@]}" ] && [ "$v_choice" -ge 1 ]; then
         target_cuda="${valid_vers[$((v_choice-1))]}"
     elif [ "$v_choice" -eq "$(( ${#valid_vers[@]} + 1 ))" ]; then
-        read -rp "请输入目标 CUDA 版本号 (如 13.2 或 12.8): " manual_ver
+        read -rp "请输入目标 CUDA 版本号 (严格要求 13.x, 如 13.2 或 13.0): " manual_ver
         target_cuda="${manual_ver:-$target_cuda}"
     fi
 
     local cuda_pkg_suffix="$(echo "$target_cuda" | tr '.' '-')"
     echo -e "\n${GREEN}✔ 选择目标版本: CUDA ${target_cuda} (包后缀: ${cuda_pkg_suffix})${NC}"
 
-    # 检查并询问是否保留已有的 CUDA 版本
+    # 检查并询问是否保留已有的旧版 CUDA
     local existing_cuda=($(find /usr/local -maxdepth 1 -type d -name "cuda-[0-9]*" 2>/dev/null | sort -V))
     if [ ${#existing_cuda[@]} -gt 0 ]; then
         echo -e "\n检测到当前系统已存在以下 CUDA 版本: ${BOLD}${existing_cuda[*]}${NC}"
-        echo -e "是否保留已有版本？(默认保留，将多版本共存并自动激活最高版本)"
-        read -rp "是否保留已有 CUDA 版本？[Y/n, 默认 Y]: " keep_old
-        keep_old=${keep_old:-Y}
-        if [[ ! "$keep_old" =~ ^[Yy]$ ]]; then
+        echo -e "是否清理旧版本 CUDA (如 12.x/11.x) 以释放空间？(默认保留，自动将 /usr/local/cuda 软链接切换至最高 13.x)"
+        read -rp "是否清理旧版 CUDA？[y/N, 默认 N]: " clean_old
+        clean_old=${clean_old:-N}
+        if [[ "$clean_old" =~ ^[Yy]$ ]]; then
             purge_old_cuda_packages
         fi
     fi
 
-    echo -e "\n${CYAN}2. 正在通过 NVIDIA 官方源安装 CUDA ${target_cuda} 开发套件与 TensorRT...${NC}"
+    echo -e "\n${CYAN}2. 正在通过 NVIDIA 官方源安装 CUDA Toolkit ${target_cuda} 与 TensorRT 11.x...${NC}"
     run_as_root apt-get update
     run_as_root apt-get install -y --no-install-recommends \
         tensorrt \
@@ -532,19 +583,23 @@ install_cuda_and_tensorrt() {
         "cuda-cudart-dev-${cuda_pkg_suffix}" \
         "cuda-driver-dev-${cuda_pkg_suffix}"
 
-    # 若指定版本包不存在则自动回退 12.8
+    # 若指定版本包未命中则尝试安装通用 cuda-nvcc-13-0 或 cuda-toolkit-13-*
     if [ $? -ne 0 ]; then
-        echo -e "${YELLOW}提示: 源中若暂未上线 cuda-nvcc-${cuda_pkg_suffix}，尝试安装稳定版 cuda-nvcc-12-8 ...${NC}"
+        echo -e "${YELLOW}提示: 尝试安装 CUDA 13.x 通用套件包 (cuda-nvcc-13-0 / cuda-toolkit-13-*)...${NC}"
         run_as_root apt-get install -y --no-install-recommends \
             tensorrt \
             tensorrt-dev \
-            cuda-nvcc-12-8 \
-            cuda-cudart-dev-12-8 \
-            cuda-driver-dev-12-8
+            cuda-nvcc-13-0 \
+            cuda-cudart-dev-13-0 \
+            cuda-driver-dev-13-0 2>/dev/null || \
+        run_as_root apt-get install -y --no-install-recommends \
+            tensorrt \
+            tensorrt-dev \
+            cuda-toolkit-13-*
     fi
 
-    # 自动同步并激活最高版本 CUDA
-    echo -e "\n${CYAN}3. 自动配置并激活 /usr/local/cuda 环境变量...${NC}"
+    # 自动同步并激活最高版本 CUDA 13
+    echo -e "\n${CYAN}3. 自动配置并激活 /usr/local/cuda (CUDA 13.x) 环境变量...${NC}"
     sync_and_activate_highest_cuda
 
     cat << 'EOF' | run_as_root tee /etc/profile.d/cuda.sh > /dev/null
@@ -560,7 +615,7 @@ EOF
         echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> "$HOME/.bashrc"
     fi
 
-    echo -e "\n${GREEN}✔ CUDA Toolkit 与 TensorRT 安装就绪！${NC}"
+    echo -e "\n${GREEN}✔ CUDA Toolkit 13.x 与 TensorRT 11.x 安装就绪！${NC}"
     check_cuda_toolkit || true
     check_tensorrt || true
 }
@@ -742,7 +797,16 @@ build_project() {
     fi
 
     if [ -z "$nvcc_path" ]; then
-        echo -e "${RED}[错误] 未找到 nvcc，无法编译 CUDA 内核！请先安装 CUDA Toolkit。${NC}"
+        echo -e "${RED}[错误] 未找到 nvcc，无法编译 CUDA 内核！请先安装 CUDA Toolkit 13.x。${NC}"
+        return 1
+    fi
+
+    local nvcc_ver=$("$nvcc_path" --version | grep "release" | sed -E 's/.*release ([0-9]+\.[0-9]+).*/\1/')
+    local cuda_major=$(echo "$nvcc_ver" | cut -d. -f1)
+    if [ -n "$cuda_major" ] && [ "$cuda_major" -lt 13 ]; then
+        echo -e "${RED}[错误] 当前 nvcc 版本为 ${nvcc_ver} (< 13.0)。${NC}"
+        echo -e "${RED}作者严格要求 CUDA Toolkit 13.x（因 CMakeLists.txt 包含 sm_100 / sm_120 等 Blackwell 架构编译）。${NC}"
+        echo -e "${YELLOW}请先运行 ./deploy.sh 菜单选项 [4] 安装 CUDA Toolkit 13.x。${NC}"
         return 1
     fi
 
@@ -1202,7 +1266,7 @@ one_click_setup() {
         return 1
     fi
 
-    echo -e "\n>>> 步骤 2/6: 自动匹配最高 CUDA Toolkit 并安装 TensorRT"
+    echo -e "\n>>> 步骤 2/6: 安装严格要求的 CUDA Toolkit 13.x 与 TensorRT 11.x"
     if ! install_cuda_and_tensorrt; then
         echo -e "${RED}[错误] 步骤 2 失败！${NC}"
         return 1
@@ -1242,10 +1306,10 @@ main_menu() {
         print_header
         echo -e "${BOLD}请选择操作：${NC}"
         echo -e "  ${BOLD}[1]${NC}  ${CYAN}全面环境自检与诊断${NC} (Check All Environment)"
-        echo -e "  ${BOLD}[2]${NC}  ${GREEN}一键全自动安装与编译${NC} (One-Click Setup: CUDA Toolkit/TRT -> FFmpeg -> Fix -> Build)"
+        echo -e "  ${BOLD}[2]${NC}  ${GREEN}一键全自动安装与编译${NC} (One-Click Setup: CUDA 13.x/TRT 11.x -> FFmpeg -> Fix -> Build)"
         echo -e "  ----------------------------------------------------------------------"
         echo -e "  ${BOLD}[3]${NC}  清理旧 Keyring 并配置 NVIDIA 官方源 (Fix AutoDL Keyring & Setup Repo)"
-        echo -e "  ${BOLD}[4]${NC}  ${MAGENTA}自动检测驱动支持上限并安装最高 CUDA Toolkit 与 TensorRT${NC}"
+        echo -e "  ${BOLD}[4]${NC}  ${MAGENTA}安装严格要求的 CUDA Toolkit 13.x 与 TensorRT 11.x${NC} (Install CUDA 13.x & TRT 11.x)"
         echo -e "  ${BOLD}[5]${NC}  安装编译工具链与 BtbN FFmpeg Shared (Install Build Tools & FFmpeg)"
         echo -e "  ${BOLD}[6]${NC}  ${MAGENTA}下载并编译 NVENC 容器多卡修复补丁${NC} (Build libnvenc_fix.so)"
         echo -e "  ${BOLD}[7]${NC}  创建并配置 Python 虚拟环境 (Setup Python .venv)"
@@ -1254,7 +1318,7 @@ main_menu() {
         echo -e "  ${BOLD}[9]${NC}  ${YELLOW}下载超分模型 (ONNX) 并构建 TensorRT Engine${NC} (Download Models & Build Engine)"
         echo -e "  ${BOLD}[10]${NC} ${MAGENTA}截取 1 分钟 example.mkv 进行超分测试${NC} (Run 1-Min Encode Test)"
         echo -e "  ----------------------------------------------------------------------"
-        echo -e "  ${BOLD}[11]${NC} ${CYAN}一键清理系统中多余旧版 CUDA 软件包 (释放空间)${NC} (Purge Old CUDA Packages)"
+        echo -e "  ${BOLD}[11]${NC} ${CYAN}一键清理系统中旧版 CUDA 软件包 (如 12.x/11.x 释放空间)${NC} (Purge Old CUDA Packages)"
         echo -e "  ${BOLD}[12]${NC} ${GREEN}交互式超分任务配置向导与命令生成器 (不自动执行)${NC} (Task Wizard & Generator)"
         echo -e "  ${BOLD}[0]${NC}  退出 (Exit)"
         echo -e "${CYAN}------------------------------------------------------------------------------${NC}"
@@ -1320,13 +1384,13 @@ if [ $# -gt 0 ]; then
             echo "  --check         全面环境自检与诊断"
             echo "  --all           一键全自动安装与编译"
             echo "  --repo          清理旧 Keyring 并配置 NVIDIA Network 源"
-            echo "  --cuda          自动检测并安装匹配显卡驱动最高上限的 CUDA 与 TensorRT"
+            echo "  --cuda          安装严格要求的 CUDA Toolkit 13.x 与 TensorRT 11.x"
             echo "  --ffmpeg        安装编译工具链与 BtbN FFmpeg Shared"
             echo "  --nvenc-fix     下载并编译 NVENC 多卡容器修复补丁 (libnvenc_fix.so)"
             echo "  --venv          创建并配置 Python 虚拟环境"
             echo "  --build         编译 AnimeJaNai-Inference"
             echo "  --engine        下载模型并构建 TensorRT Engine"
-            echo "  --clean-cuda    清理系统中的多余旧版本 CUDA 软件包"
+            echo "  --clean-cuda    清理系统中的旧版本 CUDA 软件包 (如 12.x/11.x)"
             echo "  --test          截取 1 分钟 example.mkv 进行超分测试"
             echo "  --gen / --run   启动交互式超分任务配置向导与命令生成器 (不自动执行)"
             ;;
