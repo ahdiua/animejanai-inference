@@ -35,6 +35,7 @@
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/time.h>
 #include <libswscale/swscale.h>
 
 #include "aji.h"
@@ -244,6 +245,7 @@ typedef struct {
     int64_t  out_frames;
     int64_t  src_frames_est;
     int64_t  scene_dupes;
+    int64_t  start_time_us;
     int      color_space, color_range, color_pri, color_trc, chroma_loc;
 } enc_ctx;
 
@@ -862,13 +864,20 @@ static int emit_output(enc_ctx *c, AVFrame *cuda_out)
     if (drain_encoder(c, 0) < 0) goto done;
 
     c->out_frames++;
+    if (c->start_time_us == 0)
+        c->start_time_us = av_gettime_relative();
+
     if ((c->out_frames & 31) == 0) {
+        int64_t now_us = av_gettime_relative();
+        double elapsed_sec = (double)(now_us - c->start_time_us) / 1000000.0;
+        double cur_fps = (elapsed_sec > 0.001) ? ((double)c->out_frames / elapsed_sec) : 0.0;
+
         int pct = c->src_frames_est ? (int)(c->out_frames * 100 /
                   (c->src_frames_est * (c->rife ? c->rnum : 1) /
                    (c->rife ? c->rden : 1))) : 0;
         progress("encode", c->out_frames,
                  c->src_frames_est * (c->rife ? c->rnum : 1) /
-                 (c->rife ? c->rden : 1), 0, pct > 100 ? 100 : pct);
+                 (c->rife ? c->rden : 1), cur_fps, pct > 100 ? 100 : pct);
     }
     rc = 0;
 done:
@@ -1140,7 +1149,9 @@ static int run(enc_ctx *c)
              (long long)c->out_frames, (long long)expect,
              (long long)c->scene_dupes);
     }
-    progress("encode", c->out_frames, c->out_frames, 0, 100);
+    int64_t total_time_us = (c->start_time_us > 0) ? (av_gettime_relative() - c->start_time_us) : 0;
+    double avg_fps = (total_time_us > 1000) ? ((double)c->out_frames / (total_time_us / 1000000.0)) : 0.0;
+    progress("encode", c->out_frames, c->out_frames, avg_fps, 100);
     rc = 0;
 done:
 fail:
