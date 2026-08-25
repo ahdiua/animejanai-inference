@@ -624,8 +624,8 @@ static void inject_profile(const char *vcodec, enum out_pixfmt pf,
     } else if (!strcmp(vcodec, "libx264")) {
         p = pf == OUT_420P10 ? "high10" :
             (pf == OUT_444P8 || pf == OUT_444P10) ? "high444" : NULL;
-    } else if (strstr(vcodec, "nvenc")) {
-        p = pf == OUT_420P10 ? "main10" : NULL;   /* nvenc is 4:2:0 only here */
+    } else if (!strcmp(vcodec, "hevc_nvenc")) {
+        p = pf == OUT_420P10 ? "main10" : NULL;
     }
     if (p)
         av_dict_set(opts, "profile", p, 0);
@@ -1367,7 +1367,7 @@ static void usage(void)
     fprintf(stderr,
 "aji_encode --input <f> --output <f> --conf <c> --slot <N> "
 "--model-dir <d> [--rife-model-dir <d>] [--trtexec <p>]\n"
-"           [--vcodec hevc_nvenc|h264_nvenc|libx265|libx264|ffv1]"
+"           [--vcodec hevc_nvenc|av1_nvenc|h264_nvenc|libx265|libx264|ffv1]"
 " [--vquality \"<args>\"]\n"
 "           [--pix-fmt yuv420p|yuv420p10|yuv444p|yuv444p10]"
 " (default yuv420p10; 4:4:4 = software encoder)\n"

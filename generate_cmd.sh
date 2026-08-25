@@ -366,27 +366,29 @@ select_output_path() {
 select_encoder_and_quality() {
     echo -e "${BOLD}${CYAN}[步骤 6/8] 选择视频编码器与画质参数 (Video Encoder & Quality)${NC}"
     echo -e "  ${BOLD}1)${NC} ${GREEN}hevc_nvenc (NVIDIA NVENC H.265 硬件编码 - 强烈推荐，极速高画质)${NC}"
-    echo -e "  ${BOLD}2)${NC} h264_nvenc (NVIDIA NVENC H.264 硬件编码 - 兼容性好)"
-    echo -e "  ${BOLD}3)${NC} libx265   (CPU H.265 软件编码 - 极致压缩率，但速度慢)"
-    echo -e "  ${BOLD}4)${NC} libx264   (CPU H.264 软件编码)"
-    echo -e "  ${BOLD}5)${NC} ffv1      (无损归档编码)"
-    read -rp "请选择编码器 [1-5, 默认 1]: " enc_choice
+    echo -e "  ${BOLD}2)${NC} ${GREEN}av1_nvenc  (NVIDIA NVENC AV1 硬件编码 - Ada/RTX 40 系及更新 GPU)${NC}"
+    echo -e "  ${BOLD}3)${NC} h264_nvenc (NVIDIA NVENC H.264 硬件编码 - 兼容性好)"
+    echo -e "  ${BOLD}4)${NC} libx265   (CPU H.265 软件编码 - 极致压缩率，但速度慢)"
+    echo -e "  ${BOLD}5)${NC} libx264   (CPU H.264 软件编码)"
+    echo -e "  ${BOLD}6)${NC} ffv1      (无损归档编码)"
+    read -rp "请选择编码器 [1-6, 默认 1]: " enc_choice
     enc_choice=${enc_choice:-1}
 
     case "$enc_choice" in
         1) VCODEC="hevc_nvenc" ;;
-        2) VCODEC="h264_nvenc" ;;
-        3) VCODEC="libx265" ;;
-        4) VCODEC="libx264" ;;
-        5) VCODEC="ffv1" ;;
+        2) VCODEC="av1_nvenc" ;;
+        3) VCODEC="h264_nvenc" ;;
+        4) VCODEC="libx265" ;;
+        5) VCODEC="libx264" ;;
+        6) VCODEC="ffv1" ;;
         *) VCODEC="hevc_nvenc" ;;
     esac
 
     echo -e "\n请选择画质与预设参数 (VQuality Preset)："
     if [[ "$VCODEC" == *"nvenc"* ]]; then
         local nvenc_extra="-tune hq"
-        if [[ "$VCODEC" == "hevc_nvenc" ]]; then
-            # Ada 等配有多个 NVENC 的 GPU 可借此并行编码同一 HEVC 帧；
+        if [[ "$VCODEC" == "hevc_nvenc" || "$VCODEC" == "av1_nvenc" ]]; then
+            # Ada 等配有多个 NVENC 的 GPU 可借此并行编码同一 HEVC/AV1 帧；
             # 单 NVENC GPU 会保持单路编码。H.264 不支持 split encode。
             nvenc_extra+=" -split_encode_mode 2"
         fi

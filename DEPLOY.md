@@ -358,6 +358,20 @@ ffprobe -hide_banner test_clip_4k.mkv
 # 应显示：Video: hevc, 3840x2160 [SAR 1:1 DAR 16:9]
 ```
 
+### 使用 AV1 NVENC（Ada / RTX 40 系及更新 GPU）
+
+```bash
+./build/aji_encode \
+  --input test_clip.mkv \
+  --output test_clip_4k_av1.mkv \
+  --engine ~/models/performance_1080p.engine \
+  --max-width 1920 --max-height 1080 \
+  --vcodec av1_nvenc \
+  --vquality "-cq 20 -preset p6 -tune hq -split_encode_mode 2" \
+  --pix-fmt yuv420p10 \
+  --overwrite
+```
+
 ### 使用软件编码器（无 NVENC 的 GPU，如 Tesla T4 / A10）
 
 ```bash
@@ -386,7 +400,8 @@ aji_encode --input <f> --output <f> [选项...]
 
 可选参数:
   --vcodec <codec>        视频编码器（默认 hevc_nvenc）
-                          可选：hevc_nvenc, h264_nvenc, libx265, libx264, ffv1
+                          可选：hevc_nvenc, av1_nvenc, h264_nvenc,
+                                libx265, libx264, ffv1
   --vquality "<args>"     编码器质量参数
   --pix-fmt <fmt>         输出像素格式（默认 yuv420p10）
                           可选：yuv420p, yuv420p10, yuv444p, yuv444p10
