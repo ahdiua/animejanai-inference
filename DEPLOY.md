@@ -364,6 +364,10 @@ ffprobe -hide_banner test_clip_4k.mkv
 
 ### 使用 AV1 NVENC（Ada / RTX 40 系及更新 GPU）
 
+使用 `generate_cmd.sh` 时会自动按 GPU 架构选择 split-frame 数量：Blackwell
+请求 3 路，其他架构保留 2 路请求。若具体 GPU 的 NVENC 数量少于请求值，
+驱动会自动收缩到实际可用数量。手写命令时也可以按需指定：
+
 ```bash
 ./build/aji_encode \
   --input test_clip.mkv \

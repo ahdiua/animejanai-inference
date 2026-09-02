@@ -73,6 +73,41 @@ RIFE_MODEL_DIR="${PROJECT_ROOT}/onnx/rife"
 RIFE_FACTOR=2
 RIFE_ORDER="before"
 RIFE_SCD_THRESHOLD="0.150"
+GPU_NAME="未检测"
+GPU_COMPUTE_CAP=""
+# Preserve the previous dual-split default when GPU detection is unavailable.
+NVENC_SPLIT_COUNT=2
+
+# Blackwell supports up to a three-way single-session split. Keep the existing
+# two-way request elsewhere; NVENC clamps either request to the number of
+# encoder engines that physically exist on the selected GPU.
+detect_nvenc_split_count() {
+    local detected_name=""
+    local detected_cap=""
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        detected_name=$(nvidia-smi --query-gpu=name --format=csv,noheader \
+            2>/dev/null | sed -n '1{s/^[[:space:]]*//;s/[[:space:]]*$//;p;}')
+        detected_cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits \
+            2>/dev/null | sed -n '1{s/[[:space:]]//g;p;}')
+    fi
+
+    [ -n "$detected_name" ] && GPU_NAME="$detected_name"
+    GPU_COMPUTE_CAP="$detected_cap"
+
+    case "$GPU_COMPUTE_CAP" in
+        10.*|12.*) NVENC_SPLIT_COUNT=3 ;; # Blackwell data-center/consumer
+        *)
+            case "$GPU_NAME" in
+                *Blackwell*|*GeForce*RTX*50[0-9][0-9]*)
+                    NVENC_SPLIT_COUNT=3 ;;
+                *)  NVENC_SPLIT_COUNT=2 ;; # Retain legacy behaviour
+            esac
+            ;;
+    esac
+
+    VQUALITY="-cq 18 -preset p7 -tune hq -split_encode_mode ${NVENC_SPLIT_COUNT}"
+}
 
 print_header() {
     clear 2>/dev/null || true
@@ -398,9 +433,14 @@ select_encoder_and_quality() {
     if [[ "$VCODEC" == *"nvenc"* ]]; then
         local nvenc_extra="-tune hq"
         if [[ "$VCODEC" == "hevc_nvenc" || "$VCODEC" == "av1_nvenc" ]]; then
-            # Ada 等配有多个 NVENC 的 GPU 可借此并行编码同一 HEVC/AV1 帧；
-            # 单 NVENC GPU 会保持单路编码。H.264 不支持 split encode。
-            nvenc_extra+=" -split_encode_mode 2"
+            # HEVC/AV1 can split one frame across multiple NVENC engines.
+            # H.264 does not support split-frame encoding.
+            if [ "$NVENC_SPLIT_COUNT" -gt 1 ]; then
+                nvenc_extra+=" -split_encode_mode ${NVENC_SPLIT_COUNT}"
+                echo -e "  ${CYAN}自动 NVENC 分割: ${NVENC_SPLIT_COUNT} 路 (${GPU_NAME}, SM ${GPU_COMPUTE_CAP:-未知})${NC}"
+            else
+                echo -e "  ${CYAN}自动 NVENC 分割: 单路 (${GPU_NAME}, SM ${GPU_COMPUTE_CAP:-未知})${NC}"
+            fi
         fi
 
         echo -e "  ${BOLD}1)${NC} ${GREEN}高质量动漫推荐: -cq 18 -preset p7 ${nvenc_extra}${NC} (兼顾绝佳画质与合理体积)"
@@ -635,6 +675,7 @@ EOF
 # 主执行流
 main() {
     check_binaries
+    detect_nvenc_split_count
     print_header
     select_input_video
     select_engine
