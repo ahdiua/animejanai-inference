@@ -173,7 +173,10 @@ void append_file_text(const std::string &path, const std::string &text)
 // the cuDNN/cuBLAS tactic sources are gone). So the only flags worth carrying are the builder
 // optimization level, the build shape profile, and skip-inference (we do the inference ourselves).
 const char *DEFAULT_TRT_ENGINE_SETTINGS =
-    "--builderOptimizationLevel=5 --optShapes=input:%video_resolution% "
+    "--builderOptimizationLevel=5 "
+    "--minShapes=input:%video_resolution% "
+    "--optShapes=input:%video_resolution% "
+    "--maxShapes=input:%video_resolution% "
     "--skipInference";
 
 class Logger : public nvinfer1::ILogger {
@@ -993,7 +996,8 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
     // strongly-typed build from the fp16-typed rife onnx (the shipped
     // models keep the sampling-grid math fp32 in-graph); no cuDNN/cuBLAS
     const std::string settings = std::string(
-        "--stronglyTyped --optShapes=input:") + dims +
+        "--stronglyTyped --builderOptimizationLevel=5 --minShapes=input:") +
+        dims + " --optShapes=input:" + dims + " --maxShapes=input:" + dims +
         " --inputIOFormats=fp16:chw --outputIOFormats=fp16:chw"
         " --tacticSources=-CUDNN,-CUBLAS,-CUBLAS_LT --skipInference";
     const std::string epath =

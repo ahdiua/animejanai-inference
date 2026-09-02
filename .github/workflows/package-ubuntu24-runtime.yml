@@ -1,0 +1,83 @@
+name: Package Ubuntu 24.04 runtime
+
+on:
+  workflow_dispatch:
+    inputs:
+      gpu_arch:
+        description: TensorRT builder / CUDA SM architecture
+        required: true
+        default: '89'
+        type: choice
+        options:
+          - '75'
+          - '80'
+          - '86'
+          - '89'
+          - '90'
+          - '100'
+          - '120'
+      release_tag:
+        description: Optional GitHub release tag; leave empty for Actions artifact only
+        required: false
+        default: ''
+        type: string
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/package-ubuntu24-runtime.yml'
+      - 'packaging/ubuntu24/**'
+      - 'scripts/package-ubuntu24-runtime*.sh'
+      - 'tools/convert_rife_fp16.py'
+      - 'generate_cmd.sh'
+      - 'README.md'
+      - 'CMakeLists.txt'
+      - 'src/**'
+      - 'include/**'
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      GPU_ARCH: ${{ inputs.gpu_arch || '89' }}
+      PACKAGE_VERSION: ${{ inputs.release_tag || github.ref_name }}-${{ github.sha }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build self-contained runtime archive
+        run: |
+          chmod +x scripts/package-ubuntu24-runtime.sh
+          ./scripts/package-ubuntu24-runtime.sh \
+            --install-deps \
+            --gpu-arch "${GPU_ARCH}" \
+            --version "${PACKAGE_VERSION}"
+
+      - name: Show archive contents
+        run: |
+          cat dist/*.sha256
+          tar --zstd -tf dist/*.tar.zst | sed -n '1,160p'
+
+      - name: Upload Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: animejanai-ubuntu24-x86_64-sm${{ env.GPU_ARCH }}
+          path: |
+            dist/*.tar.zst
+            dist/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Publish optional GitHub release
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag != '' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: ${{ inputs.release_tag }}
+          files: |
+            dist/*.tar.zst
+            dist/*.sha256

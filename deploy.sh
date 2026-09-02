@@ -943,15 +943,16 @@ except:
     echo -e "正在调用 trtexec 为当前 GPU 构建 TensorRT Engine..."
     echo -e "  - 输入 ONNX:   ${onnx_path}"
     echo -e "  - 输入节点:     ${input_name}"
-    echo -e "  - 目标优化:     ${opt_w}x${opt_h} (max/opt: 1x3x${opt_h}x${opt_w})"
+    echo -e "  - 固定输入:     ${opt_w}x${opt_h} (min/opt/max: 1x3x${opt_h}x${opt_w})"
     echo -e "  - 输出 Engine:  ${engine_path}"
     echo -e "构建大约需要 1-3 分钟，请稍候...\n"
 
     trtexec \
         --onnx="$onnx_path" \
-        --minShapes="${input_name}:1x3x64x64" \
+        --minShapes="${input_name}:1x3x${opt_h}x${opt_w}" \
         --optShapes="${input_name}:1x3x${opt_h}x${opt_w}" \
         --maxShapes="${input_name}:1x3x${opt_h}x${opt_w}" \
+        --builderOptimizationLevel=5 \
         "${fp16_arg[@]}" \
         --skipInference \
         --saveEngine="$engine_path"

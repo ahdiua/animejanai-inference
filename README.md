@@ -79,12 +79,29 @@ CUDACXX=/usr/local/cuda/bin/nvcc cmake -B build -S .
 cmake --build build -j
 ```
 
+## Ubuntu 24.04 portable runtime
+
+Build the same self-contained runtime archive used by GitHub Actions:
+
+```sh
+./scripts/package-ubuntu24-runtime-local.sh --gpu-arch 89
+```
+
+The archive in `dist/` contains the five AnimeJaNai upscale ONNX models,
+fp16 RIFE v4.26/v4.25, BtbN FFmpeg, CUDA runtime, full TensorRT runtime,
+`trtexec`, and only the selected GPU architecture's TensorRT builder resource.
+It needs Ubuntu 24.04 and a compatible host NVIDIA driver, but no separately
+installed CUDA Toolkit or TensorRT. See
+[`packaging/ubuntu24/README.md`](packaging/ubuntu24/README.md) for other GPU
+architectures and release packaging details.
+
 ## Engine
 
 ```sh
 trtexec --onnx=models/<model>.onnx --fp16 \
-        --minShapes=input:1x3x64x64 --optShapes=input:1x3x1080x1920 \
-        --maxShapes=input:1x3x1088x1920 --saveEngine=models/<model>.engine
+        --minShapes=input:1x3x1080x1920 --optShapes=input:1x3x1080x1920 \
+        --maxShapes=input:1x3x1080x1920 --builderOptimizationLevel=5 \
+        --saveEngine=models/<model>.engine
 ```
 
 ## Harness (no player needed)

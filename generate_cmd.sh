@@ -36,8 +36,18 @@ fi
 
 MODELS_DIR="${HOME}/models"
 FFMPEG_INSTALL_DIR="/opt/ffmpeg"
-NVENC_FIX_SO="/opt/libnvenc_fix.so"
+CUDA_BIN_DIR="/usr/local/cuda/bin"
+CUDA_LIB_DIR="/usr/local/cuda/lib64"
 AJI_ENCODE_BIN="${PROJECT_ROOT}/build/aji_encode"
+if [ -x "${PROJECT_ROOT}/bin/ffmpeg.real" ] && [ -d "${PROJECT_ROOT}/lib" ]; then
+    # Self-contained Ubuntu runtime package: all tools and shared libraries
+    # live beside this script instead of under /opt and /usr/local/cuda.
+    FFMPEG_INSTALL_DIR="${PROJECT_ROOT}"
+    CUDA_BIN_DIR="${PROJECT_ROOT}/bin"
+    CUDA_LIB_DIR="${PROJECT_ROOT}/lib"
+    AJI_ENCODE_BIN="${PROJECT_ROOT}/aji_encode"
+fi
+NVENC_FIX_SO="/opt/libnvenc_fix.so"
 
 # 全局配置变量初始化
 INPUT_VIDEO=""
@@ -534,8 +544,8 @@ generate_final_command_and_script() {
 set -e
 
 # 1. 配置运行时动态库与环境变量
-export PATH="/usr/local/cuda/bin:${FFMPEG_INSTALL_DIR}/bin:\$PATH"
-export LD_LIBRARY_PATH="${PROJECT_ROOT}/build:${FFMPEG_INSTALL_DIR}/lib:/usr/local/cuda/lib64:\${LD_LIBRARY_PATH:-}"
+export PATH="${CUDA_BIN_DIR}:${FFMPEG_INSTALL_DIR}/bin:\$PATH"
+export LD_LIBRARY_PATH="${PROJECT_ROOT}/build:${FFMPEG_INSTALL_DIR}/lib:${CUDA_LIB_DIR}:\${LD_LIBRARY_PATH:-}"
 ${preload_str}
 
 echo -e "\033[1;36m==============================================================================\033[0m"
@@ -600,8 +610,8 @@ EOF
     echo -e "${CYAN}------------------------------------------------------------------------------${NC}"
     
     echo -e "${CYAN}# 1. 导入环境变量：${NC}"
-    echo -e "${BOLD}export PATH=\"/usr/local/cuda/bin:${FFMPEG_INSTALL_DIR}/bin:\$PATH\""
-    echo -e "export LD_LIBRARY_PATH=\"${PROJECT_ROOT}/build:${FFMPEG_INSTALL_DIR}/lib:/usr/local/cuda/lib64:\$LD_LIBRARY_PATH\"${NC}"
+    echo -e "${BOLD}export PATH=\"${CUDA_BIN_DIR}:${FFMPEG_INSTALL_DIR}/bin:\$PATH\""
+    echo -e "export LD_LIBRARY_PATH=\"${PROJECT_ROOT}/build:${FFMPEG_INSTALL_DIR}/lib:${CUDA_LIB_DIR}:\$LD_LIBRARY_PATH\"${NC}"
     if [ -n "$preload_str" ]; then
         echo -e "${BOLD}${preload_str}${NC}"
     fi
