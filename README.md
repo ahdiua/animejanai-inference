@@ -79,21 +79,120 @@ CUDACXX=/usr/local/cuda/bin/nvcc cmake -B build -S .
 cmake --build build -j
 ```
 
-## Ubuntu 24.04 portable runtime
+## Ubuntu 24.04 免安装 Runtime 包
 
-Build the same self-contained runtime archive used by GitHub Actions:
+Runtime 包适合直接部署到 AutoDL、云 GPU 容器或 Ubuntu 24.04 x86_64
+主机。包内已经包含 AnimeJaNai/RIFE ONNX 模型、FFmpeg、CUDA Runtime、
+TensorRT 运行库、`trtexec` 和对应架构的 TensorRT Builder Resource；宿主机
+只需安装兼容的 NVIDIA 驱动，不需要另外安装 CUDA Toolkit、TensorRT、
+FFmpeg 或 Python。
+
+### 1. 选择并下载包
+
+每次 Runtime Action 成功运行后，两个压缩包会一起发布到本仓库的
+[Releases](../../releases) 页面，并标记为 prerelease：
+
+| 文件名中的架构 | 适用 GPU |
+|---|---|
+| `sm89` | Ada Lovelace，RTX 40 系 |
+| `sm120` | Blackwell，RTX 50 系（包括 RTX 5090） |
+
+下载对应的 `.tar.zst` 及同名 `.sha256` 文件。不要在 RTX 50 系上使用
+`sm89` 包，也不要跨 GPU 架构复制已经生成的 `.engine`。
+
+### 2. 校验并解压
+
+以下以 RTX 5090 的 `sm120` 包为例：
+
+```sh
+sha256sum -c animejanai-ubuntu24-x86_64-sm120-*.tar.zst.sha256
+tar --zstd -xf animejanai-ubuntu24-x86_64-sm120-*.tar.zst
+cd animejanai-ubuntu24-x86_64-sm120-*/
+
+# 检查包内文件和当前 GPU/驱动
+sha256sum -c SHA256SUMS
+./runtime-info.sh
+```
+
+如果系统的 `tar` 不支持 `--zstd`，先安装 `zstd`：
+
+```sh
+sudo apt-get update
+sudo apt-get install -y zstd
+```
+
+请把 Runtime 解压到可写目录。程序会在首次运行时把生成的 TensorRT Engine
+缓存在 `onnx/` 模型旁边。
+
+### 3. 开始超分压制
+
+推荐直接使用包根目录的 `./aji_encode` 启动器。它会自动设置动态库路径，
+并补齐包内的配置文件、模型目录、RIFE 模型目录和 `trtexec` 路径：
+
+```sh
+./aji_encode \
+  --input "/path/to/input.mkv" \
+  --output "/path/to/output_upscaled.mkv" \
+  --slot 1003 \
+  --decoder nvdec \
+  --vcodec hevc_nvenc \
+  --vquality "-cq 18 -preset p7 -tune hq -split_encode_mode 3" \
+  --pix-fmt yuv420p10 \
+  --overwrite
+```
+
+上例适用于 RTX 5090/Blackwell。RTX 40 系把 `-split_encode_mode 3` 改为
+`-split_encode_mode 2`。首次运行会根据输入分辨率构建 TensorRT Engine，
+因此启动阶段会比后续运行慢；同一分辨率再次运行时会直接复用缓存。
+
+`--slot` 用来选择内置处理方案：
+
+| Slot | 处理方案 |
+|---:|---|
+| `1001` | Quality 超分 |
+| `1002` | Balanced 超分 |
+| `1003` | Performance 超分（默认） |
+| `2001` | Sharp Balanced 超分 |
+| `2002` | Sharp Performance 超分 |
+| `2003` | SD Compact 超分 |
+| `2025` / `2026` | 仅 RIFE v4.25 / v4.26 2x 插帧 |
+| `3025` / `3026` | Performance 超分 + RIFE 2x 插帧 |
+
+省略 `--slot` 时默认使用 `1003`，也可以临时设置默认值：
+
+```sh
+AJI_SLOT=3026 ./aji_encode \
+  --input "/path/to/input.mkv" \
+  --output "/path/to/output_rife2x_upscaled.mkv" \
+  --decoder nvdec --vcodec hevc_nvenc \
+  --vquality "-cq 18 -preset p7 -tune hq -split_encode_mode 3" \
+  --pix-fmt yuv420p10 --overwrite
+```
+
+包内的 FFmpeg、FFprobe 和 TensorRT 工具也应通过根目录启动器调用，以确保
+自动加载包内动态库：
+
+```sh
+./ffprobe -hide_banner "/path/to/input.mkv"
+./ffmpeg -hide_banner -encoders
+./trtexec --version
+```
+
+当前 `generate_cmd.sh` 主要用于选择已有 `.engine` 的直连模式。全新 Runtime
+第一次使用时尚无 Engine，建议先按上面的 `./aji_encode` 配置模式运行；缓存
+生成后再使用命令生成器。
+
+### 4. 本地构建 Runtime 包
+
+如需自行打包或构建其他 GPU 架构：
 
 ```sh
 ./scripts/package-ubuntu24-runtime-local.sh --gpu-arch 89
+./scripts/package-ubuntu24-runtime-local.sh --gpu-arch 120
 ```
 
-The archive in `dist/` contains the five AnimeJaNai upscale ONNX models,
-fp16 RIFE v4.26/v4.25, BtbN FFmpeg, CUDA runtime, full TensorRT runtime,
-`trtexec`, and only the selected GPU architecture's TensorRT builder resource.
-It needs Ubuntu 24.04 and a compatible host NVIDIA driver, but no separately
-installed CUDA Toolkit or TensorRT. See
-[`packaging/ubuntu24/README.md`](packaging/ubuntu24/README.md) for other GPU
-architectures and release packaging details.
+产物位于 `dist/`。详细的架构列表和打包说明见
+[`packaging/ubuntu24/README.md`](packaging/ubuntu24/README.md)。
 
 ## Engine
 

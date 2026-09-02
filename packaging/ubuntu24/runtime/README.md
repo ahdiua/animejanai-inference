@@ -15,15 +15,24 @@ A compatible NVIDIA driver is still required on the host.
 ```bash
 tar --zstd -xf animejanai-ubuntu24-x86_64-@GPU_ARCH@-*.tar.zst
 cd animejanai-ubuntu24-x86_64-@GPU_ARCH@-*
+sha256sum -c SHA256SUMS
 ./runtime-info.sh
 
 ./aji_encode \
   --input input.mkv \
   --output output.mkv \
+  --slot 1003 \
+  --decoder nvdec \
   --vcodec hevc_nvenc \
+  --vquality "-cq 18 -preset p7 -tune hq" \
   --pix-fmt yuv420p10 \
   --overwrite
 ```
+
+Run the launchers from the extracted package root. They configure the bundled
+shared-library paths automatically; do not invoke the `.real` executables in
+`bin/` directly. The package directory must be writable because generated
+TensorRT engines are cached beside the models in `onnx/`.
 
 The default slot is `1003` (Performance). The first run at a new resolution
 builds and caches a fixed-shape TensorRT engine beside the ONNX model; later
@@ -49,8 +58,22 @@ Select another profile with `--slot`, for example:
 
 ```bash
 ./aji_encode --input input.mkv --output output.mkv --slot 3026 \
-  --vcodec hevc_nvenc --pix-fmt yuv420p10 --overwrite
+  --decoder nvdec --vcodec hevc_nvenc --pix-fmt yuv420p10 --overwrite
 ```
+
+For HEVC/AV1 split-frame encoding, use `-split_encode_mode 2` on Ada/RTX 40
+and `-split_encode_mode 3` on Blackwell/RTX 50. For example:
+
+```bash
+./aji_encode --input input.mkv --output output.mkv --slot 1003 \
+  --decoder nvdec --vcodec hevc_nvenc \
+  --vquality "-cq 18 -preset p7 -tune hq -split_encode_mode 3" \
+  --pix-fmt yuv420p10 --overwrite
+```
+
+The bundled `generate_cmd.sh` currently selects an existing serialized
+`.engine` (direct Engine mode). On a fresh extraction, run `./aji_encode` as
+shown above first so configuration mode can build the initial engine cache.
 
 Direct Engine mode remains available by passing `--engine`, `--max-width` and
 `--max-height`. The root launchers set all relative runtime paths automatically.
