@@ -46,8 +46,8 @@ engine building, colorspace metadata and CUDA graphs land here in phase 1.
 8 步向导式问答，自动生成 `aji_encode` 运行命令：
 
 1. **自动扫描并列出** 系统中的视频文件，选择即用
-2. **自动发现 Engine** 模型文件，无需手动拼路径
-3. 可选 **RIFE AI 插帧**：自动发现 `onnx/rife` 模型，支持 2x/4x 与处理顺序选择
+2. 源码环境自动发现 **Engine**；Runtime 环境自动改为选择内置 **Slot**
+3. 可选 **RIFE AI 插帧**：源码模式可选 2x/4x 与处理顺序，Runtime 模式直接选择 RIFE Slot
 4. 支持 **整片压制** 或 **截取片段测试**
 5. 智能推荐 **输出路径**（自动后缀 `_upscaled` / `_rife2x_upscaled`）
 6. 预设多档 **编码器 × 画质** 组合（NVENC / x265 / FFV1 等）
@@ -124,9 +124,28 @@ sudo apt-get install -y zstd
 请把 Runtime 解压到可写目录。程序会在首次运行时把生成的 TensorRT Engine
 缓存在 `onnx/` 模型旁边。
 
-### 3. 开始超分压制
+### 3. 使用交互式生成器（推荐）
 
-推荐直接使用包根目录的 `./aji_encode` 启动器。它会自动设置动态库路径，
+Runtime 包内的 `generate_cmd.sh` 会自动识别当前是免安装 Runtime
+环境，因此不会要求选择已有 `.engine`。它会交互式选择输入视频、
+Runtime Slot、压制范围、输出路径、编码器和像素格式，最后生成
+`run_encode.sh`：
+
+```sh
+./generate_cmd.sh
+bash ./run_encode.sh
+```
+
+生成器会自动为 RTX 40/Ada 使用 `-split_encode_mode 2`，为
+RTX 50/Blackwell 使用 `-split_encode_mode 3`。选择 RIFE-only Slot 或
+“超分 + RIFE”Slot 时，输出文件名也会自动加上对应后缀。
+
+首次运行某个分辨率会自动构建 TensorRT Engine 并缓存到 `onnx/`；
+不需要先手工运行一次 `aji_encode`。同一分辨率后续任务会直接复用缓存。
+
+### 4. 手动运行 `aji_encode`
+
+如需自己组合命令，请使用包根目录的 `./aji_encode` 启动器。它会自动设置动态库路径，
 并补齐包内的配置文件、模型目录、RIFE 模型目录和 `trtexec` 路径：
 
 ```sh
@@ -178,11 +197,10 @@ AJI_SLOT=3026 ./aji_encode \
 ./trtexec --version
 ```
 
-当前 `generate_cmd.sh` 主要用于选择已有 `.engine` 的直连模式。全新 Runtime
-第一次使用时尚无 Engine，建议先按上面的 `./aji_encode` 配置模式运行；缓存
-生成后再使用命令生成器。
+如需使用自己的 `.engine`，`aji_encode` 仍支持直连模式：传入
+`--engine`、`--max-width` 和 `--max-height`。
 
-### 4. 本地构建 Runtime 包
+### 5. 本地构建 Runtime 包
 
 如需自行打包或构建其他 GPU 架构：
 

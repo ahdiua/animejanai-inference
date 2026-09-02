@@ -18,6 +18,26 @@ cd animejanai-ubuntu24-x86_64-@GPU_ARCH@-*
 sha256sum -c SHA256SUMS
 ./runtime-info.sh
 
+./generate_cmd.sh
+bash ./run_encode.sh
+```
+
+`generate_cmd.sh` detects the extracted Runtime environment and presents an
+interactive menu for the input video, built-in Slot, full/clip processing,
+output path, encoder, quality, decoder and pixel format. It does not require an
+existing `.engine`: the generated `run_encode.sh` uses configuration mode, so
+the first run builds the required fixed-shape engines and later runs reuse the
+cache in `onnx/`.
+
+The generator automatically requests two-way HEVC/AV1 split-frame encoding on
+Ada/RTX 40 and three-way encoding on Blackwell/RTX 50. RIFE-only and combined
+upscale + RIFE 2x profiles can be selected from the same Slot menu.
+
+## Manual command
+
+To bypass the interactive generator, invoke the root launcher directly:
+
+```bash
 ./aji_encode \
   --input input.mkv \
   --output output.mkv \
@@ -70,10 +90,6 @@ and `-split_encode_mode 3` on Blackwell/RTX 50. For example:
   --vquality "-cq 18 -preset p7 -tune hq -split_encode_mode 3" \
   --pix-fmt yuv420p10 --overwrite
 ```
-
-The bundled `generate_cmd.sh` currently selects an existing serialized
-`.engine` (direct Engine mode). On a fresh extraction, run `./aji_encode` as
-shown above first so configuration mode can build the initial engine cache.
 
 Direct Engine mode remains available by passing `--engine`, `--max-width` and
 `--max-height`. The root launchers set all relative runtime paths automatically.
