@@ -337,6 +337,10 @@ copy_model \
     "2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo.onnx" \
     "https://r2.ahdiua.com/2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo.onnx" \
     "ded46591ddfaeb22b3daaf84ad7b36838335aa3efca66acfa36177ce4ab21eb5"
+copy_model \
+    "RealESRGANv2-animevideo-xsx2-v0.2.3.0-fp16-dynamic.onnx" \
+    "https://r2.ahdiua.com/RealESRGANv2-animevideo-xsx2-v0.2.3.0-fp16-dynamic.onnx" \
+    "885b5abb8d7203b2cedea8c678913432ce146dca60109e2532bb5fcb53656fd5"
 
 prepare_rife_model() {
     local version="$1"
@@ -494,4 +498,4 @@ echo
 echo "Runtime package created:"
 du -h "${ARCHIVE_PATH}" "${ARCHIVE_PATH}.sha256"
 echo "GPU builder architecture: sm${GPU_ARCH}"
-echo "Models: 5 upscale + RIFE v4.26/v4.25"
+echo "Models: 6 upscale + RIFE v4.26/v4.25"

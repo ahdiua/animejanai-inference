@@ -69,6 +69,7 @@ Useful slots:
 | 2001 | Sharp Balanced |
 | 2002 | Sharp Performance |
 | 2003 | SD Compact |
+| 2004 | RealESRGANv2 AnimeVideo XS (2x) |
 | 2025 | RIFE v4.25 2x only |
 | 2026 | RIFE v4.26 2x only |
 | 3025 | Performance + RIFE v4.25 2x |
