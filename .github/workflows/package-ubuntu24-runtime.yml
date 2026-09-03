@@ -10,6 +10,7 @@ on:
         type: string
   push:
     branches: [dev]
+    tags: ['v*']
     paths:
       - '.github/workflows/package-ubuntu24-runtime.yml'
       - 'packaging/ubuntu24/**'
@@ -66,8 +67,8 @@ jobs:
           compression-level: 0
           retention-days: 14
 
-  prerelease:
-    name: Publish runtime prerelease
+  release:
+    name: Publish runtime release
     needs: package
     runs-on: ubuntu-24.04
     permissions:
@@ -86,29 +87,35 @@ jobs:
           sha256sum --check -- *.sha256
           ls -lh -- *.tar.zst *.sha256
 
-      - name: Resolve prerelease tag
+      - name: Resolve release metadata
         id: release
         env:
           REQUESTED_TAG: ${{ inputs.release_tag }}
         run: |
-          if [[ -n "${REQUESTED_TAG}" ]]; then
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            release_tag="${GITHUB_REF_NAME}"
+            prerelease=false
+          elif [[ -n "${REQUESTED_TAG}" ]]; then
             release_tag="${REQUESTED_TAG}"
+            prerelease=true
           else
             release_tag="runtime-r${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA::7}"
+            prerelease=true
           fi
           echo "tag=${release_tag}" >> "${GITHUB_OUTPUT}"
+          echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
 
-      - name: Publish GitHub prerelease
+      - name: Publish GitHub release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.release.outputs.tag }}
           name: Ubuntu 24.04 runtime ${{ steps.release.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          prerelease: true
+          prerelease: ${{ steps.release.outputs.prerelease }}
           draft: false
           fail_on_unmatched_files: true
           body: |
-            Automated runtime prerelease from `${{ github.sha }}`.
+            Automated runtime release from `${{ github.sha }}`.
 
             Includes TensorRT builder packages for Ada `sm89` and Blackwell `sm120`.
             Workflow run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
