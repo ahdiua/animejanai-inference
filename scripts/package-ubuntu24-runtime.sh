@@ -193,7 +193,12 @@ fi
 PACKAGE_VERSION="$(printf '%s' "${PACKAGE_VERSION}" | tr -cs 'A-Za-z0-9._-' '-')"
 
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/aji-runtime.XXXXXX")"
+PROGRESS_PID=""
 cleanup() {
+    if [[ -n "${PROGRESS_PID}" ]]; then
+        kill "${PROGRESS_PID}" 2>/dev/null || true
+        wait "${PROGRESS_PID}" 2>/dev/null || true
+    fi
     if [[ "${KEEP_WORK}" -eq 1 ]]; then
         echo "Kept work directory: ${WORK_DIR}"
     else
@@ -436,9 +441,45 @@ done
 mkdir -p "${OUTPUT_DIR}"
 ARCHIVE_PATH="${OUTPUT_DIR}/${PACKAGE_NAME}.tar.zst"
 SOURCE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "${PROJECT_ROOT}" log -1 --format=%ct 2>/dev/null || date +%s)}"
-ZSTD_CLEVEL=19 tar --sort=name --mtime="@${SOURCE_EPOCH}" \
-    --owner=0 --group=0 --numeric-owner --zstd \
-    -C "${WORK_DIR}" -cf "${ARCHIVE_PATH}" "${PACKAGE_NAME}"
+STAGE_SIZE="$(du -sh "${STAGE_ROOT}" | cut -f1)"
+ARCHIVE_STARTED_AT="$(date +%s)"
+
+echo
+echo "Compressing ${STAGE_SIZE} runtime archive with zstd -19 using all CPU threads..."
+archive_progress() {
+    local now elapsed minutes seconds output_size
+    while sleep 30; do
+        now="$(date +%s)"
+        elapsed=$((now - ARCHIVE_STARTED_AT))
+        minutes=$((elapsed / 60))
+        seconds=$((elapsed % 60))
+        output_size="pending"
+        if [[ -f "${ARCHIVE_PATH}" ]]; then
+            output_size="$(du -h "${ARCHIVE_PATH}" | cut -f1)"
+        fi
+        printf '[archive] zstd -19 running: %dm %02ds elapsed, %s written\n' \
+            "${minutes}" "${seconds}" "${output_size}"
+    done
+}
+
+archive_progress &
+PROGRESS_PID=$!
+archive_status=0
+tar --sort=name --mtime="@${SOURCE_EPOCH}" \
+    --owner=0 --group=0 --numeric-owner \
+    -I 'zstd -T0 -19' \
+    -C "${WORK_DIR}" -cf "${ARCHIVE_PATH}" "${PACKAGE_NAME}" \
+    || archive_status=$?
+kill "${PROGRESS_PID}" 2>/dev/null || true
+wait "${PROGRESS_PID}" 2>/dev/null || true
+PROGRESS_PID=""
+if ((archive_status != 0)); then
+    echo "Runtime archive compression failed with exit code ${archive_status}." >&2
+    exit "${archive_status}"
+fi
+ARCHIVE_ELAPSED=$(( $(date +%s) - ARCHIVE_STARTED_AT ))
+printf 'Compression finished in %dm %02ds.\n' \
+    "$((ARCHIVE_ELAPSED / 60))" "$((ARCHIVE_ELAPSED % 60))"
 (
     cd "${OUTPUT_DIR}"
     sha256sum "$(basename "${ARCHIVE_PATH}")" \
