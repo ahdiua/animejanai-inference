@@ -15,6 +15,7 @@ on:
       - 'packaging/ubuntu24/**'
       - 'scripts/package-ubuntu24-runtime*.sh'
       - 'tools/convert_rife_fp16.py'
+      - 'deploy.sh'
       - 'generate_cmd.sh'
       - 'README.md'
       - 'CMakeLists.txt'
