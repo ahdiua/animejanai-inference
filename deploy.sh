@@ -37,6 +37,7 @@ URL_ANIMEJANAI_V31_BAL="https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1_Balanced_SPA
 URL_ANIMEJANAI_V31_PERF_SHARP="https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1Sharp1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx"
 URL_ANIMEJANAI_V31_BAL_SHARP="https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1Sharp1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx"
 URL_ANIMEJANAI_SD_COMPACT="https://r2.ahdiua.com/2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo.onnx"
+URL_REALESRGAN_ANIMEVIDEO_XSX2="https://r2.ahdiua.com/RealESRGANv2-animevideo-xsx2-v0.2.3.0-fp16-dynamic.onnx"
 
 # Real-ESRGAN Anime 6B 经典动漫模型 (Hugging Face / HF-Mirror)
 DEFAULT_ONNX_REALESRGAN_ANIME6B_URL="https://huggingface.co/deepghs/imgutils-models/resolve/main/real_esrgan/RealESRGAN_x4plus_anime_6B.onnx"
@@ -898,10 +899,14 @@ download_model_file() {
 download_animejanai_models() {
     local perf_dest="${MODELS_DIR}/performance.onnx"
     local bal_dest="${MODELS_DIR}/balanced.onnx"
+    local perf_sharp_dest="${MODELS_DIR}/performance_sharp1.onnx"
+    local bal_sharp_dest="${MODELS_DIR}/balanced_sharp1.onnx"
 
-    echo -e "\n${CYAN}>>> 正在下载 AnimeJaNai V3.1 官方模型 (R2 直链秒级极速下载)...${NC}"
+    echo -e "\n${CYAN}>>> 正在下载 AnimeJaNai V3.1 官方模型（含 Sharp1）(R2 直链秒级极速下载)...${NC}"
     download_model_file "$perf_dest" "$URL_ANIMEJANAI_V31_PERF" "" "AnimeJaNai V3.1 Performance (2x)"
     download_model_file "$bal_dest" "$URL_ANIMEJANAI_V31_BAL" "" "AnimeJaNai V3.1 Balanced (2x)"
+    download_model_file "$perf_sharp_dest" "$URL_ANIMEJANAI_V31_PERF_SHARP" "" "AnimeJaNai V3.1 Sharp1 Performance (2x)"
+    download_model_file "$bal_sharp_dest" "$URL_ANIMEJANAI_V31_BAL_SHARP" "" "AnimeJaNai V3.1 Sharp1 Balanced (2x)"
 }
 
 # 单模型 Engine 构建函数
@@ -980,19 +985,21 @@ download_and_build_engine() {
     local perf_sharp_onnx="${MODELS_DIR}/performance_sharp1.onnx"
     local balanced_sharp_onnx="${MODELS_DIR}/balanced_sharp1.onnx"
     local sd_compact_onnx="${MODELS_DIR}/sd_compact.onnx"
+    local animevideo_xsx2_onnx="${MODELS_DIR}/realesrgan_animevideo_xsx2.onnx"
     local animevideo_onnx="${MODELS_DIR}/realesr_animevideov3.onnx"
     local anime6b_onnx="${MODELS_DIR}/realesrgan_anime6b.onnx"
 
     echo -e "请选择操作："
-    echo -e "  ${BOLD}1)${NC} ${GREEN}一键获取 AnimeJaNai V3.1 Performance + Balanced 常用推荐模型 (2x, 极速推荐)${NC}"
+    echo -e "  ${BOLD}1)${NC} ${GREEN}一键获取 AnimeJaNai V3.1 Performance + Balanced（含 Sharp1）模型 (2x, 极速推荐)${NC}"
     echo -e "  ${BOLD}2)${NC} 获取 AnimeJaNai V3.1 Performance (2x, 极速偏画质 - 强烈推荐)"
     echo -e "  ${BOLD}3)${NC} 获取 AnimeJaNai V3.1 Balanced (2x, 均衡推荐)"
     echo -e "  ${BOLD}4)${NC} 获取 AnimeJaNai V3.1 Sharp1 (2x, 清晰锐化增强版)"
     echo -e "  ${BOLD}5)${NC} 获取 AnimeJaNai SD Compact (2x, 标清老番修复版)"
-    echo -e "  ${BOLD}6)${NC} 获取 RealESRGAN AnimeVideoV3 (2x/4x, 专为动漫视频优化的轻量视频模型)"
-    echo -e "  ${BOLD}7)${NC} 下载 Real-ESRGAN Anime 6B (4x, 经典原版动漫模型)"
-    echo -e "  ${BOLD}8)${NC} 自定义 ONNX 模型下载链接 / 本地已有路径"
-    read -rp "请输入选项 [1-8, 默认 1]: " model_choice
+    echo -e "  ${BOLD}6)${NC} 获取原版 RealESRGANv2 AnimeVideo XS (原生 2x, 动漫视频模型)"
+    echo -e "  ${BOLD}7)${NC} 获取 RealESRGAN AnimeVideoV3 (2x/4x, 专为动漫视频优化的轻量视频模型)"
+    echo -e "  ${BOLD}8)${NC} 下载 Real-ESRGAN Anime 6B (4x, 经典原版动漫模型)"
+    echo -e "  ${BOLD}9)${NC} 自定义 ONNX 模型下载链接 / 本地已有路径"
+    read -rp "请输入选项 [1-9, 默认 1]: " model_choice
     model_choice=${model_choice:-1}
 
     local target_onnx_list=()
@@ -1000,7 +1007,7 @@ download_and_build_engine() {
     case "$model_choice" in
         1)
             download_animejanai_models
-            target_onnx_list=("$perf_onnx" "$balanced_onnx")
+            target_onnx_list=("$perf_onnx" "$balanced_onnx" "$perf_sharp_onnx" "$balanced_sharp_onnx")
             ;;
         2)
             download_model_file "$perf_onnx" "$URL_ANIMEJANAI_V31_PERF" "" "AnimeJaNai V3.1 Performance (2x)"
@@ -1020,6 +1027,10 @@ download_and_build_engine() {
             target_onnx_list=("$sd_compact_onnx")
             ;;
         6)
+            download_model_file "$animevideo_xsx2_onnx" "$URL_REALESRGAN_ANIMEVIDEO_XSX2" "" "RealESRGANv2 AnimeVideo XS (原生 2x)"
+            target_onnx_list=("$animevideo_xsx2_onnx")
+            ;;
+        7)
             read -rp "请输入 RealESRGAN AnimeVideoV3 ONNX 下载 URL 或本地已有路径: " v3_input
             if [ -f "$v3_input" ]; then
                 target_onnx_list=("$v3_input")
@@ -1028,11 +1039,11 @@ download_and_build_engine() {
                 target_onnx_list=("$animevideo_onnx")
             fi
             ;;
-        7)
+        8)
             download_model_file "$anime6b_onnx" "$DEFAULT_ONNX_REALESRGAN_ANIME6B_URL" "$DEFAULT_ONNX_REALESRGAN_ANIME6B_MIRROR" "Real-ESRGAN Anime 6B (4x)"
             target_onnx_list=("$anime6b_onnx")
             ;;
-        8)
+        9)
             read -rp "请输入 ONNX 下载 URL 或本地绝对路径: " custom_input
             if [ -f "$custom_input" ]; then
                 target_onnx_list=("$custom_input")
