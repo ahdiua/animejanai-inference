@@ -1,4 +1,6 @@
 build/
+build-runtime-*/
+dist/
 models/
 fixtures/*.raw
 fixtures/*.png

@@ -1,0 +1,116 @@
+name: Package Ubuntu 24.04 runtime
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Optional prerelease tag; leave empty to generate one per run
+        required: false
+        default: ''
+        type: string
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/package-ubuntu24-runtime.yml'
+      - 'packaging/ubuntu24/**'
+      - 'scripts/package-ubuntu24-runtime*.sh'
+      - 'tools/convert_rife_fp16.py'
+      - 'generate_cmd.sh'
+      - 'README.md'
+      - 'CMakeLists.txt'
+      - 'src/**'
+      - 'include/**'
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # Ship the two consumer GPU generations used by the project. Other
+        # architectures remain available through the local packaging script.
+        gpu_arch: ['89', '120']
+    env:
+      GPU_ARCH: ${{ matrix.gpu_arch }}
+      PACKAGE_VERSION: ${{ inputs.release_tag || github.ref_name }}-${{ github.sha }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build self-contained runtime archive
+        run: |
+          chmod +x scripts/package-ubuntu24-runtime.sh
+          ./scripts/package-ubuntu24-runtime.sh \
+            --install-deps \
+            --gpu-arch "${GPU_ARCH}" \
+            --version "${PACKAGE_VERSION}"
+
+      - name: Show archive contents
+        run: |
+          cat dist/*.sha256
+          tar --zstd -tf dist/*.tar.zst | sed -n '1,160p'
+
+      - name: Upload Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: animejanai-ubuntu24-x86_64-sm${{ matrix.gpu_arch }}
+          path: |
+            dist/*.tar.zst
+            dist/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  prerelease:
+    name: Publish runtime prerelease
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download runtime archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: animejanai-ubuntu24-x86_64-sm*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify release assets
+        working-directory: release-assets
+        run: |
+          sha256sum --check -- *.sha256
+          ls -lh -- *.tar.zst *.sha256
+
+      - name: Resolve prerelease tag
+        id: release
+        env:
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [[ -n "${REQUESTED_TAG}" ]]; then
+            release_tag="${REQUESTED_TAG}"
+          else
+            release_tag="runtime-r${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA::7}"
+          fi
+          echo "tag=${release_tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish GitHub prerelease
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: Ubuntu 24.04 runtime ${{ steps.release.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          draft: false
+          fail_on_unmatched_files: true
+          body: |
+            Automated runtime prerelease from `${{ github.sha }}`.
+
+            Includes TensorRT builder packages for Ada `sm89` and Blackwell `sm120`.
+            Workflow run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          files: |
+            release-assets/*.tar.zst
+            release-assets/*.sha256

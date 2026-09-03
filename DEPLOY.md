@@ -270,18 +270,20 @@ wget -O ~/models/realesrgan_anime6b.onnx \
 # 1. 为 AnimeJaNai 构建 Engine（输入节点为 input，以 1080p 为例）
 trtexec \
   --onnx=~/models/performance.onnx \
-  --minShapes=input:1x3x64x64 \
+  --minShapes=input:1x3x1080x1920 \
   --optShapes=input:1x3x1080x1920 \
   --maxShapes=input:1x3x1080x1920 \
+  --builderOptimizationLevel=5 \
   --skipInference \
   --saveEngine=~/models/performance_1080p.engine
 
 # 2. 为 Real-ESRGAN 构建 Engine（注意：其输入节点名称为 image.1）
 trtexec \
   --onnx=~/models/realesrgan_anime6b.onnx \
-  --minShapes=image.1:1x3x64x64 \
+  --minShapes=image.1:1x3x1080x1920 \
   --optShapes=image.1:1x3x1080x1920 \
   --maxShapes=image.1:1x3x1080x1920 \
+  --builderOptimizationLevel=5 \
   --skipInference \
   --saveEngine=~/models/realesrgan_anime6b_1080p.engine
 ```
@@ -290,9 +292,8 @@ trtexec \
 
 | 参数 | 说明 |
 |------|------|
-| `--minShapes` | 最小输入分辨率（保持 `input:1x3x64x64` 即可） |
-| `--optShapes` | 优化目标分辨率（设为你主要的源视频分辨率） |
-| `--maxShapes` | 最大输入分辨率（≥ optShapes，设为相同值即可） |
+| `--minShapes` / `--optShapes` / `--maxShapes` | 三者设为相同的源视频分辨率，生成固定 shape Engine |
+| `--builderOptimizationLevel=5` | 使用 TensorRT 最高构建优化等级（构建会更慢） |
 | `--skipInference` | 仅构建 Engine，跳过推理基准 |
 | `--fp16` | （仅适用于 TensorRT 10 及以下版本）在 TensorRT 11+ 中已废弃 |
 
@@ -301,23 +302,26 @@ trtexec \
 ```bash
 # 720p 输入
 trtexec --onnx=~/models/performance.onnx \
-  --minShapes=input:1x3x64x64 \
+  --minShapes=input:1x3x720x1280 \
   --optShapes=input:1x3x720x1280 \
   --maxShapes=input:1x3x720x1280 \
+  --builderOptimizationLevel=5 \
   --skipInference \
   --saveEngine=~/models/performance_720p.engine
 
 # 1080p 输入
 trtexec --onnx=~/models/performance.onnx \
-  --minShapes=input:1x3x64x64 \
+  --minShapes=input:1x3x1080x1920 \
   --optShapes=input:1x3x1080x1920 \
   --maxShapes=input:1x3x1080x1920 \
+  --builderOptimizationLevel=5 \
   --skipInference \
   --saveEngine=~/models/performance_1080p.engine
 ```
 
 > [!TIP]
-> 如果你的源视频分辨率不统一，可以将 `--maxShapes` 设得比 `--optShapes` 更大，但推理速度会略降。
+> 每个不同的源分辨率建议单独生成固定 shape Engine。如果改为不同的
+> `minShapes` / `optShapes` / `maxShapes`，将会生成通用性更高但速度较低的动态 Engine。
 
 ---
 
@@ -358,6 +362,24 @@ ffprobe -hide_banner test_clip_4k.mkv
 # 应显示：Video: hevc, 3840x2160 [SAR 1:1 DAR 16:9]
 ```
 
+### 使用 AV1 NVENC（Ada / RTX 40 系及更新 GPU）
+
+使用 `generate_cmd.sh` 时会自动按 GPU 架构选择 split-frame 数量：Blackwell
+请求 3 路，其他架构保留 2 路请求。若具体 GPU 的 NVENC 数量少于请求值，
+驱动会自动收缩到实际可用数量。手写命令时也可以按需指定：
+
+```bash
+./build/aji_encode \
+  --input test_clip.mkv \
+  --output test_clip_4k_av1.mkv \
+  --engine ~/models/performance_1080p.engine \
+  --max-width 1920 --max-height 1080 \
+  --vcodec av1_nvenc \
+  --vquality "-cq 20 -preset p6 -tune hq -split_encode_mode 2" \
+  --pix-fmt yuv420p10 \
+  --overwrite
+```
+
 ### 使用软件编码器（无 NVENC 的 GPU，如 Tesla T4 / A10）
 
 ```bash
@@ -386,7 +408,8 @@ aji_encode --input <f> --output <f> [选项...]
 
 可选参数:
   --vcodec <codec>        视频编码器（默认 hevc_nvenc）
-                          可选：hevc_nvenc, h264_nvenc, libx265, libx264, ffv1
+                          可选：hevc_nvenc, av1_nvenc, h264_nvenc,
+                                libx265, libx264, ffv1
   --vquality "<args>"     编码器质量参数
   --pix-fmt <fmt>         输出像素格式（默认 yuv420p10）
                           可选：yuv420p, yuv420p10, yuv444p, yuv444p10
@@ -401,6 +424,13 @@ aji_encode --input <f> --output <f> [选项...]
   --log <file>            日志输出到文件
   --build-only            仅构建 Engine，不执行编码
 
+直连 Engine 模式的可选 RIFE 参数（与超分同一管道）:
+  --rife-model <name>     RIFE ONNX 文件名（不含 .onnx，如 rife_v4.26）
+  --rife-model-dir <dir>  RIFE ONNX 与 Engine 缓存目录
+  --rife-factor <N>       整数插帧倍率 2-8（默认 2）
+  --rife-order <order>    before（先插帧再超分，默认）或 after
+  --rife-scene-threshold  转场检测阈值（默认 0.150）
+
 配置模式（替代 --engine 直连模式）:
   --conf <file>           animejanai.conf 配置文件路径
   --slot <N>              配置 Slot 编号
@@ -409,6 +439,18 @@ aji_encode --input <f> --output <f> [选项...]
   --rife-model-dir <dir>  RIFE 插帧模型目录
   --backend tensorrt      推理后端（默认 tensorrt）
 ```
+
+例如，使用同一次解码/编码完成 RIFE 2x 插帧与 2x 超分：
+
+```sh
+aji_encode --input input.mkv --output output.mkv \
+  --engine models/balanced_1080p.engine --max-width 1920 --max-height 1080 \
+  --rife-model-dir onnx/rife --rife-model rife_v4.26 \
+  --rife-factor 2 --rife-order before \
+  --decoder nvdec --vcodec hevc_nvenc --pix-fmt yuv420p10
+```
+
+首次运行会按 RIFE 工作分辨率构建并缓存 TensorRT Engine；后续任务直接复用。
 
 ---
 
@@ -511,9 +553,10 @@ mkdir -p ~/models
 # 5. 构建 Engine（替换为你的模型路径）
 trtexec \
     --onnx=~/models/performance.onnx \
-    --minShapes=input:1x3x64x64 \
+    --minShapes=input:1x3x1080x1920 \
     --optShapes=input:1x3x1080x1920 \
     --maxShapes=input:1x3x1080x1920 \
+    --builderOptimizationLevel=5 \
     --skipInference \
     --saveEngine=~/models/performance_1080p.engine
 

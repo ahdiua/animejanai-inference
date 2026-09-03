@@ -2,7 +2,7 @@
 # ==============================================================================
 # AnimeJaNai-Inference 交互式任务配置与命令生成器 (Command Generator)
 # 功能说明：
-#   通过向导式问答收集输入视频、模型 Engine、编码器、画质、位深等参数，
+#   通过向导式问答收集输入视频、处理方案、编码器、画质、位深等参数，
 #   生成标准高效的 aji_encode 运行命令与独立执行脚本 (.sh)，
 #   默认不自动执行，支持直接复制命令或手动运行生成的脚本。
 # ==============================================================================
@@ -21,8 +21,12 @@ NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# 定位项目根目录
-if [ -f "${SCRIPT_DIR}/CMakeLists.txt" ] || [ -f "${SCRIPT_DIR}/build/aji_encode" ]; then
+# 定位项目根目录。Runtime 包必须优先于 $HOME 中可能存在的源码树，
+# 否则从解压目录启动时会误用源码树的 build/aji_encode。
+if [ -x "${SCRIPT_DIR}/aji_encode" ] && [ -x "${SCRIPT_DIR}/bin/ffmpeg.real" ] && \
+   [ -d "${SCRIPT_DIR}/lib" ]; then
+    PROJECT_ROOT="${SCRIPT_DIR}"
+elif [ -f "${SCRIPT_DIR}/CMakeLists.txt" ] || [ -f "${SCRIPT_DIR}/build/aji_encode" ]; then
     PROJECT_ROOT="${SCRIPT_DIR}"
 elif [ -f "CMakeLists.txt" ] || [ -f "build/aji_encode" ]; then
     PROJECT_ROOT="$(pwd)"
@@ -36,13 +40,30 @@ fi
 
 MODELS_DIR="${HOME}/models"
 FFMPEG_INSTALL_DIR="/opt/ffmpeg"
-NVENC_FIX_SO="/opt/libnvenc_fix.so"
+CUDA_BIN_DIR="/usr/local/cuda/bin"
+CUDA_LIB_DIR="/usr/local/cuda/lib64"
 AJI_ENCODE_BIN="${PROJECT_ROOT}/build/aji_encode"
+RUNTIME_MODE=0
+if [ -x "${PROJECT_ROOT}/bin/ffmpeg.real" ] && [ -d "${PROJECT_ROOT}/lib" ]; then
+    # Self-contained Ubuntu runtime package: all tools and shared libraries
+    # live beside this script instead of under /opt and /usr/local/cuda.
+    RUNTIME_MODE=1
+    FFMPEG_INSTALL_DIR="${PROJECT_ROOT}"
+    CUDA_BIN_DIR="${PROJECT_ROOT}/bin"
+    CUDA_LIB_DIR="${PROJECT_ROOT}/lib"
+    AJI_ENCODE_BIN="${PROJECT_ROOT}/aji_encode"
+fi
+NVENC_FIX_SO="/opt/libnvenc_fix.so"
 
 # 全局配置变量初始化
 INPUT_VIDEO=""
 ENGINE_FILE=""
 OUTPUT_VIDEO=""
+USE_RUNTIME_CONFIG=${RUNTIME_MODE}
+RUNTIME_CONFIG="${PROJECT_ROOT}/animejanai.conf"
+RUNTIME_SLOT=1003
+RUNTIME_PROFILE="Performance"
+UPSCALE_ENABLED=1
 SRC_WIDTH=1920
 SRC_HEIGHT=1080
 SRC_CODEC="未知"
@@ -57,11 +78,73 @@ DECODER="nvdec"
 PIX_FMT="yuv420p10"
 OVERWRITE_FLAG=""
 EXTRA_FLAGS=()
+RIFE_ENABLED=0
+RIFE_MODEL=""
+RIFE_MODEL_DIR="${PROJECT_ROOT}/onnx/rife"
+RIFE_FACTOR=2
+RIFE_ORDER="before"
+RIFE_SCD_THRESHOLD="0.150"
+GPU_NAME="未检测"
+GPU_COMPUTE_CAP=""
+# Preserve the previous dual-split default when GPU detection is unavailable.
+NVENC_SPLIT_COUNT=2
+
+# Blackwell supports up to a three-way single-session split. Keep the existing
+# two-way request elsewhere; NVENC clamps either request to the number of
+# encoder engines that physically exist on the selected GPU.
+detect_nvenc_split_count() {
+    local detected_name=""
+    local detected_cap=""
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        if detected_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null); then
+            detected_name=$(printf '%s\n' "$detected_name" \
+                | sed -n '1{s/^[[:space:]]*//;s/[[:space:]]*$//;p;}')
+        else
+            detected_name=""
+        fi
+        if detected_cap=$(nvidia-smi --query-gpu=compute_cap \
+            --format=csv,noheader,nounits 2>/dev/null); then
+            detected_cap=$(printf '%s\n' "$detected_cap" \
+                | sed -n '1{s/[[:space:]]//g;p;}')
+        else
+            detected_cap=""
+        fi
+    fi
+
+    # If NVML is temporarily unavailable in a container, the Runtime's
+    # single-architecture TensorRT builder resource is a reliable fallback.
+    if [ -z "$detected_cap" ] && [ "$RUNTIME_MODE" -eq 1 ]; then
+        if compgen -G "${PROJECT_ROOT}/lib/libnvinfer_builder_resource_sm120.so*" >/dev/null; then
+            detected_name=${detected_name:-"Runtime target sm120"}
+            detected_cap="12.0"
+        elif compgen -G "${PROJECT_ROOT}/lib/libnvinfer_builder_resource_sm100.so*" >/dev/null; then
+            detected_name=${detected_name:-"Runtime target sm100"}
+            detected_cap="10.0"
+        fi
+    fi
+
+    [ -n "$detected_name" ] && GPU_NAME="$detected_name"
+    GPU_COMPUTE_CAP="$detected_cap"
+
+    case "$GPU_COMPUTE_CAP" in
+        10.*|12.*) NVENC_SPLIT_COUNT=3 ;; # Blackwell data-center/consumer
+        *)
+            case "$GPU_NAME" in
+                *Blackwell*|*GeForce*RTX*50[0-9][0-9]*)
+                    NVENC_SPLIT_COUNT=3 ;;
+                *)  NVENC_SPLIT_COUNT=2 ;; # Retain legacy behaviour
+            esac
+            ;;
+    esac
+
+    VQUALITY="-cq 18 -preset p7 -tune hq -split_encode_mode ${NVENC_SPLIT_COUNT}"
+}
 
 print_header() {
     clear 2>/dev/null || true
     echo -e "${CYAN}==============================================================================${NC}"
-    echo -e "${BOLD}${MAGENTA}      AnimeJaNai-Inference 交互式超分任务配置向导与命令生成器${NC}"
+    echo -e "${BOLD}${MAGENTA}      AnimeJaNai-Inference 交互式 AI 视频任务配置与命令生成器${NC}"
     echo -e "${CYAN}==============================================================================${NC}"
     echo -e " 核心工具: ${BOLD}${AJI_ENCODE_BIN}${NC}"
     echo -e " 系统时间: $(date '+%Y-%m-%d %H:%M:%S')"
@@ -75,11 +158,20 @@ check_binaries() {
         echo -e "${YELLOW}请先运行 ./deploy.sh 选项 [8] 或 [2] 编译项目后再使用此生成器。${NC}"
         exit 1
     fi
+
+    if [ "$RUNTIME_MODE" -eq 1 ]; then
+        if [ ! -f "$RUNTIME_CONFIG" ] || [ ! -d "${PROJECT_ROOT}/onnx" ] || \
+           [ ! -x "${PROJECT_ROOT}/bin/trtexec.real" ]; then
+            echo -e "${RED}[错误] Runtime 包不完整，缺少 animejanai.conf、onnx/ 或 bin/trtexec.real。${NC}"
+            echo -e "${YELLOW}请重新解压完整的 Runtime 包后再运行生成器。${NC}"
+            exit 1
+        fi
+    fi
 }
 
 # 2. 视频输入选择 (自动真实路径去重)
 select_input_video() {
-    echo -e "${BOLD}${CYAN}[步骤 1/7] 选择输入视频文件 (Input Video)${NC}"
+    echo -e "${BOLD}${CYAN}[步骤 1/8] 选择输入视频文件 (Input Video)${NC}"
     
     # 自动搜索常见目录下的视频文件（自动规范化为真实绝对路径并严格去重）
     local search_dirs=("$PWD" "$PROJECT_ROOT" "$HOME" "/root" "$HOME/videos" "$HOME/autodl-tmp" "/root/autodl-tmp" "/root/autodl-fs")
@@ -156,7 +248,7 @@ select_input_video() {
 
 # 3. 选择/匹配 TensorRT Engine 模型 (自动真实路径去重)
 select_engine() {
-    echo -e "${BOLD}${CYAN}[步骤 2/7] 选择超分 TensorRT Engine 模型${NC}"
+    echo -e "${BOLD}${CYAN}[步骤 2/8] 选择超分 TensorRT Engine 模型${NC}"
 
     local search_dirs=("$MODELS_DIR" "$PROJECT_ROOT" "$HOME" "/root/models" "/root")
     local raw_engines=()
@@ -221,10 +313,173 @@ select_engine() {
     echo ""
 }
 
-# 4. 选择压制范围（全片或截取片段测试）
+# Runtime 包不依赖预先生成的 .engine。选中 Slot 后，aji_encode
+# 会按输入分辨率在首次执行时构建 Engine，后续自动复用缓存。
+select_runtime_profile() {
+    echo -e "${BOLD}${CYAN}[步骤 2/8] 选择 Runtime 处理方案 (Slot)${NC}"
+    echo -e "${GREEN}已识别到免安装 Runtime 环境；无需手动准备 .engine。${NC}"
+    echo -e "  ${BOLD}1)${NC} Quality                  - 质量优先超分 (Slot 1001)"
+    echo -e "  ${BOLD}2)${NC} Balanced                 - 平衡超分 (Slot 1002)"
+    echo -e "  ${BOLD}3)${NC} ${GREEN}Performance              - 性能优先超分，默认推荐 (Slot 1003)${NC}"
+    echo -e "  ${BOLD}4)${NC} Sharp Balanced           - 锐化平衡超分 (Slot 2001)"
+    echo -e "  ${BOLD}5)${NC} Sharp Performance        - 锐化性能超分 (Slot 2002)"
+    echo -e "  ${BOLD}6)${NC} SD Compact               - SD 素材超分 (Slot 2003)"
+    echo -e "  ${BOLD}7)${NC} RIFE v4.25 2x           - 仅插帧 (Slot 2025)"
+    echo -e "  ${BOLD}8)${NC} RIFE v4.26 2x           - 仅插帧 (Slot 2026)"
+    echo -e "  ${BOLD}9)${NC} Performance + RIFE 4.25 - 超分 + 2x 插帧 (Slot 3025)"
+    echo -e "  ${BOLD}10)${NC} Performance + RIFE 4.26 - 超分 + 2x 插帧 (Slot 3026)"
+
+    local profile_choice
+    read -rp "请选择处理方案 [1-10, 默认 3]: " profile_choice
+    profile_choice=${profile_choice:-3}
+
+    USE_RUNTIME_CONFIG=1
+    UPSCALE_ENABLED=1
+    RIFE_ENABLED=0
+    RIFE_MODEL=""
+    RIFE_FACTOR=2
+    RIFE_ORDER="before"
+    RIFE_SCD_THRESHOLD="0.150"
+
+    case "$profile_choice" in
+        1) RUNTIME_SLOT=1001; RUNTIME_PROFILE="Quality" ;;
+        2) RUNTIME_SLOT=1002; RUNTIME_PROFILE="Balanced" ;;
+        3) RUNTIME_SLOT=1003; RUNTIME_PROFILE="Performance" ;;
+        4) RUNTIME_SLOT=2001; RUNTIME_PROFILE="Sharp Balanced" ;;
+        5) RUNTIME_SLOT=2002; RUNTIME_PROFILE="Sharp Performance" ;;
+        6) RUNTIME_SLOT=2003; RUNTIME_PROFILE="SD Compact" ;;
+        7)
+            RUNTIME_SLOT=2025
+            RUNTIME_PROFILE="RIFE v4.25 2x only"
+            UPSCALE_ENABLED=0
+            RIFE_ENABLED=1
+            RIFE_MODEL="rife_v4.25"
+            ;;
+        8)
+            RUNTIME_SLOT=2026
+            RUNTIME_PROFILE="RIFE v4.26 2x only"
+            UPSCALE_ENABLED=0
+            RIFE_ENABLED=1
+            RIFE_MODEL="rife_v4.26"
+            ;;
+        9)
+            RUNTIME_SLOT=3025
+            RUNTIME_PROFILE="Performance + RIFE v4.25 2x"
+            RIFE_ENABLED=1
+            RIFE_MODEL="rife_v4.25"
+            ;;
+        10)
+            RUNTIME_SLOT=3026
+            RUNTIME_PROFILE="Performance + RIFE v4.26 2x"
+            RIFE_ENABLED=1
+            RIFE_MODEL="rife_v4.26"
+            ;;
+        *)
+            echo -e "${YELLOW}无效选项，已使用默认 Performance (Slot 1003)。${NC}"
+            RUNTIME_SLOT=1003
+            RUNTIME_PROFILE="Performance"
+            ;;
+    esac
+
+    echo -e "${GREEN}✔ 已选择 Runtime Slot: ${BOLD}${RUNTIME_SLOT} (${RUNTIME_PROFILE})${NC}"
+    echo -e "${CYAN}首次处理新分辨率时会自动构建 Engine，之后直接复用 onnx/ 中的缓存。${NC}\n"
+}
+
+select_processing_profile() {
+    if [ "$RUNTIME_MODE" -eq 1 ]; then
+        select_runtime_profile
+    else
+        select_engine
+    fi
+}
+
+# 4. 可选 RIFE 插帧（与超分在同一 aji_encode 管道内执行）
+select_rife() {
+    echo -e "${BOLD}${CYAN}[步骤 3/8] RIFE AI 插帧设置 (单次解码/编码管道)${NC}"
+
+    local search_dirs=("${PROJECT_ROOT}/onnx/rife" "${MODELS_DIR}/rife" "${HOME}/onnx/rife")
+    local raw_models=()
+    for d in "${search_dirs[@]}"; do
+        [ -d "$d" ] || continue
+        while IFS= read -r f; do
+            raw_models+=("$(readlink -f "$f")")
+        done < <(find -L "$d" -maxdepth 1 -type f -name 'rife_v*.onnx' 2>/dev/null)
+    done
+
+    local found_models=()
+    if [ ${#raw_models[@]} -gt 0 ]; then
+        mapfile -t found_models < <(printf "%s\n" "${raw_models[@]}" | sort -uV)
+    fi
+    if [ ${#found_models[@]} -eq 0 ]; then
+        echo -e "${YELLOW}未找到 RIFE ONNX（预期目录：${PROJECT_ROOT}/onnx/rife），本次不启用插帧。${NC}\n"
+        RIFE_ENABLED=0
+        return
+    fi
+
+    read -rp "是否同时启用 RIFE AI 插帧？[y/N, 默认 N]: " enable_rife
+    enable_rife=${enable_rife:-N}
+    if [[ ! "$enable_rife" =~ ^[Yy]$ ]]; then
+        RIFE_ENABLED=0
+        echo -e "${GREEN}✔ 本次仅执行超分，不插帧。${NC}\n"
+        return
+    fi
+
+    RIFE_ENABLED=1
+    echo -e "检测到以下 RIFE 模型："
+    local default_idx=1
+    for i in "${!found_models[@]}"; do
+        local name="$(basename "${found_models[$i]}")"
+        if [ "$name" = "rife_v4.26.onnx" ]; then
+            default_idx=$((i + 1))
+        fi
+        echo -e "  ${BOLD}$((i+1)))${NC} ${name}"
+    done
+    read -rp "请选择 RIFE 模型 [1-${#found_models[@]}, 默认 ${default_idx}]: " rife_idx
+    rife_idx=${rife_idx:-$default_idx}
+    if [[ ! "$rife_idx" =~ ^[0-9]+$ ]] ||
+       [ "$rife_idx" -lt 1 ] || [ "$rife_idx" -gt "${#found_models[@]}" ]; then
+        rife_idx=$default_idx
+    fi
+    local rife_file="${found_models[$((rife_idx-1))]}"
+    RIFE_MODEL_DIR="$(dirname "$rife_file")"
+    RIFE_MODEL="$(basename "$rife_file" .onnx)"
+
+    echo -e "\n插帧倍率："
+    echo -e "  ${BOLD}1)${NC} ${GREEN}2x（推荐，如 24→48 / 30→60 fps）${NC}"
+    echo -e "  ${BOLD}2)${NC} 4x（如 24→96 fps，耗时和输出体积显著增加）"
+    read -rp "请选择 [1-2, 默认 1]: " factor_choice
+    [ "${factor_choice:-1}" = "2" ] && RIFE_FACTOR=4 || RIFE_FACTOR=2
+
+    echo -e "\n处理顺序："
+    echo -e "  ${BOLD}1)${NC} ${GREEN}先插帧、再超分（推荐；RIFE 在源分辨率运行）${NC}"
+    echo -e "  ${BOLD}2)${NC} 先超分、再插帧（细节优先；RIFE 在输出分辨率运行，通常很慢）"
+    read -rp "请选择 [1-2, 默认 1]: " order_choice
+    [ "${order_choice:-1}" = "2" ] && RIFE_ORDER="after" || RIFE_ORDER="before"
+
+    read -rp "转场检测阈值 [默认 0.150]: " scd_input
+    RIFE_SCD_THRESHOLD=${scd_input:-0.150}
+    echo -e "${GREEN}✔ RIFE: ${BOLD}${RIFE_MODEL}${NC} | ${RIFE_FACTOR}x | ${RIFE_ORDER} upscale | SCD ${RIFE_SCD_THRESHOLD}${NC}\n"
+}
+
+select_rife_settings() {
+    if [ "$USE_RUNTIME_CONFIG" -eq 0 ]; then
+        select_rife
+        return
+    fi
+
+    echo -e "${BOLD}${CYAN}[步骤 3/8] RIFE AI 插帧设置${NC}"
+    if [ "$RIFE_ENABLED" -eq 1 ]; then
+        echo -e "${GREEN}✔ 已由 Slot ${RUNTIME_SLOT} 启用 ${BOLD}${RIFE_MODEL} 2x${NC}${GREEN} 插帧。${NC}"
+    else
+        echo -e "${GREEN}✔ Slot ${RUNTIME_SLOT} 仅执行超分，不插帧。${NC}"
+    fi
+    echo -e "${CYAN}Runtime 的 RIFE 模型、倍率与处理顺序由所选 Slot 统一配置。${NC}\n"
+}
+
+# 5. 选择压制范围（全片或截取片段测试）
 select_clip_mode() {
-    echo -e "${BOLD}${CYAN}[步骤 3/7] 压制范围选择 (Full Video or Clip Test)${NC}"
-    echo -e "  ${BOLD}1)${NC} ${GREEN}整片完整超分压制${NC} (Full Encode - 标准输出整部影片)"
+    echo -e "${BOLD}${CYAN}[步骤 4/8] 压制范围选择 (Full Video or Clip Test)${NC}"
+    echo -e "  ${BOLD}1)${NC} ${GREEN}整片完整处理${NC} (Full Encode - 标准输出整部影片)"
     echo -e "  ${BOLD}2)${NC} ${YELLOW}截取指定时间段进行测试${NC} (Clip Slice Test - 快速验证画质与压制速度)"
     read -rp "请选择 [1-2, 默认 1]: " clip_choice
     clip_choice=${clip_choice:-1}
@@ -241,24 +496,35 @@ select_clip_mode() {
         CLIP_DURATION=${input_dur:-60}
         echo -e "${GREEN}✔ 已设置为截取测试模式: 从 ${CLIP_START} 开始截取 ${CLIP_DURATION} 秒${NC}\n"
     else
-        echo -e "${GREEN}✔ 已设置为整片完整超分模式${NC}\n"
+        echo -e "${GREEN}✔ 已设置为整片完整处理模式${NC}\n"
     fi
 }
 
-# 5. 输出文件路径设置
+# 6. 输出文件路径设置
 select_output_path() {
-    echo -e "${BOLD}${CYAN}[步骤 4/7] 设置输出文件路径 (Output Destination)${NC}"
+    echo -e "${BOLD}${CYAN}[步骤 5/8] 设置输出文件路径 (Output Destination)${NC}"
 
     local dir_name="$(dirname "$INPUT_VIDEO")"
     local base_name="$(basename "$INPUT_VIDEO")"
     local raw_name="${base_name%.*}"
-    local ext="${base_name##*.}"
 
     local default_out=""
     if [ "$IS_CLIP" -eq 1 ]; then
-        default_out="${dir_name}/${raw_name}_clip_${CLIP_DURATION}s_upscaled.mkv"
+        if [ "$RIFE_ENABLED" -eq 1 ] && [ "$UPSCALE_ENABLED" -eq 1 ]; then
+            default_out="${dir_name}/${raw_name}_clip_${CLIP_DURATION}s_rife${RIFE_FACTOR}x_upscaled.mkv"
+        elif [ "$RIFE_ENABLED" -eq 1 ]; then
+            default_out="${dir_name}/${raw_name}_clip_${CLIP_DURATION}s_rife${RIFE_FACTOR}x.mkv"
+        else
+            default_out="${dir_name}/${raw_name}_clip_${CLIP_DURATION}s_upscaled.mkv"
+        fi
     else
-        default_out="${dir_name}/${raw_name}_upscaled.mkv"
+        if [ "$RIFE_ENABLED" -eq 1 ] && [ "$UPSCALE_ENABLED" -eq 1 ]; then
+            default_out="${dir_name}/${raw_name}_rife${RIFE_FACTOR}x_upscaled.mkv"
+        elif [ "$RIFE_ENABLED" -eq 1 ]; then
+            default_out="${dir_name}/${raw_name}_rife${RIFE_FACTOR}x.mkv"
+        else
+            default_out="${dir_name}/${raw_name}_upscaled.mkv"
+        fi
     fi
 
     echo -e "默认推荐输出路径: ${BOLD}${default_out}${NC}"
@@ -280,33 +546,40 @@ select_output_path() {
     echo -e "${GREEN}✔ 输出路径: ${BOLD}${OUTPUT_VIDEO}${NC}\n"
 }
 
-# 6. 选择编码器与画质配置
+# 7. 选择编码器与画质配置
 select_encoder_and_quality() {
-    echo -e "${BOLD}${CYAN}[步骤 5/7] 选择视频编码器与画质参数 (Video Encoder & Quality)${NC}"
+    echo -e "${BOLD}${CYAN}[步骤 6/8] 选择视频编码器与画质参数 (Video Encoder & Quality)${NC}"
     echo -e "  ${BOLD}1)${NC} ${GREEN}hevc_nvenc (NVIDIA NVENC H.265 硬件编码 - 强烈推荐，极速高画质)${NC}"
-    echo -e "  ${BOLD}2)${NC} h264_nvenc (NVIDIA NVENC H.264 硬件编码 - 兼容性好)"
-    echo -e "  ${BOLD}3)${NC} libx265   (CPU H.265 软件编码 - 极致压缩率，但速度慢)"
-    echo -e "  ${BOLD}4)${NC} libx264   (CPU H.264 软件编码)"
-    echo -e "  ${BOLD}5)${NC} ffv1      (无损归档编码)"
-    read -rp "请选择编码器 [1-5, 默认 1]: " enc_choice
+    echo -e "  ${BOLD}2)${NC} ${GREEN}av1_nvenc  (NVIDIA NVENC AV1 硬件编码 - Ada/RTX 40 系及更新 GPU)${NC}"
+    echo -e "  ${BOLD}3)${NC} h264_nvenc (NVIDIA NVENC H.264 硬件编码 - 兼容性好)"
+    echo -e "  ${BOLD}4)${NC} libx265   (CPU H.265 软件编码 - 极致压缩率，但速度慢)"
+    echo -e "  ${BOLD}5)${NC} libx264   (CPU H.264 软件编码)"
+    echo -e "  ${BOLD}6)${NC} ffv1      (无损归档编码)"
+    read -rp "请选择编码器 [1-6, 默认 1]: " enc_choice
     enc_choice=${enc_choice:-1}
 
     case "$enc_choice" in
         1) VCODEC="hevc_nvenc" ;;
-        2) VCODEC="h264_nvenc" ;;
-        3) VCODEC="libx265" ;;
-        4) VCODEC="libx264" ;;
-        5) VCODEC="ffv1" ;;
+        2) VCODEC="av1_nvenc" ;;
+        3) VCODEC="h264_nvenc" ;;
+        4) VCODEC="libx265" ;;
+        5) VCODEC="libx264" ;;
+        6) VCODEC="ffv1" ;;
         *) VCODEC="hevc_nvenc" ;;
     esac
 
     echo -e "\n请选择画质与预设参数 (VQuality Preset)："
     if [[ "$VCODEC" == *"nvenc"* ]]; then
         local nvenc_extra="-tune hq"
-        if [[ "$VCODEC" == "hevc_nvenc" ]]; then
-            # Ada 等配有多个 NVENC 的 GPU 可借此并行编码同一 HEVC 帧；
-            # 单 NVENC GPU 会保持单路编码。H.264 不支持 split encode。
-            nvenc_extra+=" -split_encode_mode 2"
+        if [[ "$VCODEC" == "hevc_nvenc" || "$VCODEC" == "av1_nvenc" ]]; then
+            # HEVC/AV1 can split one frame across multiple NVENC engines.
+            # H.264 does not support split-frame encoding.
+            if [ "$NVENC_SPLIT_COUNT" -gt 1 ]; then
+                nvenc_extra+=" -split_encode_mode ${NVENC_SPLIT_COUNT}"
+                echo -e "  ${CYAN}自动 NVENC 分割: ${NVENC_SPLIT_COUNT} 路 (${GPU_NAME}, SM ${GPU_COMPUTE_CAP:-未知})${NC}"
+            else
+                echo -e "  ${CYAN}自动 NVENC 分割: 单路 (${GPU_NAME}, SM ${GPU_COMPUTE_CAP:-未知})${NC}"
+            fi
         fi
 
         echo -e "  ${BOLD}1)${NC} ${GREEN}高质量动漫推荐: -cq 18 -preset p7 ${nvenc_extra}${NC} (兼顾绝佳画质与合理体积)"
@@ -347,9 +620,9 @@ select_encoder_and_quality() {
     echo -e "${GREEN}✔ 编码器: ${BOLD}${VCODEC}${NC} | 参数: ${BOLD}${VQUALITY}${NC}\n"
 }
 
-# 7. 选择解码器与像素格式
+# 8. 选择解码器与像素格式
 select_decoder_and_pixfmt() {
-    echo -e "${BOLD}${CYAN}[步骤 6/7] 硬件解码器与色彩像素格式 (Decoder & Pixel Format)${NC}"
+    echo -e "${BOLD}${CYAN}[步骤 7/8] 硬件解码器与色彩像素格式 (Decoder & Pixel Format)${NC}"
 
     echo -e "解码器选择 (--decoder)："
     echo -e "  ${BOLD}1)${NC} ${GREEN}nvdec (NVIDIA 硬件加速解码 - 推荐，显存零拷贝极速)${NC}"
@@ -380,11 +653,9 @@ select_decoder_and_pixfmt() {
     echo -e "${GREEN}✔ 解码器: ${BOLD}${DECODER}${NC} | 像素格式: ${BOLD}${PIX_FMT}${NC}\n"
 }
 
-# 8. 音轨/字幕与降采样选项
+# 9. 音轨/字幕与降采样选项
 select_optional_flags() {
-    echo -e "${BOLD}${CYAN}[步骤 7/7] 音频、字幕与输出缩放附加选项${NC}"
-    
-    EXTRA_FLAGS=()
+    echo -e "${BOLD}${CYAN}[步骤 8/8] 音频、字幕与输出缩放附加选项${NC}"
 
     read -rp "是否保留原视频中的全部音频流？[Y/n, 默认 Y]: " keep_audio
     keep_audio=${keep_audio:-Y}
@@ -398,7 +669,7 @@ select_optional_flags() {
         EXTRA_FLAGS+=("--no-subs")
     fi
 
-    read -rp "是否在超分后下采样回特定高度？(如输入 1080 实现 2x 超分再降采样超采样抗锯齿，留空表示不缩放): " resize_h
+    read -rp "是否在 AI 处理后缩放到特定高度？(如输入 1080 实现 2x 超分再降采样抗锯齿，留空表示不缩放): " resize_h
     if [ -n "$resize_h" ] && [ "$resize_h" -gt 0 ] 2>/dev/null; then
         EXTRA_FLAGS+=("--final-resize-height" "$resize_h")
         echo -e "${GREEN}✔ 已开启后处理下采样至高度: ${resize_h}p${NC}"
@@ -426,13 +697,28 @@ generate_final_command_and_script() {
 
     cmd_args+=("--input" "\"${effective_input}\"")
     cmd_args+=("--output" "\"${OUTPUT_VIDEO}\"")
-    cmd_args+=("--engine" "\"${ENGINE_FILE}\"")
-    cmd_args+=("--max-width" "${SRC_WIDTH}")
-    cmd_args+=("--max-height" "${SRC_HEIGHT}")
+    if [ "$USE_RUNTIME_CONFIG" -eq 1 ]; then
+        cmd_args+=("--conf" "\"${RUNTIME_CONFIG}\"")
+        cmd_args+=("--slot" "${RUNTIME_SLOT}")
+        cmd_args+=("--model-dir" "\"${PROJECT_ROOT}/onnx\"")
+        cmd_args+=("--rife-model-dir" "\"${PROJECT_ROOT}/onnx/rife\"")
+        cmd_args+=("--trtexec" "\"${PROJECT_ROOT}/bin/trtexec.real\"")
+    else
+        cmd_args+=("--engine" "\"${ENGINE_FILE}\"")
+        cmd_args+=("--max-width" "${SRC_WIDTH}")
+        cmd_args+=("--max-height" "${SRC_HEIGHT}")
+    fi
     cmd_args+=("--decoder" "${DECODER}")
     cmd_args+=("--vcodec" "${VCODEC}")
     cmd_args+=("--vquality" "\"${VQUALITY}\"")
     cmd_args+=("--pix-fmt" "${PIX_FMT}")
+    if [ "$RIFE_ENABLED" -eq 1 ] && [ "$USE_RUNTIME_CONFIG" -eq 0 ]; then
+        cmd_args+=("--rife-model-dir" "\"${RIFE_MODEL_DIR}\"")
+        cmd_args+=("--rife-model" "${RIFE_MODEL}")
+        cmd_args+=("--rife-factor" "${RIFE_FACTOR}")
+        cmd_args+=("--rife-order" "${RIFE_ORDER}")
+        cmd_args+=("--rife-scene-threshold" "${RIFE_SCD_THRESHOLD}")
+    fi
     [ -n "$OVERWRITE_FLAG" ] && cmd_args+=("${OVERWRITE_FLAG}")
     [ ${#EXTRA_FLAGS[@]} -gt 0 ] && cmd_args+=("${EXTRA_FLAGS[@]}")
 
@@ -445,15 +731,26 @@ generate_final_command_and_script() {
 set -e
 
 # 1. 配置运行时动态库与环境变量
-export PATH="/usr/local/cuda/bin:${FFMPEG_INSTALL_DIR}/bin:\$PATH"
-export LD_LIBRARY_PATH="${PROJECT_ROOT}/build:${FFMPEG_INSTALL_DIR}/lib:/usr/local/cuda/lib64:\${LD_LIBRARY_PATH:-}"
+export PATH="${CUDA_BIN_DIR}:${FFMPEG_INSTALL_DIR}/bin:\$PATH"
+export LD_LIBRARY_PATH="${PROJECT_ROOT}/build:${FFMPEG_INSTALL_DIR}/lib:${CUDA_LIB_DIR}:\${LD_LIBRARY_PATH:-}"
 ${preload_str}
 
 echo -e "\033[1;36m==============================================================================\033[0m"
-echo -e "\033[1;35m🚀 开始执行 AnimeJaNai 视频超分压制任务\033[0m"
+echo -e "\033[1;35m🚀 开始执行 AnimeJaNai AI 视频压制任务\033[0m"
 echo -e "  - 输入文件: ${INPUT_VIDEO}"
 echo -e "  - 输出文件: ${OUTPUT_VIDEO}"
-echo -e "  - Engine:   ${ENGINE_FILE}"
+if [ "${USE_RUNTIME_CONFIG}" -eq 1 ]; then
+    echo -e "  - Runtime Slot: ${RUNTIME_SLOT} (${RUNTIME_PROFILE})"
+else
+    echo -e "  - Engine:   ${ENGINE_FILE}"
+fi
+if [ "${RIFE_ENABLED}" -eq 1 ]; then
+    if [ "${USE_RUNTIME_CONFIG}" -eq 1 ]; then
+        echo -e "  - RIFE:     ${RIFE_MODEL} (${RIFE_FACTOR}x, 由 Runtime Slot 配置)"
+    else
+        echo -e "  - RIFE:     ${RIFE_MODEL} (${RIFE_FACTOR}x, ${RIFE_ORDER} upscale, SCD ${RIFE_SCD_THRESHOLD})"
+    fi
+fi
 echo -e "  - 编码器:   ${VCODEC} (${VQUALITY})"
 echo -e "  - 像素格式: ${PIX_FMT}"
 echo -e "\033[1;36m------------------------------------------------------------------------------\033[0m"
@@ -466,8 +763,8 @@ EOF
 echo -e "\033[0;33m[前置] 正在流拷贝无损快速截取 ${CLIP_DURATION} 秒测试片段...\033[0m"
 ffmpeg -y -ss "${CLIP_START}" -i "${INPUT_VIDEO}" -t "${CLIP_DURATION}" -c copy "${clip_intermediate}"
 
-# 3. 运行超分压制
-echo -e "\033[0;32m[核心] 启动 aji_encode 进行超分推理与编码...\033[0m"
+# 3. 运行单管道超分/插帧压制
+echo -e "\033[0;32m[核心] 启动 aji_encode 进行 AI 推理与编码...\033[0m"
 ${AJI_ENCODE_BIN} \\
     ${cmd_args[*]}
 
@@ -476,7 +773,7 @@ rm -f "${clip_intermediate}"
 EOF
     else
         cat << EOF >> "$gen_script_path"
-# 2. 启动 aji_encode 进行全视频超分压制
+# 2. 启动 aji_encode 进行全视频单管道 AI 处理/压制
 ${AJI_ENCODE_BIN} \\
     ${cmd_args[*]}
 EOF
@@ -485,7 +782,7 @@ EOF
     cat << 'EOF' >> "$gen_script_path"
 
 echo -e "\n\033[1;32m==============================================================================\033[0m"
-echo -e "\033[1;32m🎉 视频超分压制任务圆满完成！\033[0m"
+echo -e "\033[1;32m🎉 AI 视频压制任务圆满完成！\033[0m"
 echo -e "\033[1;32m==============================================================================\033[0m"
 EOF
 
@@ -508,13 +805,13 @@ EOF
     echo -e "${CYAN}------------------------------------------------------------------------------${NC}"
     
     echo -e "${CYAN}# 1. 导入环境变量：${NC}"
-    echo -e "${BOLD}export PATH=\"/usr/local/cuda/bin:${FFMPEG_INSTALL_DIR}/bin:\$PATH\""
-    echo -e "export LD_LIBRARY_PATH=\"${PROJECT_ROOT}/build:${FFMPEG_INSTALL_DIR}/lib:/usr/local/cuda/lib64:\$LD_LIBRARY_PATH\"${NC}"
+    echo -e "${BOLD}export PATH=\"${CUDA_BIN_DIR}:${FFMPEG_INSTALL_DIR}/bin:\$PATH\""
+    echo -e "export LD_LIBRARY_PATH=\"${PROJECT_ROOT}/build:${FFMPEG_INSTALL_DIR}/lib:${CUDA_LIB_DIR}:\$LD_LIBRARY_PATH\"${NC}"
     if [ -n "$preload_str" ]; then
         echo -e "${BOLD}${preload_str}${NC}"
     fi
 
-    echo -e "\n${CYAN}# 2. 执行超分命令：${NC}"
+    echo -e "\n${CYAN}# 2. 执行 AI 视频处理命令：${NC}"
     if [ "$IS_CLIP" -eq 1 ]; then
         echo -e "${BOLD}ffmpeg -y -ss ${CLIP_START} -i \"${INPUT_VIDEO}\" -t ${CLIP_DURATION} -c copy \"${clip_intermediate}\" && \\${NC}"
     fi
@@ -533,9 +830,11 @@ EOF
 # 主执行流
 main() {
     check_binaries
+    detect_nvenc_split_count
     print_header
     select_input_video
-    select_engine
+    select_processing_profile
+    select_rife_settings
     select_clip_mode
     select_output_path
     select_encoder_and_quality
