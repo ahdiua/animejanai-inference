@@ -420,7 +420,7 @@ aji_encode --input <f> --output <f> [选项...]
   --no-audio              不拷贝音轨
   --no-subs               不拷贝字幕
   --no-chapters           不拷贝章节信息
-  --progress <mode>       进度格式：line（默认）, json, none
+  --progress <mode>       进度格式：line（默认，含 ETA）, json, none
   --log <file>            日志输出到文件
   --build-only            仅构建 Engine，不执行编码
 
