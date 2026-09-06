@@ -303,12 +303,10 @@ select_engine() {
     echo -e "${GREEN}✔ 已选择 Engine: ${BOLD}${ENGINE_FILE}${NC}"
 
     # 针对 4x / 2x 视频模型的适配与优化提示
-    if [[ "$ENGINE_FILE" == *"anime6b"* ]] || [[ "$ENGINE_FILE" == *"4x"* ]]; then
+    if [[ "$ENGINE_FILE" == *"anime6b"* ]] || [[ "$ENGINE_FILE" == *"4x"* ]] || [[ "$ENGINE_FILE" == *"animevideov3"* ]]; then
         echo -e "\n${CYAN}ℹ️  [提示] 所选模型为 4x 模型（直推输出 4x 超高分辨率）。${NC}"
         echo -e "${GREEN}   - 经过底层 CUDA 帧池瘦身与流水线优化，已自动为您加入 --pipeline-depth 2 保证显存平稳运行。${NC}"
         EXTRA_FLAGS+=("--pipeline-depth" "2")
-    elif [[ "$ENGINE_FILE" == *"animevideov3"* ]] || [[ "$ENGINE_FILE" == *"animevideo"* ]]; then
-        echo -e "\n${GREEN}✔ [已选用] RealESRGAN AnimeVideoV3 动漫视频专用轻量模型。${NC}"
     fi
     echo ""
 }
@@ -328,9 +326,10 @@ select_runtime_profile() {
     echo -e "  ${BOLD}8)${NC} RIFE v4.26 2x           - 仅插帧 (Slot 2026)"
     echo -e "  ${BOLD}9)${NC} Performance + RIFE 4.25 - 超分 + 2x 插帧 (Slot 3025)"
     echo -e "  ${BOLD}10)${NC} Performance + RIFE 4.26 - 超分 + 2x 插帧 (Slot 3026)"
+    echo -e "  ${BOLD}11)${NC} RealESRGAN AnimeVideo-v3 - 原生 4x 动漫视频超分 (Slot 2004)"
 
     local profile_choice
-    read -rp "请选择处理方案 [1-10, 默认 3]: " profile_choice
+    read -rp "请选择处理方案 [1-11, 默认 3]: " profile_choice
     profile_choice=${profile_choice:-3}
 
     USE_RUNTIME_CONFIG=1
@@ -373,6 +372,12 @@ select_runtime_profile() {
             RUNTIME_PROFILE="Performance + RIFE v4.26 2x"
             RIFE_ENABLED=1
             RIFE_MODEL="rife_v4.26"
+            ;;
+        11)
+            RUNTIME_SLOT=2004
+            RUNTIME_PROFILE="RealESRGAN AnimeVideo-v3 (4x)"
+            EXTRA_FLAGS+=("--pipeline-depth" "2")
+            echo -e "${CYAN}原生 4x 输出：1080p → 8K，可在后续输出设置中缩小至 4K。${NC}"
             ;;
         *)
             echo -e "${YELLOW}无效选项，已使用默认 Performance (Slot 1003)。${NC}"

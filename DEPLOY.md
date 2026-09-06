@@ -243,11 +243,22 @@ ls -lh build/libaji.so build/libaji_trt.so build/aji_harness build/aji_encode
 | `2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx` (`balanced.onnx`) | 2× 超分（画质与速度均衡） | ⚡⚡ 均衡 (2x) | `input` |
 | `2x_AnimeJaNai_HD_V3.1Sharp1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx` (`balanced_sharp1.onnx`) | 2× 超分（清晰锐化版） | ⚡⚡ 锐化 (2x) | `input` |
 | `2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo.onnx` (`sd_compact.onnx`) | 2× 标清修复（适合 480p/老番） | ⚡⚡ 标清 (2x) | `input` |
+| `realesr-animevideov3-v0.2.5.0-fp16-dynamic.onnx` | AnimeVideo-v3 动漫视频轻量超分 | 原生 4x | `input` |
 | `RealESRGAN_x4plus_anime_6B.onnx` (`realesrgan_anime6b.onnx`) | 4× 经典原版动漫超分（线条强化与降噪） | ⚡ 经典 (4x) | `image.1` |
+
+AnimeVideo-v3 使用官方 v0.2.5.0 的 `realesr-animevideov3.pth` 转换，
+输入/输出为 FP16 RGB NCHW，batch 和宽高动态，ONNX opset 17。
+`deploy.sh` 模型选项 6 自动下载并构建 Engine；Runtime 使用 Slot 2004，
+首次按输入尺寸构建 Engine 并缓存。原生 4× 表示 1080p → 8K；
+如需最终 4K，可在 `generate_cmd.sh` 的输出缩放设置中指定高度 2160。
+SHA256：`d584ed9c21a2c2448d96d5e3e0a2d719a0e573d36eb4244cb07e68be96e3a0ab`。
 
 ```bash
 # 创建模型目录
 mkdir -p ~/models
+
+# AnimeVideo-v3 (native 4x)
+wget -O ~/models/realesr-animevideov3-v0.2.5.0-fp16-dynamic.onnx "https://r2.ahdiua.com/realesr-animevideov3-v0.2.5.0-fp16-dynamic.onnx"
 
 # 1 & 2: 获取 AnimeJaNai 官方 V3.1 模型 (R2 CDN 高速直连秒级下载)
 wget -O ~/models/performance.onnx "https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx"
