@@ -806,6 +806,7 @@ fail:
 
 static int init_resize(enc_ctx *c, AVFrame *first)
 {
+    AVBufferSrcParameters *bp = NULL;
     if (!c->graph) {
         if (!avfilter_get_by_name("scale_cuda")) {
             loge("--final-resize requested but scale_cuda filter unavailable");
@@ -814,19 +815,29 @@ static int init_resize(enc_ctx *c, AVFrame *first)
         c->graph = avfilter_graph_alloc();
         if (!c->graph) return -1;
 
-        char args[512];
+        if (first->format != AV_PIX_FMT_CUDA || !first->hw_frames_ctx) {
+            loge("--final-resize requires a CUDA frame with hw_frames_ctx");
+            goto fail;
+        }
         AVStream *vst = c->ifmt->streams[c->vstream];
-        snprintf(args, sizeof args,
-                 "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=1/1",
-                 first->width, first->height, AV_PIX_FMT_CUDA,
-                 vst->time_base.num, vst->time_base.den);
-        AV(avfilter_graph_create_filter(&c->buf_src,
-                avfilter_get_by_name("buffer"), "in", args, NULL, c->graph));
+        /* create_filter initializes immediately, but CUDA buffer sources
+         * require hw_frames_ctx during initialization. Allocate, set all
+         * parameters (including the frame pool), then initialize explicitly. */
+        c->buf_src = avfilter_graph_alloc_filter(c->graph,
+                avfilter_get_by_name("buffer"), "in");
+        if (!c->buf_src) goto fail;
 
-        AVBufferSrcParameters *bp = av_buffersrc_parameters_alloc();
+        bp = av_buffersrc_parameters_alloc();
+        if (!bp) goto fail;
+        bp->format = first->format;
+        bp->width = first->width;
+        bp->height = first->height;
+        bp->time_base = vst->time_base;
+        bp->sample_aspect_ratio = (AVRational){1, 1};
         bp->hw_frames_ctx = first->hw_frames_ctx;
         AV(av_buffersrc_parameters_set(c->buf_src, bp));
-        av_free(bp);
+        av_freep(&bp);
+        AV(avfilter_init_str(c->buf_src, NULL));
 
         AV(avfilter_graph_create_filter(&c->buf_sink,
                 avfilter_get_by_name("buffersink"), "out", NULL, NULL,
@@ -844,6 +855,10 @@ static int init_resize(enc_ctx *c, AVFrame *first)
     }
     return 0;
 fail:
+    av_freep(&bp);
+    avfilter_graph_free(&c->graph);
+    c->buf_src = NULL;
+    c->buf_sink = NULL;
     return -1;
 }
 
