@@ -103,6 +103,12 @@ else()
         add_dependencies(aji_encode aji_trt)
         set_target_properties(aji_encode PROPERTIES
             BUILD_RPATH "${AJI_TRT_LIB};$<TARGET_FILE_DIR:aji>")
+
+        # CPU-only media validator and lossless GOP packet splitter. It shares
+        # the encoder's FFmpeg discovery but has no CUDA or TensorRT runtime.
+        add_executable(aji_gop_media src/gop_media.c src/gop_nal.c)
+        target_include_directories(aji_gop_media PRIVATE src)
+        target_link_libraries(aji_gop_media PRIVATE PkgConfig::FFMPEG)
     else()
         message(STATUS "ffmpeg/libav not found via pkg-config; skipping aji_encode target")
     endif()
