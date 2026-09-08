@@ -38,6 +38,7 @@ typedef struct {
 typedef struct {
     int64_t pts;
     int64_t dts;
+    size_t gop;
 } PacketTime;
 
 typedef struct {
@@ -285,47 +286,66 @@ static int finalize_gops(MediaIndex *index)
 {
     size_t g;
     size_t f;
+    int64_t p;
+    size_t current_gop = 0;
 
     if (index->gop_count == 0 || index->gop[0].packet != 0) {
         errorf("video does not begin with an independently decodable IDR packet");
         return -1;
     }
-    for (g = 0; g < index->gop_count; g++) {
-        int found = 0;
-        for (f = 0; f < index->frame_count; f++) {
-            if (index->frame[f].packet == index->gop[g].packet) {
-                if (found) {
-                    errorf("IDR packet %" PRId64 " maps to multiple decoded frames",
-                           index->gop[g].packet);
-                    return -1;
-                }
-                index->gop[g].frame = (int64_t)f;
-                index->gop[g].pts = index->frame[f].pts;
-                found = 1;
-            }
-        }
-        if (!found) {
-            errorf("IDR packet %" PRId64 " did not produce a decoded frame",
-                   index->gop[g].packet);
-            return -1;
-        }
-        if (g > 0 && index->gop[g].frame <= index->gop[g - 1].frame) {
-            errorf("IDR display frames are not strictly increasing");
+    for (g = 1; g < index->gop_count; g++) {
+        if (index->gop[g].packet <= index->gop[g - 1].packet ||
+            index->gop[g].packet >= index->packets) {
+            errorf("IDR packet boundaries are invalid or not strictly increasing");
             return -1;
         }
     }
+    g = 0;
+    for (p = 0; p < index->packets; p++) {
+        if (g + 1 < index->gop_count && p == index->gop[g + 1].packet)
+            g++;
+        index->packet_time[p].gop = g;
+    }
 
-    for (g = 1; g < index->gop_count; g++) {
-        int64_t cut_packet = index->gop[g].packet;
-        int64_t cut_frame = index->gop[g].frame;
-        for (f = 0; f < index->frame_count; f++) {
-            if ((index->frame[f].packet < cut_packet && (int64_t)f >= cut_frame) ||
-                (index->frame[f].packet >= cut_packet && (int64_t)f < cut_frame)) {
-                errorf("packet cut %" PRId64 " crosses display frame order at frame %zu",
-                       cut_packet, f);
+    for (f = 0; f < index->frame_count; f++) {
+        int64_t packet = index->frame[f].packet;
+        size_t frame_gop;
+        if (packet < 0 || packet >= index->packets) {
+            errorf("decoded frame %zu maps to invalid packet %" PRId64, f, packet);
+            return -1;
+        }
+        frame_gop = index->packet_time[packet].gop;
+        if (f == 0) {
+            if (frame_gop != 0) {
+                errorf("first decoded frame does not belong to the initial IDR GOP");
                 return -1;
             }
+            index->gop[0].frame = 0;
+            index->gop[0].pts = index->frame[0].pts;
+        } else if (frame_gop != current_gop) {
+            if (frame_gop != current_gop + 1) {
+                errorf("packet interval crosses display frame order at frame %zu", f);
+                return -1;
+            }
+            current_gop = frame_gop;
+            index->gop[current_gop].frame = (int64_t)f;
+            index->gop[current_gop].pts = index->frame[f].pts;
         }
+        if (packet == index->gop[frame_gop].packet &&
+            index->gop[frame_gop].frame != (int64_t)f) {
+            errorf("IDR packet %" PRId64 " maps to multiple decoded frames", packet);
+            return -1;
+        }
+        if (index->gop[frame_gop].frame == (int64_t)f &&
+            packet != index->gop[frame_gop].packet) {
+            errorf("GOP %zu begins on non-IDR packet %" PRId64, frame_gop, packet);
+            return -1;
+        }
+    }
+    if (current_gop + 1 != index->gop_count) {
+        errorf("IDR packet %" PRId64 " did not produce a decoded frame",
+               index->gop[current_gop + 1].packet);
+        return -1;
     }
     for (g = 0; g < index->gop_count; g++) {
         int64_t end = g + 1 < index->gop_count
@@ -470,7 +490,7 @@ done:
     return status;
 }
 
-static void print_index(const MediaIndex *index)
+static int print_index(const MediaIndex *index)
 {
     const char *pixel_format = av_get_pix_fmt_name(index->pix_fmt);
     size_t i;
@@ -493,6 +513,12 @@ static void print_index(const MediaIndex *index)
                index->gop[i].pts, index->gop[i].frames);
     }
     puts("]}");
+    if (fflush(stdout) == EOF || ferror(stdout)) {
+        errorf("failed to write scan JSON to stdout: %s",
+               errno ? strerror(errno) : "output error");
+        return -1;
+    }
+    return 0;
 }
 
 static int parse_cut(const char *text, int64_t *value)
@@ -520,6 +546,7 @@ static int validate_cuts(const MediaIndex *index, int argc, char **argv,
                          int64_t **cuts_out)
 {
     int64_t *cuts = NULL;
+    size_t gop_index = 1;
     int i;
 
     if (argc > 0) {
@@ -530,25 +557,22 @@ static int validate_cuts(const MediaIndex *index, int argc, char **argv,
         }
     }
     for (i = 0; i < argc; i++) {
-        size_t g;
-        int safe = 0;
         if (parse_cut(argv[i], &cuts[i]) < 0 || cuts[i] <= 0 ||
             cuts[i] >= index->packets || (i > 0 && cuts[i] <= cuts[i - 1])) {
             errorf("invalid decimal packet cut '%s'", argv[i]);
             free(cuts);
             return -1;
         }
-        for (g = 1; g < index->gop_count; g++) {
-            if (index->gop[g].packet == cuts[i]) {
-                safe = 1;
-                break;
-            }
-        }
-        if (!safe) {
+        while (gop_index < index->gop_count &&
+               index->gop[gop_index].packet < cuts[i])
+            gop_index++;
+        if (gop_index == index->gop_count ||
+            index->gop[gop_index].packet != cuts[i]) {
             errorf("packet cut %" PRId64 " is not a verified IDR boundary", cuts[i]);
             free(cuts);
             return -1;
         }
+        gop_index++;
     }
     *cuts_out = cuts;
     return 0;
@@ -590,24 +614,40 @@ static int64_t output_seek(void *opaque, int64_t offset, int whence)
     }
 }
 
-static void close_output(OutputPart *part, int write_trailer)
+static int close_output(OutputPart *part, int write_trailer)
 {
-    if (part->format && write_trailer && part->header_written)
-        av_write_trailer(part->format);
+    int status = 0;
+
+    if (part->format && write_trailer && part->header_written) {
+        status = av_write_trailer(part->format);
+        part->header_written = 0;
+        if (status < 0) {
+            char text[AV_ERROR_MAX_STRING_SIZE];
+            errorf("failed to write output trailer: %s", av_error(status, text));
+        }
+    }
     if (part->format && part->format->pb) {
         AVIOContext *avio = part->format->pb;
         avio_flush(avio);
+        if (avio->error < 0 && status == 0) {
+            char text[AV_ERROR_MAX_STRING_SIZE];
+            status = avio->error;
+            errorf("failed to flush output: %s", av_error(status, text));
+        }
         av_freep(&avio->buffer);
         avio_context_free(&avio);
         part->format->pb = NULL;
     }
-    if (part->io.fd >= 0)
-        close(part->io.fd);
+    if (part->io.fd >= 0 && close(part->io.fd) < 0 && status == 0) {
+        status = AVERROR(errno);
+        errorf("failed to close output: %s", strerror(errno));
+    }
     avformat_free_context(part->format);
     part->format = NULL;
     part->stream = NULL;
     part->io.fd = -1;
     part->header_written = 0;
+    return status;
 }
 
 static int open_output(OutputPart *part, const char *directory, size_t number,
@@ -672,20 +712,46 @@ failure:
     return -1;
 }
 
-static int64_t segment_shift(const MediaIndex *index, int64_t begin, int64_t end)
+static int compute_segment_shifts(const MediaIndex *index, const int64_t *cuts,
+                                  int cut_count, int64_t **shifts_out)
 {
-    int64_t minimum = AV_NOPTS_VALUE;
-    int64_t i;
-    for (i = begin; i < end; i++) {
-        int64_t values[2] = {index->packet_time[i].pts, index->packet_time[i].dts};
+    size_t part_count = (size_t)cut_count + 1;
+    int64_t *shifts;
+    int part = 0;
+    int64_t packet;
+    size_t i;
+
+    if (part_count > SIZE_MAX / sizeof(*shifts)) {
+        errorf("too many output parts");
+        return -1;
+    }
+    shifts = malloc(part_count * sizeof(*shifts));
+    if (!shifts) {
+        errorf("out of memory preparing timestamp shifts");
+        return -1;
+    }
+    for (i = 0; i < part_count; i++)
+        shifts[i] = AV_NOPTS_VALUE;
+    for (packet = 0; packet < index->packets; packet++) {
+        int64_t values[2] = {
+            index->packet_time[packet].pts,
+            index->packet_time[packet].dts,
+        };
         int j;
+        if (part < cut_count && packet == cuts[part])
+            part++;
         for (j = 0; j < 2; j++) {
             if (values[j] != AV_NOPTS_VALUE &&
-                (minimum == AV_NOPTS_VALUE || values[j] < minimum))
-                minimum = values[j];
+                (shifts[part] == AV_NOPTS_VALUE || values[j] < shifts[part]))
+                shifts[part] = values[j];
         }
     }
-    return minimum == AV_NOPTS_VALUE ? 0 : minimum;
+    for (i = 0; i < part_count; i++) {
+        if (shifts[i] == AV_NOPTS_VALUE)
+            shifts[i] = 0;
+    }
+    *shifts_out = shifts;
+    return 0;
 }
 
 static int split_media(const char *input_path, const char *directory,
@@ -697,6 +763,7 @@ static int split_media(const char *input_path, const char *directory,
     AVStream *input_stream;
     OutputPart part;
     int64_t *cuts = NULL;
+    int64_t *shifts = NULL;
     char **created = NULL;
     size_t created_count = 0;
     int64_t packet_number = 0;
@@ -711,6 +778,8 @@ static int split_media(const char *input_path, const char *directory,
     if (scan_media(input_path, &index) < 0)
         goto done;
     if (validate_cuts(&index, cut_count, cut_text, &cuts) < 0)
+        goto done;
+    if (compute_segment_shifts(&index, cuts, cut_count, &shifts) < 0)
         goto done;
     if (stat(directory, &directory_status) < 0 || !S_ISDIR(directory_status.st_mode) ||
         directory_status.st_uid != geteuid()) {
@@ -746,23 +815,22 @@ static int split_media(const char *input_path, const char *directory,
 
     while ((result = av_read_frame(input, packet)) >= 0) {
         if (packet->stream_index == index.video_stream) {
-            int64_t end;
             int64_t shift;
             if (part_number < cut_count && packet_number == cuts[part_number]) {
                 result = av_write_trailer(part.format);
                 if (result < 0)
                     goto av_failure;
                 part.header_written = 0;
-                close_output(&part, 0);
+                result = close_output(&part, 0);
+                if (result < 0)
+                    goto av_failure;
                 part_number++;
                 if (open_output(&part, directory, (size_t)part_number, input_stream) < 0)
                     goto done;
                 created[created_count++] = part.path;
                 part.path = NULL;
             }
-            end = part_number < cut_count ? cuts[part_number] : index.packets;
-            shift = segment_shift(&index,
-                part_number == 0 ? 0 : cuts[part_number - 1], end);
+            shift = shifts[part_number];
             if (packet->pts != AV_NOPTS_VALUE)
                 packet->pts -= shift;
             if (packet->dts != AV_NOPTS_VALUE)
@@ -788,7 +856,9 @@ static int split_media(const char *input_path, const char *directory,
     if (result < 0)
         goto av_failure;
     part.header_written = 0;
-    close_output(&part, 0);
+    result = close_output(&part, 0);
+    if (result < 0)
+        goto av_failure;
     fprintf(stderr, "aji_gop_media: split complete: %d parts, %" PRId64
             " video packets\n", cut_count + 1, packet_number);
     status = 0;
@@ -815,6 +885,7 @@ done:
             free(created[i]);
     }
     free(created);
+    free(shifts);
     free(cuts);
     free_index(&index);
     return status;
@@ -835,7 +906,7 @@ int main(int argc, char **argv)
         MediaIndex index;
         int status = scan_media(argv[2], &index);
         if (status == 0)
-            print_index(&index);
+            status = print_index(&index);
         free_index(&index);
         return status == 0 ? 0 : 1;
     }

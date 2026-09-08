@@ -76,12 +76,16 @@ def assert_index(index, codec):
     assert index["codec"] == codec
     assert index["width"] == 64 and index["height"] == 48
     assert index["pix_fmt"] == "yuv420p"
+    assert index["time_base"] == [1, 1000]
     assert index["fps"] == [24000, 1001]
+    assert index["start_pts"] == 0
     assert index["frames"] == 97
     assert index["packets"] == 97
     assert sum(gop["frames"] for gop in index["gops"]) == 97
     assert [gop["frames"] for gop in index["gops"]] == [24, 24, 24, 24, 1]
     assert [gop["frame"] for gop in index["gops"]] == [0, 24, 48, 72, 96]
+    assert [gop["packet"] for gop in index["gops"]] == [0, 24, 48, 72, 96]
+    assert [gop["pts"] for gop in index["gops"]] == [0, 1001, 2002, 3003, 4004]
     assert all(set(gop) == {"packet", "frame", "pts", "frames"}
                for gop in index["gops"])
 
@@ -90,9 +94,13 @@ def exercise_closed_fixture(tool, root, codec):
     source = root / f"closed {codec} 动画.mkv"
     pieces = root / f"pieces {codec} 分片"
     invalid = root / f"invalid {codec}"
+    no_cut = root / f"no cut {codec}"
+    subset = root / f"subset {codec}"
     source.parent.mkdir(parents=True, exist_ok=True)
     pieces.mkdir()
     invalid.mkdir()
+    no_cut.mkdir()
+    subset.mkdir()
     make_fixture(source, codec)
 
     index = scan(tool, source)
@@ -110,6 +118,19 @@ def exercise_closed_fixture(tool, root, codec):
         combined.extend(frame_hashes(output))
     assert combined == frame_hashes(source)
 
+    result = run(str(tool), "split", str(source), str(no_cut), check=False)
+    assert result.returncode == 0, result.stderr
+    no_cut_outputs = sorted(no_cut.glob("gop-*.mkv"))
+    assert [path.name for path in no_cut_outputs] == ["gop-000000.mkv"]
+    assert frame_hashes(no_cut_outputs[0]) == frame_hashes(source)
+
+    result = run(str(tool), "split", str(source), str(subset),
+                 str(index["gops"][2]["packet"]), check=False)
+    assert result.returncode == 0, result.stderr
+    subset_outputs = sorted(subset.glob("gop-*.mkv"))
+    assert [len(frame_hashes(path)) for path in subset_outputs] == [48, 49]
+    assert [item for path in subset_outputs for item in frame_hashes(path)] == frame_hashes(source)
+
     before = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
               for path in outputs}
     result = run(str(tool), "split", str(source), str(pieces), *cuts, check=False)
@@ -121,6 +142,13 @@ def exercise_closed_fixture(tool, root, codec):
     result = run(str(tool), "split", str(source), str(invalid), "1", check=False)
     assert result.returncode != 0
     assert list(invalid.iterdir()) == []
+
+    if codec == "h264":
+        with open("/dev/full", "w", encoding="utf-8") as full:
+            result = subprocess.run([str(tool), "scan", str(source)], stdout=full,
+                                    stderr=subprocess.PIPE, text=True)
+        assert result.returncode != 0
+        assert "stdout" in result.stderr
 
 
 def main():
