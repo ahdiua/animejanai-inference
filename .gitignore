@@ -7,3 +7,4 @@ fixtures/*.png
 fixtures/*.mkv
 sanity/saxpy
 *.engine
+/MEMORY.md
