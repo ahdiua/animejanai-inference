@@ -65,6 +65,11 @@ if(NOT WIN32)
 endif()
 
 add_executable(aji_harness src/harness.c)
+add_executable(aji_engine_path src/engine_path.cpp)
+target_include_directories(aji_engine_path PRIVATE "${AJI_TRT_INCLUDE}")
+target_link_directories(aji_engine_path PRIVATE "${AJI_TRT_LIB}")
+target_link_libraries(aji_engine_path PRIVATE ${AJI_NVINFER} CUDA::cudart)
+set_target_properties(aji_engine_path PROPERTIES BUILD_RPATH "${AJI_TRT_LIB}")
 target_link_libraries(aji_harness PRIVATE aji CUDA::cudart)
 add_dependencies(aji_harness aji_trt)
 set_target_properties(aji_harness PROPERTIES

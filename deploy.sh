@@ -936,7 +936,6 @@ build_single_engine() {
     local onnx_path="$1"
     local opt_w="$2"
     local opt_h="$3"
-    local engine_suffix="$4"
 
     if [ ! -s "$onnx_path" ]; then
         echo -e "${RED}[错误] ONNX 文件不存在或为空: ${onnx_path}${NC}"
@@ -944,27 +943,38 @@ build_single_engine() {
     fi
 
     local model_basename="$(basename "$onnx_path" .onnx)"
-    local engine_path="${MODELS_DIR}/${model_basename}_${engine_suffix}.engine"
+    local engine_path
 
     # 动态获取 ONNX 模型的第一个输入节点名称 (默认为 input)
     local input_name="input"
     if [ -f "$VENV_DIR/bin/python3" ]; then
-        local detected_name=$("$VENV_DIR/bin/python3" -c "
+        local detected_name=$("$VENV_DIR/bin/python3" - "$onnx_path" 2>/dev/null <<'PYONNX'
 import onnx, sys
 try:
-    m = onnx.load('$onnx_path')
+    m = onnx.load(sys.argv[1])
     print(m.graph.input[0].name)
 except:
     print('input')
-" 2>/dev/null || echo "input")
+PYONNX
+)
         [ -n "$detected_name" ] && input_name="$detected_name"
     fi
 
-    # 检测 trtexec 是否支持 --fp16 参数 (TensorRT 11+ 已移除 --fp16 选项，默认为强类型模式)
-    local fp16_arg=()
-    if trtexec --help 2>&1 | grep -q -- "--fp16"; then
-        fp16_arg=("--fp16")
+    local path_tool="${PROJECT_ROOT}/build/aji_engine_path"
+    if [ ! -x "$path_tool" ]; then
+        echo -e "${RED}缺少 aji_engine_path，请先运行 ./deploy.sh --build 更新构建工具。${NC}"
+        return 1
     fi
+    local cache_info
+    cache_info=$("$path_tool" "$onnx_path" "$MODELS_DIR" "$opt_w" "$opt_h" "$input_name") || return 1
+    engine_path=${cache_info%%$'\n'*}
+    if [ -s "$engine_path" ]; then
+        printf '%s (%sx%s)\n' "$model_basename" "$opt_w" "$opt_h" > "${engine_path}.label"
+        echo -e "${GREEN}✔ 已存在相同模型、尺寸及设备的引擎: ${engine_path}${NC}"
+        return 0
+    fi
+    local build_log="${engine_path}.build.log"
+    local timing_cache="${MODELS_DIR}/${model_basename}.timing.cache"
 
     echo -e "\n${CYAN}==============================================================================${NC}"
     echo -e "正在调用 trtexec 为当前 GPU 构建 TensorRT Engine..."
@@ -972,7 +982,7 @@ except:
     echo -e "  - 输入节点:     ${input_name}"
     echo -e "  - 固定输入:     ${opt_w}x${opt_h} (min/opt/max: 1x3x${opt_h}x${opt_w})"
     echo -e "  - 输出 Engine:  ${engine_path}"
-    echo -e "构建大约需要 1-3 分钟，请稍候...\n"
+    echo -e "构建日志: ${build_log}；首次构建可能耗时较长。\n"
 
     trtexec \
         --onnx="$onnx_path" \
@@ -980,16 +990,19 @@ except:
         --optShapes="${input_name}:1x3x${opt_h}x${opt_w}" \
         --maxShapes="${input_name}:1x3x${opt_h}x${opt_w}" \
         --builderOptimizationLevel=5 \
-        "${fp16_arg[@]}" \
         --skipInference \
-        --saveEngine="$engine_path"
+        --timingCacheFile="$timing_cache" \
+        --saveEngine="$engine_path" 2>&1 | tee "$build_log"
+    local build_status=${PIPESTATUS[0]}
 
-    if [ $? -eq 0 ] && [ -f "$engine_path" ]; then
+    if [ "$build_status" -eq 0 ] && [ -s "$engine_path" ]; then
+        printf '%s (%sx%s)\n' "$model_basename" "$opt_w" "$opt_h" > "${engine_path}.label"
         echo -e "\n${GREEN}✔ TensorRT Engine 构建成功！${NC}"
         echo -e "  Engine 路径: ${BOLD}${engine_path}${NC} ($(du -h "$engine_path" | cut -f1))"
         return 0
     else
-        echo -e "\n${RED}[错误] trtexec 构建 Engine 失败！如果显存不足请关闭其他占用显存的进程。${NC}"
+        rm -f -- "$engine_path"
+        echo -e "\n${RED}[错误] trtexec 构建 Engine 失败！详情见 ${build_log}。${NC}"
         return 1
     fi
 }

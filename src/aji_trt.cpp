@@ -5,11 +5,19 @@
  * steps + 2x model steps, all on fp16 NCHW RGB ping-pong buffers, with
  * static per-resolution engines built on first use via trtexec (cache key
  * compatible with the Python pipeline: {onnx}.{crc32(settings)}.trt-{ver}
- * .gpu-{name-smN}.engine, plus stale-engine cleanup).
+ * .gpu-{name-smN}.engine).
  *
  * Context model: all CUDA work happens with the caller's CUcontext pushed
  * current; the CUDA runtime binds to the current driver context.
  */
+
+#include "engine_cache.h"
+
+using aji_cache::DEFAULT_TRT_ENGINE_SETTINGS;
+using aji_cache::crc32_z;
+using aji_cache::engine_path_for;
+using aji_cache::short_engine_path_for;
+using aji_cache::engine_suffix;
 
 #include <algorithm>
 #include <atomic>
@@ -168,17 +176,6 @@ void append_file_text(const std::string &path, const std::string &text)
 }
 #endif
 
-// TRT 11: strongly-typed is the default (--stronglyTyped is a no-op), and sanitize_settings_trt11
-// strips --inputIOFormats/--outputIOFormats/--tacticSources anyway (types come from the network;
-// the cuDNN/cuBLAS tactic sources are gone). So the only flags worth carrying are the builder
-// optimization level, the build shape profile, and skip-inference (we do the inference ourselves).
-const char *DEFAULT_TRT_ENGINE_SETTINGS =
-    "--builderOptimizationLevel=5 "
-    "--minShapes=input:%video_resolution% "
-    "--optShapes=input:%video_resolution% "
-    "--maxShapes=input:%video_resolution% "
-    "--skipInference";
-
 class Logger : public nvinfer1::ILogger {
 public:
     aji_log_fn fn = nullptr;
@@ -202,40 +199,6 @@ struct CtxGuard {
         }
     }
 };
-
-// zlib-compatible CRC-32 (matches Python zlib.crc32 used for engine names).
-uint32_t crc32_z(const std::string &data)
-{
-    static uint32_t table[256];
-    static bool init = false;
-    if (!init) {
-        for (uint32_t i = 0; i < 256; i++) {
-            uint32_t c = i;
-            for (int k = 0; k < 8; k++)
-                c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
-            table[i] = c;
-        }
-        init = true;
-    }
-    uint32_t c = 0xFFFFFFFFu;
-    for (unsigned char ch : data)
-        c = table[(c ^ ch) & 0xFF] ^ (c >> 8);
-    return c ^ 0xFFFFFFFFu;
-}
-
-std::string sanitize_token(std::string s)
-{
-    for (auto &ch : s) {
-        if (ch == ' ')
-            ch = '-';
-    }
-    std::string out;
-    for (char ch : s) {
-        if (isalnum((unsigned char)ch) || ch == '.' || ch == '_' || ch == '-')
-            out += ch;
-    }
-    return out.empty() ? "device0" : out;
-}
 
 struct ModelEngine {
     std::unique_ptr<nvinfer1::ICudaEngine> engine;
@@ -266,7 +229,6 @@ struct aji_ctx {
     std::string conf_path, model_dir, trtexec, trtexec_env, rife_model_dir;
     AjiConf conf;
     int slot = 1;
-    bool engines_cleaned = false;
     std::vector<ModelEngine> engines;
     std::vector<Step> steps;
     bool active = false;
@@ -391,74 +353,6 @@ aji_csp make_csp(const aji_frame *f)
     return aji_make_csp(f->format, f->matrix, f->range);
 }
 
-std::string trt_version_token()
-{
-    int32_t v = getInferLibVersion();
-    int major, minor, patch;
-    if (v < 10000) {
-        major = v / 1000; minor = (v / 100) % 10; patch = v % 100;
-    } else {
-        major = v / 10000; minor = (v / 100) % 100; patch = v % 100;
-    }
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%d.%d.%d", major, minor, patch);
-    return buf;
-}
-
-std::string gpu_token()
-{
-    cudaDeviceProp prop = {};
-    if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess)
-        return "unknown";
-    std::string tok = sanitize_token(prop.name);
-    return tok + "-sm" + std::to_string(prop.major);
-}
-
-std::string engine_suffix()
-{
-    return ".trt-" + trt_version_token() + ".gpu-" + gpu_token() + ".engine";
-}
-
-std::string engine_path_for(const std::string &model_dir,
-                            const std::string &onnx_name,
-                            const std::string &settings)
-{
-    return (fs::path(model_dir) /
-            (onnx_name + "." + std::to_string(crc32_z(settings)) + engine_suffix()))
-        .string();
-}
-
-std::string short_engine_path_for(const std::string &model_dir,
-                                  const std::string &onnx_name,
-                                  const std::string &settings)
-{
-    char model_hash[9];
-    snprintf(model_hash, sizeof(model_hash), "%08x", crc32_z(onnx_name));
-    return (fs::path(model_dir) /
-            ("aji-" + std::string(model_hash) + "." +
-             std::to_string(crc32_z(settings)) + engine_suffix()))
-        .string();
-}
-
-void clean_stale_engines(aji_ctx *c)
-{
-    const std::string suffix = engine_suffix();
-    std::error_code ec;
-    for (const auto &e : fs::directory_iterator(c->model_dir, ec)) {
-        const std::string name = e.path().filename().string();
-        if (name.size() < 7 || name.substr(name.size() - 7) != ".engine")
-            continue;
-        if (name.size() >= suffix.size() &&
-            name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0)
-            continue;
-        std::error_code rec;
-        if (fs::remove(e.path(), rec)) {
-            c->log_steps.push_back(
-                "Removed stale TensorRT engine (different GPU or TensorRT version): " + name);
-            c->verbose("removed stale engine %s", name.c_str());
-        }
-    }
-}
 
 // Human-readable build resolution from the trtexec shape flags: the WxH of
 // --optShapes for static engines, or "minWxH-maxWxH" when min/max differ
@@ -1347,10 +1241,9 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         chain->max_resolution + ";    FPS Range: " + fmt_num(chain->min_fps) +
         " - " + fmt_num(chain->max_fps));
 
-    if (!c->engines_cleaned) {
-        clean_stale_engines(c);
-        c->engines_cleaned = true;
-    }
+    // The model directory may also contain deploy.sh/manual engines or caches
+    // for other devices. Filenames do not prove incompatibility: never sweep
+    // this directory. ensure_engine handles only the requested cache entry.
 
     std::string settings_tpl = c->conf.trt_engine_settings.empty()
                                    ? DEFAULT_TRT_ENGINE_SETTINGS

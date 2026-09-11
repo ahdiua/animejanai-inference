@@ -331,6 +331,11 @@ select_engine() {
         echo -e "检测到以下已构建好的 TensorRT Engine 文件："
         for i in "${!found_engines[@]}"; do
             local esize=$(ls -lh "${found_engines[$i]}" 2>/dev/null | awk '{print $5}')
+            local engine_label=""
+            if [ -f "${found_engines[$i]}.label" ]; then
+                IFS= read -r engine_label < "${found_engines[$i]}.label"
+            fi
+            [ -z "$engine_label" ] || printf '     %s\n' "$engine_label"
             echo -e "  ${BOLD}$((i+1)))${NC} ${found_engines[$i]} (${GREEN}${esize}${NC})"
         done
         echo -e "  ${BOLD}$(( ${#found_engines[@]} + 1 )))${NC} 手动输入自定义 Engine 路径"
@@ -358,7 +363,11 @@ select_engine() {
     echo -e "${GREEN}✔ 已选择 Engine: ${BOLD}${ENGINE_FILE}${NC}"
 
     # 针对 4x / 2x 视频模型的适配与优化提示
-    if [[ "$ENGINE_FILE" == *"anime6b"* ]] || [[ "$ENGINE_FILE" == *"4x"* ]] || [[ "$ENGINE_FILE" == *"animevideov3"* ]]; then
+    local model_identity="$ENGINE_FILE"
+    if [ -f "${ENGINE_FILE}.label" ]; then
+        IFS= read -r model_identity < "${ENGINE_FILE}.label"
+    fi
+    if [[ "$model_identity" == *"anime6b"* ]] || [[ "$model_identity" == *"4x"* ]] || [[ "$model_identity" == *"animevideov3"* ]]; then
         echo -e "\n${CYAN}ℹ️  [提示] 所选模型为 4x 模型（直推输出 4x 超高分辨率）。${NC}"
         echo -e "${GREEN}   - 经过底层 CUDA 帧池瘦身与流水线优化，已自动为您加入 --pipeline-depth 2 保证显存平稳运行。${NC}"
         EXTRA_FLAGS+=("--pipeline-depth" "2")
