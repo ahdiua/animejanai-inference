@@ -57,6 +57,10 @@ NVENC_FIX_SO="/opt/libnvenc_fix.so"
 
 # 全局配置变量初始化
 INPUT_VIDEO=""
+INPUT_VIDEOS=()
+OUTPUT_VIDEOS=()
+SOURCE_WIDTHS=()
+SOURCE_HEIGHTS=()
 ENGINE_FILE=""
 OUTPUT_VIDEO=""
 USE_RUNTIME_CONFIG=${RUNTIME_MODE}
@@ -197,37 +201,86 @@ select_input_video() {
         mapfile -t found_videos < <(printf "%s\n" "${raw_found[@]}" | sort -u)
     fi
 
-    INPUT_VIDEO=""
-
+    INPUT_VIDEOS=()
+    local v_idx token manual_input abs_file existing duplicate
+    local selections=()
     if [ ${#found_videos[@]} -gt 0 ]; then
         echo -e "在系统中自动检索到以下视频文件："
         for i in "${!found_videos[@]}"; do
-            local fsize=$(ls -lh "${found_videos[$i]}" 2>/dev/null | awk '{print $5}')
-            echo -e "  ${BOLD}$((i+1)))${NC} ${found_videos[$i]} (${GREEN}${fsize}${NC})"
+            printf '  %d) %s\n' "$((i+1))" "${found_videos[$i]}"
         done
-        echo -e "  ${BOLD}$(( ${#found_videos[@]} + 1 )))${NC} 手动输入自定义路径"
-        
-        read -rp "请选择视频编号 [1-$(( ${#found_videos[@]} + 1 )), 默认 1]: " v_idx
-        v_idx=${v_idx:-1}
-
-        if [ "$v_idx" -le "${#found_videos[@]}" ] && [ "$v_idx" -ge 1 ]; then
-            INPUT_VIDEO="${found_videos[$((v_idx-1))]}"
-        fi
+        echo "  a) 全选"
+        echo "  $(( ${#found_videos[@]} + 1 ))) 手动输入路径（可添加多个）"
+        while true; do
+            read -rp "请选择编号（空格或逗号分隔，如 1 3 或 1,3；默认 1）: " v_idx || return 1
+            v_idx=${v_idx:-1}
+            if [[ "$v_idx" == [Aa] ]]; then
+                INPUT_VIDEOS=("${found_videos[@]}")
+                break
+            fi
+            if [ "$v_idx" = "$(( ${#found_videos[@]} + 1 ))" ]; then
+                break
+            fi
+            read -ra selections <<< "${v_idx//,/ }"
+            INPUT_VIDEOS=()
+            for token in "${selections[@]}"; do
+                if [[ ! "$token" =~ ^[0-9]{1,9}$ ]] ||
+                   (( 10#$token < 1 || 10#$token > ${#found_videos[@]} )); then
+                    INPUT_VIDEOS=()
+                    break
+                fi
+                abs_file=${found_videos[$((10#$token-1))]}
+                duplicate=0
+                for existing in "${INPUT_VIDEOS[@]}"; do
+                    [ "$existing" = "$abs_file" ] && duplicate=1
+                done
+                [ "$duplicate" -eq 1 ] || INPUT_VIDEOS+=("$abs_file")
+            done
+            [ ${#INPUT_VIDEOS[@]} -gt 0 ] && break
+            echo -e "${RED}[错误] 请输入有效编号；手动输入选项需单独选择。${NC}"
+        done
     fi
 
-    while [ -z "$INPUT_VIDEO" ] || [ ! -f "$INPUT_VIDEO" ]; do
-        read -rp "请输入待超分视频文件的绝对或相对路径: " manual_input
-        manual_input=$(echo "$manual_input" | sed -e "s/^['\"]//" -e "s/['\"]$//")
-        if [ -f "$manual_input" ]; then
-            INPUT_VIDEO="$manual_input"
-        else
-            echo -e "${RED}[错误] 文件不存在: ${manual_input}，请重新输入！${NC}"
-        fi
+    if [ ${#INPUT_VIDEOS[@]} -eq 0 ]; then
+        while true; do
+            read -rp "请输入视频路径（每行一个，添加完毕后回车）: " manual_input || return 1
+            if [ -z "$manual_input" ] && [ ${#INPUT_VIDEOS[@]} -gt 0 ]; then
+                break
+            fi
+            manual_input=$(printf '%s\n' "$manual_input" | sed -e "s/^['\"]//" -e "s/['\"]$//")
+            if [ ! -f "$manual_input" ]; then
+                echo -e "${RED}[错误] 文件不存在，请重新输入！${NC}"
+                continue
+            fi
+            abs_file=$(readlink -f -- "$manual_input")
+            duplicate=0
+            for existing in "${INPUT_VIDEOS[@]}"; do
+                [ "$existing" = "$abs_file" ] && duplicate=1
+            done
+            [ "$duplicate" -eq 1 ] || INPUT_VIDEOS+=("$abs_file")
+        done
+    fi
+
+    echo -e "${GREEN}✔ 已选择 ${#INPUT_VIDEOS[@]} 个视频，将按以下顺序串行处理，共用后续处理参数。${NC}"
+    SOURCE_WIDTHS=()
+    SOURCE_HEIGHTS=()
+    for INPUT_VIDEO in "${INPUT_VIDEOS[@]}"; do
+        printf '\n输入视频: %s\n' "$INPUT_VIDEO"
+        probe_input_video
+        SOURCE_WIDTHS+=("$SRC_WIDTH")
+        SOURCE_HEIGHTS+=("$SRC_HEIGHT")
     done
+    INPUT_VIDEO=${INPUT_VIDEOS[0]}
+    SRC_WIDTH=${SOURCE_WIDTHS[0]}
+    SRC_HEIGHT=${SOURCE_HEIGHTS[0]}
+}
 
-    INPUT_VIDEO=$(readlink -f "$INPUT_VIDEO")
-    echo -e "${GREEN}✔ 已选择输入视频: ${BOLD}${INPUT_VIDEO}${NC}\n"
-
+probe_input_video() {
+    SRC_WIDTH=1920
+    SRC_HEIGHT=1080
+    SRC_CODEC="未知"
+    SRC_FPS="24"
+    SRC_DURATION="未知"
     # 使用 ffprobe 获取视频详细元数据
     export PATH="${FFMPEG_INSTALL_DIR}/bin:$PATH"
     if command -v ffprobe &>/dev/null; then
@@ -418,10 +471,13 @@ select_apisr_profile() {
         echo -e "${YELLOW}源码环境请运行 ./deploy.sh --models 选择 9；Runtime 请使用包含 APISR 的新版包。${NC}"
         return 1
     fi
-    if (( SRC_WIDTH % 2 != 0 || SRC_HEIGHT % 2 != 0 )); then
-        echo -e "${RED}APISR 要求源视频宽高均为偶数。${NC}"
-        return 1
-    fi
+    local i
+    for i in "${!INPUT_VIDEOS[@]}"; do
+        if (( SOURCE_WIDTHS[i] % 2 != 0 || SOURCE_HEIGHTS[i] % 2 != 0 )); then
+            printf 'APISR 要求源视频宽高均为偶数: %s\n' "${INPUT_VIDEOS[$i]}"
+            return 1
+        fi
+    done
     USE_RUNTIME_CONFIG=1
     RUNTIME_SLOT=2005
     RUNTIME_PROFILE="APISR 2x RRDB GAN"
@@ -557,36 +613,52 @@ select_clip_mode() {
 select_output_path() {
     echo -e "${BOLD}${CYAN}[步骤 5/8] 设置输出文件路径 (Output Destination)${NC}"
 
-    local dir_name="$(dirname "$INPUT_VIDEO")"
-    local base_name="$(basename "$INPUT_VIDEO")"
-    local raw_name="${base_name%.*}"
+    OUTPUT_VIDEOS=()
+    local existing canonical_output
+    for INPUT_VIDEO in "${INPUT_VIDEOS[@]}"; do
+        printf '\n输入视频: %s\n' "$INPUT_VIDEO"
+        local dir_name="$(dirname "$INPUT_VIDEO")"
+        local base_name="$(basename "$INPUT_VIDEO")"
+        local raw_name="${base_name%.*}"
 
-    local default_out=""
-    if [ "$IS_CLIP" -eq 1 ]; then
-        if [ "$RIFE_ENABLED" -eq 1 ] && [ "$UPSCALE_ENABLED" -eq 1 ]; then
-            default_out="${dir_name}/${raw_name}_clip_${CLIP_DURATION}s_rife${RIFE_FACTOR}x_upscaled.mkv"
-        elif [ "$RIFE_ENABLED" -eq 1 ]; then
-            default_out="${dir_name}/${raw_name}_clip_${CLIP_DURATION}s_rife${RIFE_FACTOR}x.mkv"
+        local default_out=""
+        if [ "$IS_CLIP" -eq 1 ]; then
+            if [ "$RIFE_ENABLED" -eq 1 ] && [ "$UPSCALE_ENABLED" -eq 1 ]; then
+                default_out="${dir_name}/${raw_name}_clip_${CLIP_DURATION}s_rife${RIFE_FACTOR}x_upscaled.mkv"
+            elif [ "$RIFE_ENABLED" -eq 1 ]; then
+                default_out="${dir_name}/${raw_name}_clip_${CLIP_DURATION}s_rife${RIFE_FACTOR}x.mkv"
+            else
+                default_out="${dir_name}/${raw_name}_clip_${CLIP_DURATION}s_upscaled.mkv"
+            fi
         else
-            default_out="${dir_name}/${raw_name}_clip_${CLIP_DURATION}s_upscaled.mkv"
+            if [ "$RIFE_ENABLED" -eq 1 ] && [ "$UPSCALE_ENABLED" -eq 1 ]; then
+                default_out="${dir_name}/${raw_name}_rife${RIFE_FACTOR}x_upscaled.mkv"
+            elif [ "$RIFE_ENABLED" -eq 1 ]; then
+                default_out="${dir_name}/${raw_name}_rife${RIFE_FACTOR}x.mkv"
+            else
+                default_out="${dir_name}/${raw_name}_upscaled.mkv"
+            fi
         fi
-    else
-        if [ "$RIFE_ENABLED" -eq 1 ] && [ "$UPSCALE_ENABLED" -eq 1 ]; then
-            default_out="${dir_name}/${raw_name}_rife${RIFE_FACTOR}x_upscaled.mkv"
-        elif [ "$RIFE_ENABLED" -eq 1 ]; then
-            default_out="${dir_name}/${raw_name}_rife${RIFE_FACTOR}x.mkv"
-        else
-            default_out="${dir_name}/${raw_name}_upscaled.mkv"
-        fi
-    fi
 
-    echo -e "默认推荐输出路径: ${BOLD}${default_out}${NC}"
-    read -rp "是否使用此输出路径？回车默认确认，或直接输入新路径: " user_out
-    if [ -n "$user_out" ]; then
-        OUTPUT_VIDEO=$(echo "$user_out" | sed -e "s/^['\"]//" -e "s/['\"]$//")
-    else
-        OUTPUT_VIDEO="$default_out"
-    fi
+        echo -e "默认推荐输出路径: ${BOLD}${default_out}${NC}"
+        read -rp "是否使用此输出路径？回车默认确认，或直接输入新路径: " user_out || return 1
+        if [ -n "$user_out" ]; then
+            OUTPUT_VIDEO=$(printf '%s\n' "$user_out" | sed -e "s/^['\"]//" -e "s/['\"]$//")
+        else
+            OUTPUT_VIDEO="$default_out"
+        fi
+
+        canonical_output=$(readlink -m -- "$OUTPUT_VIDEO") || return 1
+        for existing in "${INPUT_VIDEOS[@]}" "${OUTPUT_VIDEOS[@]}"; do
+            if [ "$canonical_output" = "$existing" ] || [ "$OUTPUT_VIDEO" -ef "$existing" ]; then
+                echo -e "${RED}[错误] 输出路径与输入视频或其他任务的输出冲突，请重新配置。${NC}"
+                return 1
+            fi
+        done
+        OUTPUT_VIDEOS+=("$canonical_output")
+    done
+    INPUT_VIDEO=${INPUT_VIDEOS[0]}
+    OUTPUT_VIDEO=${OUTPUT_VIDEOS[0]}
 
     read -rp "若输出文件已存在，是否默认自动覆盖？[Y/n, 默认 Y]: " overwrite_choice
     overwrite_choice=${overwrite_choice:-Y}
@@ -596,7 +668,7 @@ select_output_path() {
         OVERWRITE_FLAG=""
     fi
 
-    echo -e "${GREEN}✔ 输出路径: ${BOLD}${OUTPUT_VIDEO}${NC}\n"
+    printf "✔ 输出路径: %s\n" "${OUTPUT_VIDEOS[@]}"
 }
 
 # 7. 选择编码器与画质配置
@@ -731,153 +803,92 @@ select_optional_flags() {
     echo ""
 }
 
-# 9. 生成最终命令与独立脚本
+# 输出可直接由 Bash 执行的命令，保留空格、引号及 $ 等文件名字符。
+write_shell_command() {
+    printf '%q ' "$@"
+    printf '\n'
+}
+
+# 9. 生成最终命令与独立脚本；set -e 保证任务失败时停止队列。
 generate_final_command_and_script() {
     local gen_script_path="${PROJECT_ROOT}/run_encode.sh"
-    local clip_intermediate="${PROJECT_ROOT}/temp_clip_for_test.mkv"
-    local effective_input="$INPUT_VIDEO"
-
-    local preload_str=""
-    if [ -f "$NVENC_FIX_SO" ]; then
-        preload_str="export LD_PRELOAD=\"${NVENC_FIX_SO}\${LD_PRELOAD:+ \$LD_PRELOAD}\""
-    fi
-
-    # 组装 aji_encode 命令参数
+    local i effective_input
     local cmd_args=()
-    if [ "$IS_CLIP" -eq 1 ]; then
-        effective_input="$clip_intermediate"
-    fi
 
-    cmd_args+=("--input" "\"${effective_input}\"")
-    cmd_args+=("--output" "\"${OUTPUT_VIDEO}\"")
-    if [ "$USE_RUNTIME_CONFIG" -eq 1 ]; then
-        cmd_args+=("--conf" "\"${RUNTIME_CONFIG}\"")
-        cmd_args+=("--slot" "${RUNTIME_SLOT}")
-        cmd_args+=("--model-dir" "\"${CONFIG_MODEL_DIR}\"")
-        cmd_args+=("--rife-model-dir" "\"${CONFIG_MODEL_DIR}/rife\"")
-        cmd_args+=("--trtexec" "\"${CONFIG_TRTEXEC}\"")
-    else
-        cmd_args+=("--engine" "\"${ENGINE_FILE}\"")
-        cmd_args+=("--max-width" "${SRC_WIDTH}")
-        cmd_args+=("--max-height" "${SRC_HEIGHT}")
-    fi
-    cmd_args+=("--decoder" "${DECODER}")
-    cmd_args+=("--vcodec" "${VCODEC}")
-    cmd_args+=("--vquality" "\"${VQUALITY}\"")
-    cmd_args+=("--pix-fmt" "${PIX_FMT}")
-    if [ "$RIFE_ENABLED" -eq 1 ] && [ "$USE_RUNTIME_CONFIG" -eq 0 ]; then
-        cmd_args+=("--rife-model-dir" "\"${RIFE_MODEL_DIR}\"")
-        cmd_args+=("--rife-model" "${RIFE_MODEL}")
-        cmd_args+=("--rife-factor" "${RIFE_FACTOR}")
-        cmd_args+=("--rife-order" "${RIFE_ORDER}")
-        cmd_args+=("--rife-scene-threshold" "${RIFE_SCD_THRESHOLD}")
-    fi
-    [ -n "$OVERWRITE_FLAG" ] && cmd_args+=("${OVERWRITE_FLAG}")
-    [ ${#EXTRA_FLAGS[@]} -gt 0 ] && cmd_args+=("${EXTRA_FLAGS[@]}")
-
-    # 写入独立的执行脚本 run_encode.sh
-    cat << EOF > "$gen_script_path"
-#!/usr/bin/env bash
-# ==============================================================================
-# AnimeJaNai-Inference 独立执行脚本 (自动生成于 $(date '+%Y-%m-%d %H:%M:%S'))
-# ==============================================================================
-set -e
-
-# 1. 配置运行时动态库与环境变量
-export PATH="${CUDA_BIN_DIR}:${FFMPEG_INSTALL_DIR}/bin:\$PATH"
-export LD_LIBRARY_PATH="${PROJECT_ROOT}/build:${FFMPEG_INSTALL_DIR}/lib:${CUDA_LIB_DIR}:\${LD_LIBRARY_PATH:-}"
-${preload_str}
-
-echo -e "\033[1;36m==============================================================================\033[0m"
-echo -e "\033[1;35m🚀 开始执行 AnimeJaNai AI 视频压制任务\033[0m"
-echo -e "  - 输入文件: ${INPUT_VIDEO}"
-echo -e "  - 输出文件: ${OUTPUT_VIDEO}"
-if [ "${USE_RUNTIME_CONFIG}" -eq 1 ]; then
-    echo -e "  - Runtime Slot: ${RUNTIME_SLOT} (${RUNTIME_PROFILE})"
-else
-    echo -e "  - Engine:   ${ENGINE_FILE}"
-fi
-if [ "${RIFE_ENABLED}" -eq 1 ]; then
-    if [ "${USE_RUNTIME_CONFIG}" -eq 1 ]; then
-        echo -e "  - RIFE:     ${RIFE_MODEL} (${RIFE_FACTOR}x, 由 Runtime Slot 配置)"
-    else
-        echo -e "  - RIFE:     ${RIFE_MODEL} (${RIFE_FACTOR}x, ${RIFE_ORDER} upscale, SCD ${RIFE_SCD_THRESHOLD})"
-    fi
-fi
-echo -e "  - 编码器:   ${VCODEC} (${VQUALITY})"
-echo -e "  - 像素格式: ${PIX_FMT}"
-echo -e "\033[1;36m------------------------------------------------------------------------------\033[0m"
-
-EOF
-
-    if [ "$IS_CLIP" -eq 1 ]; then
-        cat << EOF >> "$gen_script_path"
-# 2. 截取测试片段 (${CLIP_START}, 时长 ${CLIP_DURATION} 秒)
-echo -e "\033[0;33m[前置] 正在流拷贝无损快速截取 ${CLIP_DURATION} 秒测试片段...\033[0m"
-ffmpeg -y -ss "${CLIP_START}" -i "${INPUT_VIDEO}" -t "${CLIP_DURATION}" -c copy "${clip_intermediate}"
-
-# 3. 运行单管道超分/插帧压制
-echo -e "\033[0;32m[核心] 启动 aji_encode 进行 AI 推理与编码...\033[0m"
-${AJI_ENCODE_BIN} \\
-    ${cmd_args[*]}
-
-# 4. 清理临时测试片段
-rm -f "${clip_intermediate}"
-EOF
-    else
-        cat << EOF >> "$gen_script_path"
-# 2. 启动 aji_encode 进行全视频单管道 AI 处理/压制
-${AJI_ENCODE_BIN} \\
-    ${cmd_args[*]}
-EOF
-    fi
-
-    cat << 'EOF' >> "$gen_script_path"
-
-echo -e "\n\033[1;32m==============================================================================\033[0m"
-echo -e "\033[1;32m🎉 AI 视频压制任务圆满完成！\033[0m"
-echo -e "\033[1;32m==============================================================================\033[0m"
-EOF
-
-    chmod +x "$gen_script_path"
-
-    # 打印最终生成展示区
-    print_header
-    echo -e "${BOLD}${GREEN}==============================================================================${NC}"
-    echo -e "${BOLD}${GREEN}🎉 任务配置完成！独立脚本已生成，未自动执行，请查看以下信息：${NC}"
-    echo -e "${BOLD}${GREEN}==============================================================================${NC}\n"
-
-    echo -e "${BOLD}${YELLOW}📄 方式一：直接运行为您生成的独立脚本 (推荐)${NC}"
-    echo -e "${CYAN}------------------------------------------------------------------------------${NC}"
-    echo -e "  ${BOLD}bash ${gen_script_path}${NC}"
-    echo -e "  或后台挂起执行 (防止断连):"
-    echo -e "  ${BOLD}nohup bash ${gen_script_path} > encode.log 2>&1 &${NC}"
-    echo -e "  (查看实时进度: ${BOLD}tail -f encode.log${NC})\n"
-
-    echo -e "${BOLD}${YELLOW}📋 方式二：手动复制以下完整单行/多行 Shell 命令到终端执行${NC}"
-    echo -e "${CYAN}------------------------------------------------------------------------------${NC}"
-    
-    echo -e "${CYAN}# 1. 导入环境变量：${NC}"
-    echo -e "${BOLD}export PATH=\"${CUDA_BIN_DIR}:${FFMPEG_INSTALL_DIR}/bin:\$PATH\""
-    echo -e "export LD_LIBRARY_PATH=\"${PROJECT_ROOT}/build:${FFMPEG_INSTALL_DIR}/lib:${CUDA_LIB_DIR}:\$LD_LIBRARY_PATH\"${NC}"
-    if [ -n "$preload_str" ]; then
-        echo -e "${BOLD}${preload_str}${NC}"
-    fi
-
-    echo -e "\n${CYAN}# 2. 执行 AI 视频处理命令：${NC}"
-    if [ "$IS_CLIP" -eq 1 ]; then
-        echo -e "${BOLD}ffmpeg -y -ss ${CLIP_START} -i \"${INPUT_VIDEO}\" -t ${CLIP_DURATION} -c copy \"${clip_intermediate}\" && \\${NC}"
-    fi
-    echo -e "${BOLD}${AJI_ENCODE_BIN} \\"
-    for ((i=0; i<${#cmd_args[@]}; i+=2)); do
-        if [ $((i+1)) -lt ${#cmd_args[@]} ]; then
-            echo -e "    ${cmd_args[$i]} ${cmd_args[$((i+1))]} \\"
-        else
-            echo -e "    ${cmd_args[$i]} \\"
+    {
+        printf '#!/usr/bin/env bash\nset -euo pipefail\n\n'
+        printf 'export PATH=%q:"$PATH"\n' "${CUDA_BIN_DIR}:${FFMPEG_INSTALL_DIR}/bin"
+        printf 'export LD_LIBRARY_PATH=%q:"${LD_LIBRARY_PATH:-}"\n' "${PROJECT_ROOT}/build:${FFMPEG_INSTALL_DIR}/lib:${CUDA_LIB_DIR}"
+        if [ -f "$NVENC_FIX_SO" ]; then
+            printf 'export LD_PRELOAD=%q"${LD_PRELOAD:+ $LD_PRELOAD}"\n' "$NVENC_FIX_SO"
         fi
-    done | sed '$ s/ \\$//'
-    echo -e "${NC}"
-    echo -e "${CYAN}==============================================================================${NC}"
+        if [ "$IS_CLIP" -eq 1 ]; then
+            # 每次执行使用独立临时目录；失败退出时也清理片段。
+            cat << 'EOF'
+clip_dir=$(mktemp -d)
+trap 'rm -rf -- "$clip_dir"' EXIT
+EOF
+        fi
+        for i in "${!INPUT_VIDEOS[@]}"; do
+            printf '\n'
+            write_shell_command printf '%s\n' "[$((i+1))/${#INPUT_VIDEOS[@]}] 输入: ${INPUT_VIDEOS[$i]}" "输出: ${OUTPUT_VIDEOS[$i]}"
+            effective_input=${INPUT_VIDEOS[$i]}
+            if [ "$IS_CLIP" -eq 1 ]; then
+                write_shell_command printf '%s\n' "正在截取测试片段（${CLIP_START}，${CLIP_DURATION} 秒）..."
+                printf '%q ' ffmpeg -y -ss "$CLIP_START" -i "$effective_input" -t "$CLIP_DURATION" -c copy
+                printf '"$clip_dir/clip.mkv"\n'
+            fi
+            cmd_args=("--output" "${OUTPUT_VIDEOS[$i]}")
+            if [ "$USE_RUNTIME_CONFIG" -eq 1 ]; then
+                cmd_args+=("--conf" "${RUNTIME_CONFIG}")
+                cmd_args+=("--slot" "${RUNTIME_SLOT}")
+                cmd_args+=("--model-dir" "${CONFIG_MODEL_DIR}")
+                cmd_args+=("--rife-model-dir" "${CONFIG_MODEL_DIR}/rife")
+                cmd_args+=("--trtexec" "${CONFIG_TRTEXEC}")
+            else
+                cmd_args+=("--engine" "${ENGINE_FILE}")
+                cmd_args+=("--max-width" "${SOURCE_WIDTHS[$i]}")
+                cmd_args+=("--max-height" "${SOURCE_HEIGHTS[$i]}")
+            fi
+            cmd_args+=("--decoder" "${DECODER}")
+            cmd_args+=("--vcodec" "${VCODEC}")
+            cmd_args+=("--vquality" "${VQUALITY}")
+            cmd_args+=("--pix-fmt" "${PIX_FMT}")
+            if [ "$RIFE_ENABLED" -eq 1 ] && [ "$USE_RUNTIME_CONFIG" -eq 0 ]; then
+                cmd_args+=("--rife-model-dir" "${RIFE_MODEL_DIR}")
+                cmd_args+=("--rife-model" "${RIFE_MODEL}")
+                cmd_args+=("--rife-factor" "${RIFE_FACTOR}")
+                cmd_args+=("--rife-order" "${RIFE_ORDER}")
+                cmd_args+=("--rife-scene-threshold" "${RIFE_SCD_THRESHOLD}")
+            fi
+            [ -n "$OVERWRITE_FLAG" ] && cmd_args+=("${OVERWRITE_FLAG}")
+            [ ${#EXTRA_FLAGS[@]} -gt 0 ] && cmd_args+=("${EXTRA_FLAGS[@]}")
+
+            printf '%q ' "$AJI_ENCODE_BIN" --input
+            if [ "$IS_CLIP" -eq 1 ]; then
+                printf '"$clip_dir/clip.mkv" '
+            else
+                printf '%q ' "$effective_input"
+            fi
+            write_shell_command "${cmd_args[@]}"
+        done
+        printf '\n'
+        write_shell_command printf '%s\n' "✔ 全部 ${#INPUT_VIDEOS[@]} 个视频处理完成！"
+    } > "$gen_script_path" || return 1
+    chmod +x "$gen_script_path" || return 1
+
+    print_header
+    echo -e "${BOLD}${GREEN}✔ 已生成 ${#INPUT_VIDEOS[@]} 个视频的串行任务脚本，未自动执行。${NC}"
+    echo "全部视频共用处理参数；任一任务失败时停止后续任务。"
+    echo -e "\n${BOLD}${YELLOW}方式一：运行独立脚本${NC}"
+    write_shell_command bash "$gen_script_path"
+    printf 'nohup bash %q > encode.log 2>&1 &\n' "$gen_script_path"
+    echo "查看进度: tail -f encode.log"
+    echo -e "\n${BOLD}${YELLOW}方式二：复制以下完整命令执行（包含串行队列）${NC}"
+    # 子 Shell 限定 set/trap 的作用域，手动粘贴执行不会退出用户的终端。
+    printf '(\n'
+    cat "$gen_script_path"
+    printf ')\n'
 }
 
 # 主执行流
@@ -885,11 +896,11 @@ main() {
     check_binaries
     detect_nvenc_split_count
     print_header
-    select_input_video
+    select_input_video || return 1
     select_processing_profile || return 1
     select_rife_settings
     select_clip_mode
-    select_output_path
+    select_output_path || return 1
     select_encoder_and_quality
     select_decoder_and_pixfmt
     select_optional_flags
