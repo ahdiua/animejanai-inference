@@ -61,6 +61,8 @@ ENGINE_FILE=""
 OUTPUT_VIDEO=""
 USE_RUNTIME_CONFIG=${RUNTIME_MODE}
 RUNTIME_CONFIG="${PROJECT_ROOT}/animejanai.conf"
+CONFIG_MODEL_DIR="${PROJECT_ROOT}/onnx"
+CONFIG_TRTEXEC="${PROJECT_ROOT}/bin/trtexec.real"
 RUNTIME_SLOT=1003
 RUNTIME_PROFILE="Performance"
 UPSCALE_ENABLED=1
@@ -327,9 +329,10 @@ select_runtime_profile() {
     echo -e "  ${BOLD}9)${NC} Performance + RIFE 4.25 - 超分 + 2x 插帧 (Slot 3025)"
     echo -e "  ${BOLD}10)${NC} Performance + RIFE 4.26 - 超分 + 2x 插帧 (Slot 3026)"
     echo -e "  ${BOLD}11)${NC} RealESRGAN AnimeVideo-v3 - 原生 4x 动漫视频超分 (Slot 2004)"
+    echo -e "  ${BOLD}12)${NC} APISR 2x RRDB GAN       - 2x 动漫超分 (Slot 2005)"
 
     local profile_choice
-    read -rp "请选择处理方案 [1-11, 默认 3]: " profile_choice
+    read -rp "请选择处理方案 [1-12, 默认 3]: " profile_choice
     profile_choice=${profile_choice:-3}
 
     USE_RUNTIME_CONFIG=1
@@ -379,6 +382,9 @@ select_runtime_profile() {
             EXTRA_FLAGS+=("--pipeline-depth" "2")
             echo -e "${CYAN}原生 4x 输出：1080p → 8K，可在后续输出设置中缩小至 4K。${NC}"
             ;;
+        12)
+            select_apisr_profile || return 1
+            ;;
         *)
             echo -e "${YELLOW}无效选项，已使用默认 Performance (Slot 1003)。${NC}"
             RUNTIME_SLOT=1003
@@ -390,11 +396,53 @@ select_runtime_profile() {
     echo -e "${CYAN}首次处理新分辨率时会自动构建 Engine，之后直接复用 onnx/ 中的缓存。${NC}\n"
 }
 
+select_apisr_profile() {
+    local model_name="2x_APISR_RRDB_GAN_fp16.onnx"
+    if [ "$RUNTIME_MODE" -eq 0 ]; then
+        RUNTIME_CONFIG="${PROJECT_ROOT}/apisr-animejanai.conf"
+        CONFIG_MODEL_DIR="$MODELS_DIR"
+        if [ ! -s "${CONFIG_MODEL_DIR}/${model_name}" ]; then
+            CONFIG_MODEL_DIR="${PROJECT_ROOT}/models"
+        fi
+        CONFIG_TRTEXEC=$(command -v trtexec) || {
+            echo -e "${RED}未找到 trtexec，请先运行 deploy.sh 安装 TensorRT。${NC}"
+            return 1
+        }
+    fi
+    if [ ! -f "$RUNTIME_CONFIG" ] || ! grep -Eq '^\[slot_2005\][[:space:]]*$' "$RUNTIME_CONFIG"; then
+        echo -e "${RED}配置缺少 APISR Slot 2005: ${RUNTIME_CONFIG}，请更新配置。${NC}"
+        return 1
+    fi
+    if [ ! -s "${CONFIG_MODEL_DIR}/${model_name}" ]; then
+        echo -e "${RED}未找到 APISR 模型: ${CONFIG_MODEL_DIR}/${model_name}${NC}"
+        echo -e "${YELLOW}源码环境请运行 ./deploy.sh --models 选择 9；Runtime 请使用包含 APISR 的新版包。${NC}"
+        return 1
+    fi
+    if (( SRC_WIDTH % 2 != 0 || SRC_HEIGHT % 2 != 0 )); then
+        echo -e "${RED}APISR 要求源视频宽高均为偶数。${NC}"
+        return 1
+    fi
+    USE_RUNTIME_CONFIG=1
+    RUNTIME_SLOT=2005
+    RUNTIME_PROFILE="APISR 2x RRDB GAN"
+    UPSCALE_ENABLED=1
+    RIFE_ENABLED=0
+    echo -e "${GREEN}✔ APISR 2x RRDB GAN：首次编码按视频尺寸自动构建引擎。${NC}"
+}
+
 select_processing_profile() {
     if [ "$RUNTIME_MODE" -eq 1 ]; then
         select_runtime_profile
     else
-        select_engine
+        local processing_choice
+        echo -e "  ${BOLD}1)${NC} 选择已有 TensorRT Engine"
+        echo -e "  ${BOLD}2)${NC} APISR 2x RRDB GAN（自动构建 Engine）"
+        read -rp "请选择 [1-2, 默认 1]: " processing_choice
+        if [ "${processing_choice:-1}" = 2 ]; then
+            select_apisr_profile
+        else
+            select_engine
+        fi
     fi
 }
 
@@ -705,9 +753,9 @@ generate_final_command_and_script() {
     if [ "$USE_RUNTIME_CONFIG" -eq 1 ]; then
         cmd_args+=("--conf" "\"${RUNTIME_CONFIG}\"")
         cmd_args+=("--slot" "${RUNTIME_SLOT}")
-        cmd_args+=("--model-dir" "\"${PROJECT_ROOT}/onnx\"")
-        cmd_args+=("--rife-model-dir" "\"${PROJECT_ROOT}/onnx/rife\"")
-        cmd_args+=("--trtexec" "\"${PROJECT_ROOT}/bin/trtexec.real\"")
+        cmd_args+=("--model-dir" "\"${CONFIG_MODEL_DIR}\"")
+        cmd_args+=("--rife-model-dir" "\"${CONFIG_MODEL_DIR}/rife\"")
+        cmd_args+=("--trtexec" "\"${CONFIG_TRTEXEC}\"")
     else
         cmd_args+=("--engine" "\"${ENGINE_FILE}\"")
         cmd_args+=("--max-width" "${SRC_WIDTH}")
@@ -838,7 +886,7 @@ main() {
     detect_nvenc_split_count
     print_header
     select_input_video
-    select_processing_profile
+    select_processing_profile || return 1
     select_rife_settings
     select_clip_mode
     select_output_path

@@ -70,6 +70,7 @@ Useful slots:
 | 2002 | Sharp Performance |
 | 2003 | SD Compact |
 | 2004 | RealESRGAN AnimeVideo-v3 (native 4x) |
+| 2005 | APISR RRDB GAN 2x (no RIFE) |
 | 2025 | RIFE v4.25 2x only |
 | 2026 | RIFE v4.26 2x only |
 | 3025 | Performance + RIFE v4.25 2x |
@@ -106,3 +107,6 @@ TensorRT engines are generated locally and should not be copied between
 different GPU/TensorRT environments.
 
 Run `sha256sum -c SHA256SUMS` to verify all extracted files.
+
+APISR is available as option 12 in `generate_cmd.sh` or with `--slot 2005`.
+Input width and height must be even; the first encode builds an engine for that size.

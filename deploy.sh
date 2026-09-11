@@ -909,6 +909,28 @@ download_animejanai_models() {
     download_model_file "$bal_sharp_dest" "$URL_ANIMEJANAI_V31_BAL_SHARP" "" "AnimeJaNai V3.1 Sharp1 Balanced (2x)"
 }
 
+prepare_apisr_model() {
+    local target_path="${MODELS_DIR}/2x_APISR_RRDB_GAN_fp16.onnx"
+    if [ -s "$target_path" ]; then
+        echo -e "${GREEN}✔ 已存在 APISR 2x RRDB GAN: ${target_path}${NC}"
+        return 0
+    fi
+    local local_model="${PROJECT_ROOT}/models/2x_APISR_RRDB_GAN_fp16.onnx"
+    if [ -s "$local_model" ]; then
+        cp "$local_model" "$target_path" || return 1
+    else
+        if [ ! -x "$VENV_DIR/bin/python3" ]; then
+            python3 -m venv "$VENV_DIR" || return 1
+        fi
+        if ! "$VENV_DIR/bin/python3" -c 'import onnx' 2>/dev/null; then
+            "$VENV_DIR/bin/python3" -m pip install onnx || return 1
+        fi
+        "$VENV_DIR/bin/python3" "${PROJECT_ROOT}/tools/prepare_apisr.py" \
+            --output "$target_path" || return 1
+    fi
+    echo -e "${GREEN}✔ APISR 已准备好，可在 generate_cmd.sh 中选择 APISR 自动构建引擎。${NC}"
+}
+
 # 单模型 Engine 构建函数
 build_single_engine() {
     local onnx_path="$1"
@@ -997,7 +1019,8 @@ download_and_build_engine() {
     echo -e "  ${BOLD}6)${NC} 获取 RealESRGAN AnimeVideo-v3 (原生 4x, 动漫视频轻量模型)"
     echo -e "  ${BOLD}7)${NC} 下载 Real-ESRGAN Anime 6B (4x, 经典原版动漫模型)"
     echo -e "  ${BOLD}8)${NC} 自定义 ONNX 模型下载链接 / 本地已有路径"
-    read -rp "请输入选项 [1-8, 默认 1]: " model_choice
+    echo -e "  ${BOLD}9)${NC} 获取 APISR 2x RRDB GAN (FP16)"
+    read -rp "请输入选项 [1-9, 默认 1]: " model_choice
     model_choice=${model_choice:-1}
 
     local target_onnx_list=()
@@ -1042,6 +1065,10 @@ download_and_build_engine() {
                 target_onnx_list=("$custom_dest")
             fi
             ;;
+        9)
+            prepare_apisr_model || return 1
+            target_onnx_list=("${MODELS_DIR}/2x_APISR_RRDB_GAN_fp16.onnx")
+            ;;
         *)
             echo -e "${RED}无效输入，返回。${NC}"
             return 1
@@ -1080,6 +1107,14 @@ download_and_build_engine() {
             return 0
             ;;
     esac
+
+    if [ "$model_choice" = 9 ]; then
+        if ! [[ "$opt_w" =~ ^[0-9]+$ && "$opt_h" =~ ^[0-9]+$ ]] ||
+           (( 10#$opt_w < 2 || 10#$opt_h < 2 || 10#$opt_w % 2 || 10#$opt_h % 2 )); then
+            echo -e "${RED}APISR 要求输入宽高为不小于 2 的偶数。${NC}"
+            return 1
+        fi
+    fi
 
     if [ ${#target_onnx_list[@]} -gt 1 ]; then
         echo -e "\n检测到已获取多个模型，请选择构建策略："

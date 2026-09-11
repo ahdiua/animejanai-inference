@@ -342,6 +342,25 @@ copy_model \
     "https://r2.ahdiua.com/realesr-animevideov3-v0.2.5.0-fp16-dynamic.onnx" \
     "d584ed9c21a2c2448d96d5e3e0a2d719a0e573d36eb4244cb07e68be96e3a0ab"
 
+prepare_apisr_model() {
+    local model_name="2x_APISR_RRDB_GAN_fp16.onnx"
+    local staged_path="${STAGE_ROOT}/onnx/${model_name}"
+    local candidate
+    for candidate in "${LOCAL_MODELS_DIR}/${model_name}" "${PROJECT_ROOT}/models/${model_name}"; do
+        if [[ -s "${candidate}" ]]; then
+            cp -aL "${candidate}" "${staged_path}"
+            return
+        fi
+    done
+    local python_env="${WORK_DIR}/apisr-converter"
+    python3 -m venv "${python_env}"
+    "${python_env}/bin/python" -m pip install --disable-pip-version-check onnx
+    "${python_env}/bin/python" "${PROJECT_ROOT}/tools/prepare_apisr.py" \
+        --output "${staged_path}"
+}
+
+prepare_apisr_model
+
 prepare_rife_model() {
     local version="$1"
     local expected_sha="$2"

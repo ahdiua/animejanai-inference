@@ -49,3 +49,8 @@ Engines built on first use are fixed to the video's working resolution
 (`minShapes=optShapes=maxShapes`) and use
 `--builderOptimizationLevel=5`. A different resolution gets its own cached
 engine.
+
+APISR 2x RRDB GAN is included as Slot 2005. Packaging first looks for
+`2x_APISR_RRDB_GAN_fp16.onnx` in `--models-dir`, then in the repository
+`models/` directory. Otherwise it uses `tools/prepare_apisr.py` to download,
+verify and adapt the pinned upstream export in an isolated Python environment.
