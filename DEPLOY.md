@@ -591,3 +591,43 @@ deploy 生成的引擎。自定义构建参数或不同 ONNX 别名会产生不�
 构建输出同时保存在 `.engine.build.log`；`.engine.label` 记录模型名和输入尺寸，
 供命令生成器展示。旧的 `balanced_1080p.engine` 等仍可通过直连模式使用，
 不会被自动改名或删除。引擎目录不再进行基于文件名后缀的自动清理。
+
+## deploy.sh 的检测、版本选择与下载校验
+
+`--check` 仅诊断，不自动克隆源码或切换 `/usr/local/cuda`，依赖检查失败返回非零。
+脚本默认操作自身所在的 fork 目录；从其他目录调用时，可用 `--project-root` 明确指定项目。
+自动安装支持 Ubuntu 22.04/24.04 x86_64，并根据发行版选择对应 NVIDIA 源。
+
+```sh
+./deploy.sh --check
+./deploy.sh --build --cuda-root /usr/local/cuda-13.2 --trt-root /usr
+./deploy.sh --all --yes --cuda-version 13.2 --ffmpeg-variant n8.1
+```
+
+`--yes` 明确接受交互问题已有的默认值；没有默认值的问题仍然需要输入。
+未指定 `--yes` 时，EOF 会取消操作；`--all` 在非交互环境中要求 `--yes`。
+CUDA 安装版本必须为 13.x，TensorRT 的安装包限定 11.x。编译时 CUDA 以
+`--cuda-root`、`CUDACXX`、PATH 的顺序选择；TensorRT 以 `--trt-root` 为准，
+未指定时依次检查 `/usr` 和 `~/sdk/tensorrt/usr`。可用 `--trtexec` 指定工具路径，
+其报告版本必须与所选开发头文件一致。CMake 和引擎构建使用同一组解析结果。
+
+FFmpeg 固定到 BtbN `autobuild-2026-08-31-13-27` 的月底构建，支持 n8.1 与 master
+两个变体；NVENC 补丁固定到 `1475091ae9e8fb23cc22d565adf932a488d00bcd`。
+这两类下载和 NVIDIA keyring 均核对脚本中记录的 SHA256；更新时须同时更新 URL 与摘要。
+BtbN 的月底构建按其发布策略保留两年，固定资产失效时应更新版本，不会静默回退到 latest。
+FFmpeg 在移除旧安装前验证压缩包及必要成员，安装失败返回非零，不保留回滚副本。
+NVENC 补丁仅在检测到设备枚举故障且补丁测试通过时用于单次编码进程。
+
+模型下载需要先执行 `--venv`。`scripts/download_model.py` 检查 HTTPS、下载长度及
+ONNX 结构后才替换目标文件，并记录 `.download.json` 中的来源与 SHA256。
+该记录用于检查本地文件完整性和 URL 是否一致，不是发布者签名；辅助工具支持
+`--sha256` 传入可信摘要。无记录的旧下载会重新获取，自定义 URL 使用不同文件名。
+模型必须是包含全部权重的单文件 ONNX；外置权重模型请自行准备并通过本地路径使用。
+这些下载记录不改变引擎缓存的命名或复用规则。
+
+安装会更新对应的 CUDA/FFmpeg profile，并迁移旧脚本写入 `.bashrc` 的已知环境变量行，
+保留其他用户配置。库搜索路径不包含空目录项。一分钟测试的输入和输出放在独立的
+`build/deploy-test.*` 目录，避免覆盖已有测试结果；失败返回非零。
+
+部署逻辑的隔离回归测试可运行 `python3 sanity/test_deploy.py`，不需要 root、GPU 或网络。
+安装 `onnx` 后会额外运行真实 ONNX 校验测试。静态检查使用 `shellcheck deploy.sh`。
