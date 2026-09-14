@@ -636,7 +636,7 @@ install_build_tools_and_ffmpeg() (
     if (( 10#$ffmpeg_choice == 2 )); then url=$FFMPEG_TAR_MASTER_URL; digest=$FFMPEG_MASTER_SHA256; fi
     run_as_root apt-get update || return 1
     run_as_root apt-get install -y --no-install-recommends \
-        build-essential cmake pkg-config git p7zip-full wget curl ca-certificates tar xz-utils || return 1
+        build-essential cmake pkg-config git p7zip-full aria2 wget curl ca-certificates tar xz-utils || return 1
     tmp_dir=$(mktemp -d) || return 1
     trap 'rm -rf -- "$tmp_dir"' EXIT
     trap 'exit 130' INT
@@ -694,7 +694,7 @@ setup_python_venv() {
     init_project_root || return 1
     check_install_platform || return 1
     run_as_root apt-get update || return 1
-    run_as_root apt-get install -y --no-install-recommends python3 python3-venv python3-pip p7zip-full || return 1
+    run_as_root apt-get install -y --no-install-recommends python3 python3-venv python3-pip p7zip-full aria2 || return 1
     if [ ! -x "$VENV_DIR/bin/python3" ] || [ ! -f "$VENV_DIR/pyvenv.cfg" ]; then
         python3 -m venv "$VENV_DIR" || return 1
     fi
@@ -809,6 +809,7 @@ build_single_engine() (
     local onnx_path="$1"
     local opt_w="$2"
     local opt_h="$3"
+    local engine_suffix="$4"
 
     if [ ! -s "$onnx_path" ]; then
         echo -e "${RED}[错误] ONNX 文件不存在或为空: ${onnx_path}${NC}"
@@ -820,7 +821,7 @@ build_single_engine() (
     prepend_path LD_LIBRARY_PATH "$TRT_LIB_DIR"
     local model_basename
     model_basename="$(basename "$onnx_path" .onnx)" || return 1
-    local engine_path
+    local engine_path="${MODELS_DIR}/${model_basename}_${engine_suffix}.engine"
 
     ensure_model_python || return 1
     local input_name
@@ -833,21 +834,15 @@ PYONNX
 ) || return 1
     [ -n "$input_name" ] || return 1
 
-    local path_tool="${PROJECT_ROOT}/build/aji_engine_path"
-    if [ ! -x "$path_tool" ]; then
-        echo -e "${RED}缺少 aji_engine_path，请先运行 ./deploy.sh --build 更新构建工具。${NC}"
-        return 1
-    fi
-    local cache_info
-    cache_info=$("$path_tool" "$onnx_path" "$MODELS_DIR" "$opt_w" "$opt_h" "$input_name") || return 1
-    engine_path=${cache_info%%$'\n'*}
-    if [ -s "$engine_path" ]; then
-        printf '%s (%sx%s)\n' "$model_basename" "$opt_w" "$opt_h" > "${engine_path}.label" || return 1
-        echo -e "${GREEN}✔ 已存在相同模型、尺寸及设备的引擎: ${engine_path}${NC}"
-        return 0
-    fi
     local build_log="${engine_path}.build.log"
     local timing_cache="${MODELS_DIR}/${model_basename}.timing.cache"
+    # 可读名称不包含设备/版本信息，每次按当前环境构建，成功后才替换旧引擎。
+    local build_dir
+    build_dir=$(mktemp -d "$MODELS_DIR/.aji-engine.XXXXXX") || return 1
+    trap 'rm -rf -- "$build_dir"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    local temporary_engine="${build_dir}/${model_basename}_${engine_suffix}.engine"
 
     echo -e "\n${CYAN}==============================================================================${NC}"
     echo -e "正在调用 trtexec 为当前 GPU 构建 TensorRT Engine..."
@@ -865,16 +860,16 @@ PYONNX
         --builderOptimizationLevel=5 \
         --skipInference \
         --timingCacheFile="$timing_cache" \
-        --saveEngine="$engine_path" 2>&1 | tee "$build_log"
+        --saveEngine="$temporary_engine" 2>&1 | tee "$build_log"
     local build_status=$?
 
-    if [ "$build_status" -eq 0 ] && [ -s "$engine_path" ]; then
+    if [ "$build_status" -eq 0 ] && [ -s "$temporary_engine" ]; then
+        mv -f -- "$temporary_engine" "$engine_path" || return 1
         printf '%s (%sx%s)\n' "$model_basename" "$opt_w" "$opt_h" > "${engine_path}.label" || return 1
         echo -e "\n${GREEN}✔ TensorRT Engine 构建成功！${NC}"
         echo -e "  Engine 路径: ${BOLD}${engine_path}${NC} ($(du -h "$engine_path" | cut -f1))"
         return 0
     else
-        rm -f -- "$engine_path"
         echo -e "\n${RED}[错误] trtexec 构建 Engine 失败！详情见 ${build_log}。${NC}"
         return 1
     fi

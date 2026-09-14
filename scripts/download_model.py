@@ -9,10 +9,17 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+
+
+# The model CDN rejects urllib's default Python-urllib User-Agent (HTTP 403).
+DOWNLOAD_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 
 class HTTPSRedirect(urllib.request.HTTPRedirectHandler):
@@ -59,6 +66,40 @@ def validate_onnx(path):
         raise ValueError(f"invalid ONNX: {error}") from error
 
 
+def fetch_model(source, temporary, opener, aria2):
+    if aria2:
+        print(f"Downloading with aria2: {source}", flush=True)
+        try:
+            subprocess.run([
+                aria2, "--no-conf=true", "--no-netrc=true",
+                "--check-certificate=true", "--follow-metalink=false",
+                "--follow-torrent=false",
+                "--max-connection-per-server=4", "--split=4", "--min-split-size=1M",
+                "--max-tries=3", "--retry-wait=2", "--connect-timeout=15", "--timeout=30",
+                "--file-allocation=none", "--auto-file-renaming=false",
+                "--allow-overwrite=true", "--remove-control-file=true",
+                "--summary-interval=0", "--console-log-level=warn",
+                f"--user-agent={DOWNLOAD_HEADERS['User-Agent']}",
+                f"--dir={temporary.parent}", f"--out={temporary.name}", "--", source,
+            ], check=True)
+            if not temporary.is_file() or temporary.stat().st_size == 0:
+                raise ValueError("empty model download")
+            return
+        except (OSError, ValueError, subprocess.CalledProcessError) as error:
+            print(f"aria2 failed, retrying with Python: {error}", file=sys.stderr)
+
+    request = urllib.request.Request(source, headers=DOWNLOAD_HEADERS)
+    with opener.open(request, timeout=30) as response, temporary.open("wb") as output:
+        require_https(response.url)
+        size = 0
+        while chunk := response.read(1024 * 1024):
+            output.write(chunk)
+            size += len(chunk)
+        length = response.headers.get("Content-Length")
+        if size == 0 or (length is not None and size != int(length)):
+            raise ValueError("empty or incomplete model download")
+
+
 def download(url, destination, mirror="", expected=""):
     require_https(url)
     if mirror:
@@ -78,6 +119,7 @@ def download(url, destination, mirror="", expected=""):
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     opener = urllib.request.build_opener(HTTPSRedirect())
+    aria2 = shutil.which("aria2c")
     # A private directory on the destination filesystem enables atomic replace.
     with tempfile.TemporaryDirectory(prefix=".aji-download-", dir=destination.parent) as directory:
         temporary = Path(directory) / "model.onnx"
@@ -86,15 +128,7 @@ def download(url, destination, mirror="", expected=""):
             if not source:
                 continue
             try:
-                with opener.open(source, timeout=30) as response, temporary.open("wb") as output:
-                    require_https(response.url)
-                    size = 0
-                    while chunk := response.read(1024 * 1024):
-                        output.write(chunk)
-                        size += len(chunk)
-                    length = response.headers.get("Content-Length")
-                    if size == 0 or (length is not None and size != int(length)):
-                        raise ValueError("empty or incomplete model download")
+                fetch_model(source, temporary, opener, aria2)
                 actual = digest(temporary)
                 if expected and actual != expected:
                     raise ValueError("model SHA256 mismatch")
@@ -107,6 +141,9 @@ def download(url, destination, mirror="", expected=""):
                 return
             except (OSError, ValueError, urllib.error.URLError) as error:
                 last_error = error
+                print(f"Model download failed ({source}): {error}", file=sys.stderr)
+                if isinstance(error, urllib.error.HTTPError):
+                    error.close()
         raise RuntimeError(f"model download failed: {last_error}")
 
 

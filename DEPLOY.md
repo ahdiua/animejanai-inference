@@ -582,15 +582,20 @@ echo "✅ 部署完成！请参考上方注释的第 4-6 步下载模型并运�
 ```
 ## deploy 与自动缓存的引擎命名
 
-`deploy.sh` 构建引擎时通过 `build/aji_engine_path` 使用与推理后端相同的命名代码：
-`aji-<模型名CRC32>.<构建参数CRC32>.trt-<版本>.gpu-<设备>.engine`。
-更新后先运行 `./deploy.sh --build`，以生成这个辅助工具。
-同一 ONNX 文件名、模型目录、输入尺寸、设备和默认构建参数下，配置模式可以复用
-deploy 生成的引擎。自定义构建参数或不同 ONNX 别名会产生不同缓存键。
+`deploy.sh` 使用可读的 `<模型名>_<分辨率>.engine` 命名，例如
+`performance_1080p.engine`、`balanced_720p.engine`、`performance_960x540.engine`。
+构建不再依赖 `build/aji_engine_path`，每次按当前 GPU 和 TensorRT 环境重新构建，
+成功后才替换同名引擎；构建失败保留原文件。
+这些引擎通过 `--engine` 直连模式使用；配置模式仍使用推理后端自己的哈希缓存名称。
 
 构建输出同时保存在 `.engine.build.log`；`.engine.label` 记录模型名和输入尺寸，
-供命令生成器展示。旧的 `balanced_1080p.engine` 等仍可通过直连模式使用，
-不会被自动改名或删除。引擎目录不再进行基于文件名后缀的自动清理。
+供命令生成器展示。已有哈希名称引擎不会被自动改名或删除，仍可通过直连模式使用。
+引擎目录不进行基于文件名后缀的自动清理。
+
+模型下载优先使用 `aria2c`（最多 4 连接，失败重试），未安装或下载失败时回退到 Python。
+`--ffmpeg` / `--venv` 安装步骤会安装 `aria2`，已有环境也可运行 `sudo apt-get install -y aria2`。
+下载显式设置兼容 CDN 的 User-Agent，避免默认 `Python-urllib` 请求被返回 HTTP 403；
+模型地址要求 HTTPS，保留证书验证、ONNX 校验、下载收据和镜像回退，失败时打印对应 URL。
 
 ## deploy.sh 的检测、版本选择与下载校验
 

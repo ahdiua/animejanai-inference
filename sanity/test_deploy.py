@@ -219,6 +219,43 @@ check_nvenc_and_patch() { NVENC_PRELOAD=''; return 0; }
 run_test_clip''', 1)
         self.assertIn(str(self.directory / 'models/my engine.engine'), (self.directory / 'encode-args').read_text().splitlines())
 
+    def prepare_engine_builder(self, status=0):
+        self.executable('venv/bin/python3', "printf 'input\\n'\n")
+        self.executable('trtexec', f'''printf '%s\\n' "$@" > "$AUDIT_DIR/build-args"
+for arg; do
+    case "$arg" in --saveEngine=*) printf new-engine > "${{arg#*=}}" ;; esac
+done
+exit {status}
+''')
+        (self.directory / 'models').mkdir()
+        (self.directory / 'models/my model.onnx').write_bytes(b'onnx')
+        return '''MODELS_DIR="$AUDIT_DIR/models"
+VENV_DIR="$AUDIT_DIR/venv"
+activate_build_environment() { :; }
+resolve_tensorrt() { TRTEXEC_BIN="$AUDIT_DIR/trtexec"; TRT_LIB_DIR="$AUDIT_DIR"; }
+ensure_model_python() { :; }
+'''
+
+    def test_engine_uses_readable_names_without_cache_helper(self):
+        setup = self.prepare_engine_builder()
+        for width, height, suffix in ((1920, 1080, '1080p'), (1280, 720, '720p'), (960, 540, '960x540')):
+            with self.subTest(suffix=suffix):
+                engine = self.directory / f'models/my model_{suffix}.engine'
+                engine.write_bytes(b'old-engine')
+                self.run_shell(setup + f'build_single_engine "$MODELS_DIR/my model.onnx" {width} {height} {suffix}')
+                self.assertEqual(engine.read_bytes(), b'new-engine')
+                self.assertEqual(Path(str(engine) + '.label').read_text(), f'my model ({width}x{height})\n')
+                self.assertIn(f'--optShapes=input:1x3x{height}x{width}', (self.directory / 'build-args').read_text())
+        self.assertEqual(list((self.directory / 'models').glob('.aji-engine.*')), [])
+
+    def test_failed_engine_rebuild_preserves_existing_engine(self):
+        setup = self.prepare_engine_builder(status=7)
+        engine = self.directory / 'models/my model_1080p.engine'
+        engine.write_bytes(b'old-engine')
+        self.run_shell(setup + 'build_single_engine "$MODELS_DIR/my model.onnx" 1920 1080 1080p', 1)
+        self.assertEqual(engine.read_bytes(), b'old-engine')
+        self.assertEqual(list((self.directory / 'models').glob('.aji-engine.*')), [])
+
     def test_legacy_profile_migration_preserves_user_lines(self):
         home = self.directory / 'home'
         home.mkdir()
@@ -284,6 +321,9 @@ class ModelDownloadTests(unittest.TestCase):
         self.validator = patch.object(downloader, 'validate_onnx')
         self.validator.start()
         self.addCleanup(self.validator.stop)
+        aria2_patch = patch.object(downloader.shutil, 'which', return_value=None)
+        self.aria2 = aria2_patch.start()
+        self.addCleanup(aria2_patch.stop)
 
     def request(self, content, url=None, length=None, expected=''):
         with patch.object(downloader.urllib.request.OpenerDirector, 'open', return_value=Response(content, length)) as mock:
@@ -303,6 +343,55 @@ class ModelDownloadTests(unittest.TestCase):
         mock.assert_not_called()
         self.request(b'model-b', url='https://example.test/b.onnx')
         self.assertEqual(self.destination.read_bytes(), b'model-b')
+
+    def test_python_download_sends_cdn_compatible_user_agent(self):
+        mock = self.request(b'model')
+        request = mock.call_args.args[0]
+        self.assertEqual(request.full_url, self.url)
+        self.assertEqual(request.get_header('User-agent'), 'Mozilla/5.0')
+
+    def fake_aria2(self, args, **kwargs):
+        directory = next(arg.split('=', 1)[1] for arg in args if arg.startswith('--dir='))
+        name = next(arg.split('=', 1)[1] for arg in args if arg.startswith('--out='))
+        (Path(directory) / name).write_bytes(b'aria2-model')
+
+    def test_aria2_preferred_and_validated_before_publish(self):
+        self.aria2.return_value = '/usr/bin/aria2c'
+        with patch.object(downloader.subprocess, 'run', side_effect=self.fake_aria2) as run:
+            mock = self.request(b'python-model')
+        mock.assert_not_called()
+        self.assertEqual(self.destination.read_bytes(), b'aria2-model')
+        self.assertEqual(run.call_args.args[0][-1], self.url)
+        downloader.validate_onnx.assert_called_once()
+
+    def test_aria2_failure_falls_back_to_python(self):
+        self.aria2.return_value = '/usr/bin/aria2c'
+        def fail(args, **kwargs):
+            self.fake_aria2(args)
+            raise subprocess.CalledProcessError(1, args)
+        with patch.object(downloader.subprocess, 'run', side_effect=fail):
+            mock = self.request(b'python-model')
+        mock.assert_called_once()
+        self.assertEqual(self.destination.read_bytes(), b'python-model')
+        self.assertEqual(list(self.destination.parent.glob('.aji-download-*')), [])
+
+    def test_invalid_aria2_download_preserves_existing_model(self):
+        self.aria2.return_value = '/usr/bin/aria2c'
+        self.destination.write_bytes(b'old-model')
+        with patch.object(downloader.subprocess, 'run', side_effect=self.fake_aria2):
+            with patch.object(downloader, 'validate_onnx', side_effect=ValueError('invalid ONNX')):
+                with self.assertRaises(RuntimeError):
+                    downloader.download(self.url, self.destination)
+        self.assertEqual(self.destination.read_bytes(), b'old-model')
+
+    def test_primary_failure_uses_mirror(self):
+        mirror = 'https://mirror.test/model.onnx'
+        with patch.object(downloader.urllib.request.OpenerDirector, 'open', side_effect=[
+                downloader.urllib.error.HTTPError(self.url, 403, 'Forbidden', {}, None),
+                Response(b'mirror-model')]) as mock:
+            downloader.download(self.url, self.destination, mirror=mirror)
+        self.assertEqual([call.args[0].full_url for call in mock.call_args_list], [self.url, mirror])
+        self.assertEqual(self.destination.read_bytes(), b'mirror-model')
 
     def test_local_corruption_redownloads(self):
         self.request(b'model-a')
