@@ -41,9 +41,19 @@ in a universal archive.
 The `Package Ubuntu 24.04 runtime` GitHub Actions workflow builds the `sm89`
 (Ada / RTX 40) and `sm120` (Blackwell / RTX 50) archives in parallel. After
 both packages pass checksum verification, every successful workflow run
-publishes them together as a GitHub prerelease. Workflow dispatches may supply
-a custom prerelease tag; otherwise the workflow generates a unique tag from
-the run number, attempt, and commit.
+publishes them together as a GitHub release. Branch runs publish prereleases;
+`v*` tag pushes publish stable releases. Workflow dispatches may supply a custom
+prerelease tag; otherwise the workflow generates a unique tag from the run
+number, attempt, and commit.
+
+After a prerelease publishes successfully, only the newest published prerelease
+is kept. Older prereleases, their attached archives, and their Git tags are
+deleted; stable releases and drafts are preserved. The `Prune old prereleases`
+workflow also supports manual cleanup and applies the policy when its workflow
+or script changes on `main`. Cleanup and publishing are serialized. For a local
+preview, set `GITHUB_REPOSITORY=ahdiua/animejanai-inference` and run
+`python3 scripts/prune-prereleases.py`; add `--apply` with `GH_TOKEN` configured
+to perform the deletions.
 
 Engines built on first use are fixed to the video's working resolution
 (`minShapes=optShapes=maxShapes`) and use

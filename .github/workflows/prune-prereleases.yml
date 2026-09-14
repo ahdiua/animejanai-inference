@@ -1,0 +1,25 @@
+name: Prune old prereleases
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/prune-prereleases.yml'
+      - 'scripts/prune-prereleases.py'
+
+permissions:
+  contents: write
+
+jobs:
+  prune:
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: runtime-release-maintenance
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Keep only the newest prerelease and its tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/prune-prereleases.py --apply

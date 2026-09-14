@@ -15,6 +15,7 @@ on:
       - '.github/workflows/package-ubuntu24-runtime.yml'
       - 'packaging/ubuntu24/**'
       - 'scripts/package-ubuntu24-runtime*.sh'
+      - 'scripts/prune-prereleases.py'
       - 'tools/convert_rife_fp16.py'
       - 'deploy.sh'
       - 'generate_cmd.sh'
@@ -70,6 +71,9 @@ jobs:
   release:
     name: Publish runtime release
     needs: package
+    concurrency:
+      group: runtime-release-maintenance
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -122,3 +126,15 @@ jobs:
           files: |
             release-assets/*.tar.zst
             release-assets/*.sha256
+
+      - name: Check out cleanup script
+        if: steps.release.outputs.prerelease == 'true'
+        uses: actions/checkout@v4
+        with:
+          path: cleanup-source
+
+      - name: Keep only the newest prerelease and its tag
+        if: steps.release.outputs.prerelease == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 cleanup-source/scripts/prune-prereleases.py --apply
