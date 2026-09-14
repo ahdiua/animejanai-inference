@@ -15,6 +15,7 @@ on:
       - '.github/workflows/package-ubuntu24-runtime.yml'
       - 'packaging/ubuntu24/**'
       - 'scripts/package-ubuntu24-runtime*.sh'
+      - 'sanity/test_package_download.py'
       - 'scripts/prune-prereleases.py'
       - 'tools/convert_rife_fp16.py'
       - 'deploy.sh'
@@ -43,6 +44,9 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v7
+
+      - name: Test download retry handling
+        run: python3 sanity/test_package_download.py
 
       - name: Build self-contained runtime archive
         run: |

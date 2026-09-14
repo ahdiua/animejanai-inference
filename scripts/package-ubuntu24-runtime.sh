@@ -112,10 +112,37 @@ run_root() {
 download() {
     local url="$1"
     local destination="$2"
-    echo "Downloading $(basename "${destination}")"
-    curl --fail --location --retry 4 --retry-delay 2 \
-        --output "${destination}.part" "${url}"
-    mv "${destination}.part" "${destination}"
+    local attempt request_url separator delay status=1
+    for attempt in 1 2 3 4 5; do
+        request_url="${url}"
+        # Ask GitHub for a fresh release redirect after a failed request instead
+        # of repeatedly fetching a potentially cached gateway error/expired URL.
+        if ((attempt > 1)) && [[ "${url}" == https://github.com/*/releases/download/* ]]; then
+            separator='?'
+            [[ "${url}" != *\?* ]] || separator='&'
+            request_url="${url}${separator}aji_retry=$(date +%s)-${RANDOM}-${attempt}"
+        fi
+        echo "Downloading $(basename "${destination}") (attempt ${attempt}/5): ${url}"
+        if curl --fail --location --connect-timeout 30 --speed-limit 1 --speed-time 60 \
+            --output "${destination}.part" "${request_url}"; then
+            if [[ -s "${destination}.part" ]]; then
+                mv "${destination}.part" "${destination}" || return 1
+                return 0
+            fi
+            echo "Empty download: ${url}" >&2
+            status=1
+        else
+            status=$?
+        fi
+        rm -f -- "${destination}.part"
+        if ((attempt < 5)); then
+            delay=$((5 * (1 << (attempt - 1))))
+            echo "Download failed (exit ${status}); retrying in ${delay}s: ${url}" >&2
+            sleep "${delay}"
+        fi
+    done
+    echo "Download failed after 5 attempts: ${url}" >&2
+    return "${status}"
 }
 
 install_dependencies() {

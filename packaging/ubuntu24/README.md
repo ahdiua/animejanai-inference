@@ -22,6 +22,11 @@ should remain inside the repository mount.
 By default, models already present below `onnx/` are reused. Missing models are
 downloaded. Override the source directory with `--models-dir`.
 
+Archive downloads retry up to five times with 5/10/20/40-second backoff.
+GitHub release retries add a fresh query parameter to avoid reusing cached
+gateway errors or expired redirects. Logs identify the failing URL, and only
+successful, nonempty downloads replace the destination file.
+
 Supported `--gpu-arch` values:
 
 | Value | Typical generation |
