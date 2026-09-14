@@ -2,6 +2,72 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## This fork: ahdiua/animejanai-inference
+
+`origin` is `ahdiua/animejanai-inference`; `upstream` is
+`the-database/animejanai-inference`. Develop on `dev`, integrate upstream there,
+then merge validated changes into `main` for fork releases. Push branches and
+release tags explicitly to `origin` only. Tags belong to each repository:
+creating `v0.9.1` in this fork does not create or change an upstream tag. Avoid
+`git push --mirror` or pushing all tags, since local tags can include upstream
+releases fetched for comparison.
+
+This fork adds an offline encoding and Ubuntu runtime workflow:
+
+- `deploy.sh`: interactive dependency diagnosis, CUDA 13.x / TensorRT 11.x
+  deployment, model downloads, engine building, and command generation.
+- `generate_cmd.sh`: source-engine or runtime-slot selection, serial queues for
+  multiple videos sharing processing settings, and generated shell scripts.
+  Generation does not execute the encoding jobs automatically.
+- `src/encode.c`: single-process RIFE plus upscaling, AV1 NVENC output,
+  progress FPS / estimated remaining time, and CUDA hardware-frame handling.
+  The generator selects NVENC split encoding for Ada and Blackwell.
+- Runtime model profiles include AnimeJaNai, Sharp/Compact, native 4x
+  RealESRGAN AnimeVideo-v3 (slot 2004), and APISR 2x RRDB GAN (slot 2005).
+  `tools/prepare_apisr.py` prepares the pinned APISR export; its profile requires
+  even input dimensions. See `packaging/ubuntu24/runtime/animejanai.conf` for
+  the packaged slot definitions.
+- `src/engine_cache.h` shares engine naming between the backend and
+  `aji_engine_path` (`src/engine_path.cpp`), which deployment uses. Preserve
+  existing engines: do not sweep model directories for other GPU/TRT cache
+  suffixes. Resolution-specific builds use fixed min/opt/max shapes and cache
+  separate engines for different working resolutions.
+
+### Fork documentation and validation
+
+Read `DEPLOY.md` for deployment, `README.md` for user-facing runtime usage,
+`packaging/ubuntu24/README.md` for packaging, and `BENCHMARKS.md` for performance
+context. The platform guides below describe the inherited upstream engine
+build; the fork runtime package has its own workflow and assets.
+
+For local validation, run `cmake --build build -j`, `./build/aji_encode --help`,
+and shell syntax checks for changed scripts. GPU or pixel-output changes need
+appropriate harness / parity or encoding checks; report when the GPU or the
+Windows/VapourSynth reference setup is unavailable. Keep local video inputs,
+generated task scripts, engines, model assets, build output, and experiment
+notes out of commits.
+
+### Fork runtime releases
+
+`.github/workflows/package-ubuntu24-runtime.yml` builds Ubuntu 24.04 x86_64
+archives for `sm89` (Ada) and `sm120` (Blackwell), with SHA-256 checksums. The
+packages include FFmpeg, CUDA/TensorRT runtime libraries, `trtexec`, the selected
+TensorRT builder resource, models, and launchers. The host still needs a
+compatible NVIDIA driver.
+
+The workflow runs on matching `dev` source changes, manual dispatch, or a
+`v*` tag push. Successful branch/manual runs publish prereleases; tag pushes
+publish stable releases in this fork. A manual `release_tag` remains a
+prerelease. Pushing `main` alone does not trigger this workflow. For a release,
+commit changes on `dev`, merge into `main`, create an annotated version tag on
+that merge, and push only the intended branches and tag to `origin`.
+
+`scripts/package-ubuntu24-runtime.sh` builds on Ubuntu 24.04;
+`scripts/package-ubuntu24-runtime-local.sh` wraps it in Docker/Podman elsewhere.
+The inherited `.github/workflows/build-linux.yml` instead builds the upstream
+mpv library bundle and pins its CI TensorRT to 11.3.0.99. That pin does not
+change the local TensorRT installation or the fork runtime workflow.
+
 ## What this repo is
 
 `libaji` — a standalone C-ABI inference engine for real-time anime upscaling and RIFE frame
@@ -20,7 +86,7 @@ ABI.
 
 - **[`docs/BUILD-WINDOWS.md`](docs/BUILD-WINDOWS.md)** — the Windows dependency setup and
   release build. **There is no Windows CI**: `aji-windows-x64.zip` is built and uploaded by hand
-  from this workstation, so this doc is the only record of how.
+  by the upstream maintainer; this fork does not automate Windows releases.
 - **[`docs/BUILD-LINUX.md`](docs/BUILD-LINUX.md)** — the Linux/WSL build, the CI workflow, and
   the parity harness.
 
@@ -85,6 +151,7 @@ and `<root>/lib/x86_64-linux-gnu`.
 | `aji_harness` | EXE | `aji`, `CUDA::cudart` | depends on `aji_trt` |
 | `aji_harness_dml` | EXE | `aji`, `d3d11` | **WIN32 only** |
 | `aji_encode` | EXE | `aji`, CUDA, ffmpeg libs | **conditional** — see below |
+| `aji_engine_path` | EXE | TensorRT, CUDA runtime | fork deployment/cache path helper |
 | `aji_kernel_test` | EXE | `CUDA::cudart` | kernel unit tests |
 
 **`aji_encode` is skipped silently** unless its ffmpeg dependency resolves. On Windows that
@@ -115,14 +182,14 @@ set(CMAKE_CUDA_ARCHITECTURES 75-real 80-real 86-real 89-real 90-real 100-real 12
 For local dev on one machine, `-DCMAKE_CUDA_ARCHITECTURES=120` (or `native`) is much faster to
 compile — the release list builds eight architectures.
 
-## Where the artifacts go
+## Where the upstream engine artifacts go
 
 | Platform | Built by | Asset |
 |---|---|---|
 | Linux | `.github/workflows/build-linux.yml` | `aji-linux-x64.tar.zst` |
 | Windows | **locally, by hand** (`docs/BUILD-WINDOWS.md`) | `aji-windows-x64.zip` |
 
-Both are attached to the **same release tag**, because the consumer derives both URLs from one
+In the upstream release process, both are attached to the **same release tag**, because the consumer derives both URLs from one
 `AjiVersion` constant. `the-database/mpv-AnimeJaNai`'s assembler downloads them in `InstallAji`
 and extracts them flat into `animejanai/inference/`.
 
@@ -144,11 +211,11 @@ branch is stale (ABI v4) and must not be used.
 
 ## Conventions
 
-- Commits: author `the-database`, short imperative subject, no co-author trailers.
-- `.gitignore` covers `build/`, `models/`, `*.engine`, and fixture binaries. The out-of-repo
-  Windows build dirs are excluded locally via `.git/info/exclude`
-  (`build-win/`, `build-win-trt11/`, `aji-build*/`) — note `build-win-release/` is in **neither**,
-  so it shows up as untracked.
+- Commits: use the configured Git identity and focused Conventional Commit
+  subjects, e.g. `fix(encode): ...` or `docs(fork): ...`.
+- `.gitignore` covers `build/`, `build-runtime-*/`, `dist/`, `models/`,
+  `*.engine`, fixture binaries, `/MEMORY.md`, `build-win-release/`, and
+  `build-win-trt11*/`. Other local build paths may need local exclusions.
 - ONNX models for the DirectML backend must be **opset ≤ 21**: the bundled ORT DirectML EP only
   registers `Conv`/`PReLU` kernels through opset 21, and a model exported at opset ≥ 22 silently
   falls back to the CPU EP (roughly 2000× slower per frame, which looks like a hang). Verify
