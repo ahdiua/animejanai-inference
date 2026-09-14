@@ -62,6 +62,15 @@ prerelease. Pushing `main` alone does not trigger this workflow. For a release,
 commit changes on `dev`, merge into `main`, create an annotated version tag on
 that merge, and push only the intended branches and tag to `origin`.
 
+After a successful prerelease upload, cleanup keeps the newest published
+prerelease and removes older prereleases, their assets, and their Git tags.
+Stable releases and drafts are excluded. `Prune old prereleases` can also be
+run manually, and runs when its workflow or script changes on `main` to apply
+the retention policy to existing releases. Publishing and cleanup share a
+concurrency group so they do not overlap. `scripts/prune-prereleases.py` defaults
+to a read-only preview; `--apply` performs deletions in `GITHUB_REPOSITORY` using
+`GH_TOKEN`. Release age is based on publication time, not commit time.
+
 `scripts/package-ubuntu24-runtime.sh` builds on Ubuntu 24.04;
 `scripts/package-ubuntu24-runtime-local.sh` wraps it in Docker/Podman elsewhere.
 The inherited `.github/workflows/build-linux.yml` instead builds the upstream
