@@ -338,9 +338,28 @@ copy_model \
     "https://r2.ahdiua.com/2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo.onnx" \
     "ded46591ddfaeb22b3daaf84ad7b36838335aa3efca66acfa36177ce4ab21eb5"
 copy_model \
-    "RealESRGANv2-animevideo-xsx2-v0.2.3.0-fp16-dynamic.onnx" \
-    "https://r2.ahdiua.com/RealESRGANv2-animevideo-xsx2-v0.2.3.0-fp16-dynamic.onnx" \
-    "885b5abb8d7203b2cedea8c678913432ce146dca60109e2532bb5fcb53656fd5"
+    "realesr-animevideov3-v0.2.5.0-fp16-dynamic.onnx" \
+    "https://r2.ahdiua.com/realesr-animevideov3-v0.2.5.0-fp16-dynamic.onnx" \
+    "d584ed9c21a2c2448d96d5e3e0a2d719a0e573d36eb4244cb07e68be96e3a0ab"
+
+prepare_apisr_model() {
+    local model_name="2x_APISR_RRDB_GAN_fp16.onnx"
+    local staged_path="${STAGE_ROOT}/onnx/${model_name}"
+    local candidate
+    for candidate in "${LOCAL_MODELS_DIR}/${model_name}" "${PROJECT_ROOT}/models/${model_name}"; do
+        if [[ -s "${candidate}" ]]; then
+            cp -aL "${candidate}" "${staged_path}"
+            return
+        fi
+    done
+    local python_env="${WORK_DIR}/apisr-converter"
+    python3 -m venv "${python_env}"
+    "${python_env}/bin/python" -m pip install --disable-pip-version-check onnx
+    "${python_env}/bin/python" "${PROJECT_ROOT}/tools/prepare_apisr.py" \
+        --output "${staged_path}"
+}
+
+prepare_apisr_model
 
 prepare_rife_model() {
     local version="$1"

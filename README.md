@@ -174,6 +174,8 @@ RTX 50/Blackwell 使用 `-split_encode_mode 3`。选择 RIFE-only Slot 或
 | `2001` | Sharp Balanced 超分 |
 | `2002` | Sharp Performance 超分 |
 | `2003` | SD Compact 超分 |
+| `2004` | RealESRGAN AnimeVideo-v3 4× 超分 |
+| `2005` | APISR RRDB GAN 2× 超分 |
 | `2025` / `2026` | 仅 RIFE v4.25 / v4.26 2x 插帧 |
 | `3025` / `3026` | Performance 超分 + RIFE 2x 插帧 |
 
@@ -211,6 +213,53 @@ AJI_SLOT=3026 ./aji_encode \
 
 产物位于 `dist/`。详细的架构列表和打包说明见
 [`packaging/ubuntu24/README.md`](packaging/ubuntu24/README.md)。
+
+## APISR 2× RRDB GAN（可选）
+
+使用 Slot `2005`，仅做 2× 超分。源码环境使用独立配置 `apisr-animejanai.conf`。
+
+交互式测试：
+
+1. 运行 `./deploy.sh --models`，选择 **9：APISR**。如希望编码时自动构建引擎，
+   分辨率菜单选择 **4：仅下载模型**。
+2. 运行 `./generate_cmd.sh`，源码环境的处理方案选择 **2：APISR**；
+   Runtime 环境选择 **12：APISR**。
+3. 设置测试片段及输出后，运行生成的 `bash ./run_encode.sh`。
+
+也可以单独准备模型：
+在仓库根目录准备模型：
+
+```sh
+python3 -m venv /tmp/aji-apisr-venv
+/tmp/aji-apisr-venv/bin/python -m pip install onnx
+/tmp/aji-apisr-venv/bin/python tools/prepare_apisr.py
+```
+
+脚本下载 [Xenova 的 APISR FP16 ONNX 导出](https://huggingface.co/Xenova/2x_APISR_RRDB_GAN_generator-onnx)
+的固定版本并校验 SHA256，移除 FP32 输入输出转换，将接口适配为
+`input` / `output`、FP16、NCHW、batch=1。内部权重和算子保持原样。
+产物为 `models/2x_APISR_RRDB_GAN_fp16.onnx`，不纳入 Git。
+已有该版本的 `model_fp16.onnx` 时，可传 `--source /path/to/model_fp16.onnx`；
+`--output` 可指定其他输出路径，脚本拒绝覆盖已有文件。
+
+本地构建后运行：
+
+```sh
+./build/aji_encode --input /path/to/input.mkv --output /path/to/output_apisr.mkv \
+  --conf apisr-animejanai.conf --slot 2005 --model-dir models \
+  --trtexec /path/to/trtexec --decoder nvdec --vcodec hevc_nvenc \
+  --pix-fmt yuv420p10
+```
+
+将 `--trtexec` 替换为实际路径。首次使用会按输入尺寸自动构建引擎。
+输入宽高必须为偶数，输出宽高各为输入的两倍；当前不额外补边或分块。
+新版 Runtime 包已包含 APISR 模型及 Slot `2005`，可直接选择该 Slot。
+模型来源及其许可信息见上述模型卡和 [APISR 原项目](https://github.com/Kiteretsu77/APISR)。
+接入冒烟检查（2026-09-11）：RTX 4070 SUPER、CUDA 13.3、TensorRT 11.2.1
+下成功构建 32×32 引擎，`aji_harness` 单帧 NV12 输入得到 64×64 输出；
+ONNX Runtime 通过两种小尺寸的 FP16 接口、输出尺寸和有限值检查，
+配置解析确认 Slot 2005 能找到模型且关闭 RIFE。DirectML 尚未实测，
+性能与画质评估另行进行。
 
 ## Engine
 

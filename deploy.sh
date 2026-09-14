@@ -37,7 +37,7 @@ URL_ANIMEJANAI_V31_BAL="https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1_Balanced_SPA
 URL_ANIMEJANAI_V31_PERF_SHARP="https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1Sharp1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx"
 URL_ANIMEJANAI_V31_BAL_SHARP="https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1Sharp1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx"
 URL_ANIMEJANAI_SD_COMPACT="https://r2.ahdiua.com/2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo.onnx"
-URL_REALESRGAN_ANIMEVIDEO_XSX2="https://r2.ahdiua.com/RealESRGANv2-animevideo-xsx2-v0.2.3.0-fp16-dynamic.onnx"
+URL_REALESRGAN_ANIMEVIDEO_V3="https://r2.ahdiua.com/realesr-animevideov3-v0.2.5.0-fp16-dynamic.onnx"
 
 # Real-ESRGAN Anime 6B 经典动漫模型 (Hugging Face / HF-Mirror)
 DEFAULT_ONNX_REALESRGAN_ANIME6B_URL="https://huggingface.co/deepghs/imgutils-models/resolve/main/real_esrgan/RealESRGAN_x4plus_anime_6B.onnx"
@@ -909,12 +909,33 @@ download_animejanai_models() {
     download_model_file "$bal_sharp_dest" "$URL_ANIMEJANAI_V31_BAL_SHARP" "" "AnimeJaNai V3.1 Sharp1 Balanced (2x)"
 }
 
+prepare_apisr_model() {
+    local target_path="${MODELS_DIR}/2x_APISR_RRDB_GAN_fp16.onnx"
+    if [ -s "$target_path" ]; then
+        echo -e "${GREEN}✔ 已存在 APISR 2x RRDB GAN: ${target_path}${NC}"
+        return 0
+    fi
+    local local_model="${PROJECT_ROOT}/models/2x_APISR_RRDB_GAN_fp16.onnx"
+    if [ -s "$local_model" ]; then
+        cp "$local_model" "$target_path" || return 1
+    else
+        if [ ! -x "$VENV_DIR/bin/python3" ]; then
+            python3 -m venv "$VENV_DIR" || return 1
+        fi
+        if ! "$VENV_DIR/bin/python3" -c 'import onnx' 2>/dev/null; then
+            "$VENV_DIR/bin/python3" -m pip install onnx || return 1
+        fi
+        "$VENV_DIR/bin/python3" "${PROJECT_ROOT}/tools/prepare_apisr.py" \
+            --output "$target_path" || return 1
+    fi
+    echo -e "${GREEN}✔ APISR 已准备好，可在 generate_cmd.sh 中选择 APISR 自动构建引擎。${NC}"
+}
+
 # 单模型 Engine 构建函数
 build_single_engine() {
     local onnx_path="$1"
     local opt_w="$2"
     local opt_h="$3"
-    local engine_suffix="$4"
 
     if [ ! -s "$onnx_path" ]; then
         echo -e "${RED}[错误] ONNX 文件不存在或为空: ${onnx_path}${NC}"
@@ -922,27 +943,38 @@ build_single_engine() {
     fi
 
     local model_basename="$(basename "$onnx_path" .onnx)"
-    local engine_path="${MODELS_DIR}/${model_basename}_${engine_suffix}.engine"
+    local engine_path
 
     # 动态获取 ONNX 模型的第一个输入节点名称 (默认为 input)
     local input_name="input"
     if [ -f "$VENV_DIR/bin/python3" ]; then
-        local detected_name=$("$VENV_DIR/bin/python3" -c "
+        local detected_name=$("$VENV_DIR/bin/python3" - "$onnx_path" 2>/dev/null <<'PYONNX'
 import onnx, sys
 try:
-    m = onnx.load('$onnx_path')
+    m = onnx.load(sys.argv[1])
     print(m.graph.input[0].name)
 except:
     print('input')
-" 2>/dev/null || echo "input")
+PYONNX
+)
         [ -n "$detected_name" ] && input_name="$detected_name"
     fi
 
-    # 检测 trtexec 是否支持 --fp16 参数 (TensorRT 11+ 已移除 --fp16 选项，默认为强类型模式)
-    local fp16_arg=()
-    if trtexec --help 2>&1 | grep -q -- "--fp16"; then
-        fp16_arg=("--fp16")
+    local path_tool="${PROJECT_ROOT}/build/aji_engine_path"
+    if [ ! -x "$path_tool" ]; then
+        echo -e "${RED}缺少 aji_engine_path，请先运行 ./deploy.sh --build 更新构建工具。${NC}"
+        return 1
     fi
+    local cache_info
+    cache_info=$("$path_tool" "$onnx_path" "$MODELS_DIR" "$opt_w" "$opt_h" "$input_name") || return 1
+    engine_path=${cache_info%%$'\n'*}
+    if [ -s "$engine_path" ]; then
+        printf '%s (%sx%s)\n' "$model_basename" "$opt_w" "$opt_h" > "${engine_path}.label"
+        echo -e "${GREEN}✔ 已存在相同模型、尺寸及设备的引擎: ${engine_path}${NC}"
+        return 0
+    fi
+    local build_log="${engine_path}.build.log"
+    local timing_cache="${MODELS_DIR}/${model_basename}.timing.cache"
 
     echo -e "\n${CYAN}==============================================================================${NC}"
     echo -e "正在调用 trtexec 为当前 GPU 构建 TensorRT Engine..."
@@ -950,7 +982,7 @@ except:
     echo -e "  - 输入节点:     ${input_name}"
     echo -e "  - 固定输入:     ${opt_w}x${opt_h} (min/opt/max: 1x3x${opt_h}x${opt_w})"
     echo -e "  - 输出 Engine:  ${engine_path}"
-    echo -e "构建大约需要 1-3 分钟，请稍候...\n"
+    echo -e "构建日志: ${build_log}；首次构建可能耗时较长。\n"
 
     trtexec \
         --onnx="$onnx_path" \
@@ -958,16 +990,19 @@ except:
         --optShapes="${input_name}:1x3x${opt_h}x${opt_w}" \
         --maxShapes="${input_name}:1x3x${opt_h}x${opt_w}" \
         --builderOptimizationLevel=5 \
-        "${fp16_arg[@]}" \
         --skipInference \
-        --saveEngine="$engine_path"
+        --timingCacheFile="$timing_cache" \
+        --saveEngine="$engine_path" 2>&1 | tee "$build_log"
+    local build_status=${PIPESTATUS[0]}
 
-    if [ $? -eq 0 ] && [ -f "$engine_path" ]; then
+    if [ "$build_status" -eq 0 ] && [ -s "$engine_path" ]; then
+        printf '%s (%sx%s)\n' "$model_basename" "$opt_w" "$opt_h" > "${engine_path}.label"
         echo -e "\n${GREEN}✔ TensorRT Engine 构建成功！${NC}"
         echo -e "  Engine 路径: ${BOLD}${engine_path}${NC} ($(du -h "$engine_path" | cut -f1))"
         return 0
     else
-        echo -e "\n${RED}[错误] trtexec 构建 Engine 失败！如果显存不足请关闭其他占用显存的进程。${NC}"
+        rm -f -- "$engine_path"
+        echo -e "\n${RED}[错误] trtexec 构建 Engine 失败！详情见 ${build_log}。${NC}"
         return 1
     fi
 }
@@ -985,8 +1020,7 @@ download_and_build_engine() {
     local perf_sharp_onnx="${MODELS_DIR}/performance_sharp1.onnx"
     local balanced_sharp_onnx="${MODELS_DIR}/balanced_sharp1.onnx"
     local sd_compact_onnx="${MODELS_DIR}/sd_compact.onnx"
-    local animevideo_xsx2_onnx="${MODELS_DIR}/realesrgan_animevideo_xsx2.onnx"
-    local animevideo_onnx="${MODELS_DIR}/realesr_animevideov3.onnx"
+    local animevideo_onnx="${MODELS_DIR}/realesr-animevideov3-v0.2.5.0-fp16-dynamic.onnx"
     local anime6b_onnx="${MODELS_DIR}/realesrgan_anime6b.onnx"
 
     echo -e "请选择操作："
@@ -995,10 +1029,10 @@ download_and_build_engine() {
     echo -e "  ${BOLD}3)${NC} 获取 AnimeJaNai V3.1 Balanced (2x, 均衡推荐)"
     echo -e "  ${BOLD}4)${NC} 获取 AnimeJaNai V3.1 Sharp1 (2x, 清晰锐化增强版)"
     echo -e "  ${BOLD}5)${NC} 获取 AnimeJaNai SD Compact (2x, 标清老番修复版)"
-    echo -e "  ${BOLD}6)${NC} 获取原版 RealESRGANv2 AnimeVideo XS (原生 2x, 动漫视频模型)"
-    echo -e "  ${BOLD}7)${NC} 获取 RealESRGAN AnimeVideoV3 (2x/4x, 专为动漫视频优化的轻量视频模型)"
-    echo -e "  ${BOLD}8)${NC} 下载 Real-ESRGAN Anime 6B (4x, 经典原版动漫模型)"
-    echo -e "  ${BOLD}9)${NC} 自定义 ONNX 模型下载链接 / 本地已有路径"
+    echo -e "  ${BOLD}6)${NC} 获取 RealESRGAN AnimeVideo-v3 (原生 4x, 动漫视频轻量模型)"
+    echo -e "  ${BOLD}7)${NC} 下载 Real-ESRGAN Anime 6B (4x, 经典原版动漫模型)"
+    echo -e "  ${BOLD}8)${NC} 自定义 ONNX 模型下载链接 / 本地已有路径"
+    echo -e "  ${BOLD}9)${NC} 获取 APISR 2x RRDB GAN (FP16)"
     read -rp "请输入选项 [1-9, 默认 1]: " model_choice
     model_choice=${model_choice:-1}
 
@@ -1027,23 +1061,14 @@ download_and_build_engine() {
             target_onnx_list=("$sd_compact_onnx")
             ;;
         6)
-            download_model_file "$animevideo_xsx2_onnx" "$URL_REALESRGAN_ANIMEVIDEO_XSX2" "" "RealESRGANv2 AnimeVideo XS (原生 2x)"
-            target_onnx_list=("$animevideo_xsx2_onnx")
+            download_model_file "$animevideo_onnx" "$URL_REALESRGAN_ANIMEVIDEO_V3" "" "RealESRGAN AnimeVideo-v3 (原生 4x)"
+            target_onnx_list=("$animevideo_onnx")
             ;;
         7)
-            read -rp "请输入 RealESRGAN AnimeVideoV3 ONNX 下载 URL 或本地已有路径: " v3_input
-            if [ -f "$v3_input" ]; then
-                target_onnx_list=("$v3_input")
-            else
-                download_model_file "$animevideo_onnx" "$v3_input" "" "RealESRGAN AnimeVideoV3"
-                target_onnx_list=("$animevideo_onnx")
-            fi
-            ;;
-        8)
             download_model_file "$anime6b_onnx" "$DEFAULT_ONNX_REALESRGAN_ANIME6B_URL" "$DEFAULT_ONNX_REALESRGAN_ANIME6B_MIRROR" "Real-ESRGAN Anime 6B (4x)"
             target_onnx_list=("$anime6b_onnx")
             ;;
-        9)
+        8)
             read -rp "请输入 ONNX 下载 URL 或本地绝对路径: " custom_input
             if [ -f "$custom_input" ]; then
                 target_onnx_list=("$custom_input")
@@ -1052,6 +1077,10 @@ download_and_build_engine() {
                 download_model_file "$custom_dest" "$custom_input" "" "Custom Model"
                 target_onnx_list=("$custom_dest")
             fi
+            ;;
+        9)
+            prepare_apisr_model || return 1
+            target_onnx_list=("${MODELS_DIR}/2x_APISR_RRDB_GAN_fp16.onnx")
             ;;
         *)
             echo -e "${RED}无效输入，返回。${NC}"
@@ -1091,6 +1120,14 @@ download_and_build_engine() {
             return 0
             ;;
     esac
+
+    if [ "$model_choice" = 9 ]; then
+        if ! [[ "$opt_w" =~ ^[0-9]+$ && "$opt_h" =~ ^[0-9]+$ ]] ||
+           (( 10#$opt_w < 2 || 10#$opt_h < 2 || 10#$opt_w % 2 || 10#$opt_h % 2 )); then
+            echo -e "${RED}APISR 要求输入宽高为不小于 2 的偶数。${NC}"
+            return 1
+        fi
+    fi
 
     if [ ${#target_onnx_list[@]} -gt 1 ]; then
         echo -e "\n检测到已获取多个模型，请选择构建策略："

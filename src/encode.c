@@ -140,17 +140,42 @@ static void av_log_cb(void *p, int level, const char *fmt, va_list ap)
 }
 
 static void progress(const char *phase, long long frame, long long total,
-                     double fps, int pct)
+                     double fps, int pct, long long eta_seconds)
 {
     if (g_progress == PROG_NONE)
         return;
-    if (g_progress == PROG_JSON)
+    if (g_progress == PROG_JSON) {
         printf("{\"phase\":\"%s\",\"frame\":%lld,\"total\":%lld,"
-               "\"fps\":%.2f,\"pct\":%d}\n", phase, frame, total, fps, pct);
-    else
-        printf("PROGRESS phase=%s frame=%lld total=%lld fps=%.2f pct=%d\n",
-               phase, frame, total, fps, pct);
+               "\"fps\":%.2f,\"pct\":%d,\"eta_seconds\":", phase, frame,
+               total, fps, pct);
+        if (eta_seconds >= 0)
+            printf("%lld", eta_seconds);
+        else
+            printf("null");
+        printf("}\n");
+    } else if (eta_seconds >= 0) {
+        long long hours = eta_seconds / 3600;
+        long long minutes = (eta_seconds % 3600) / 60;
+        long long seconds = eta_seconds % 60;
+        printf("PROGRESS phase=%s frame=%lld total=%lld fps=%.2f pct=%d "
+               "eta=%02lld:%02lld:%02lld\n", phase, frame, total, fps, pct,
+               hours, minutes, seconds);
+    } else {
+        printf("PROGRESS phase=%s frame=%lld total=%lld fps=%.2f pct=%d "
+               "eta=unknown\n", phase, frame, total, fps, pct);
+    }
     fflush(stdout);
+}
+
+static long long estimate_eta(long long frame, long long total, double fps)
+{
+    if (total <= 0 || frame < 0 || fps <= 0.0)
+        return -1;
+    if (frame >= total)
+        return 0;
+
+    /* Round up so the display does not claim zero seconds while work remains. */
+    return (long long)(((double)(total - frame) / fps) + 0.999999);
 }
 
 /* ---- colorimetry mapping (AVFrame/codecpar -> aji enums) ----------------- */
@@ -456,7 +481,7 @@ static int init_aji(enc_ctx *c)
     c->aji = aji_create(&p);
     if (!c->aji) { loge("aji_create failed"); return -1; }
 
-    progress("build_engine", 0, 0, 0, 0);
+    progress("build_engine", 0, 0, 0, 0, -1);
     int ow = 0, oh = 0;
     int act = aji_configure(c->aji, c->src_w, c->src_h, av_q2d(c->out_fps),
                             &ow, &oh);
@@ -464,7 +489,7 @@ static int init_aji(enc_ctx *c)
         loge("aji_configure: %d: %s", act, aji_last_error(c->aji));
         return -1;
     }
-    progress("build_engine", 0, 0, 0, 100);
+    progress("build_engine", 0, 0, 0, 100, 0);
     loge("%s", aji_current_log(c->aji));
 
     if (act == 0) {
@@ -781,6 +806,7 @@ fail:
 
 static int init_resize(enc_ctx *c, AVFrame *first)
 {
+    AVBufferSrcParameters *bp = NULL;
     if (!c->graph) {
         if (!avfilter_get_by_name("scale_cuda")) {
             loge("--final-resize requested but scale_cuda filter unavailable");
@@ -789,19 +815,29 @@ static int init_resize(enc_ctx *c, AVFrame *first)
         c->graph = avfilter_graph_alloc();
         if (!c->graph) return -1;
 
-        char args[512];
+        if (first->format != AV_PIX_FMT_CUDA || !first->hw_frames_ctx) {
+            loge("--final-resize requires a CUDA frame with hw_frames_ctx");
+            goto fail;
+        }
         AVStream *vst = c->ifmt->streams[c->vstream];
-        snprintf(args, sizeof args,
-                 "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=1/1",
-                 first->width, first->height, AV_PIX_FMT_CUDA,
-                 vst->time_base.num, vst->time_base.den);
-        AV(avfilter_graph_create_filter(&c->buf_src,
-                avfilter_get_by_name("buffer"), "in", args, NULL, c->graph));
+        /* create_filter initializes immediately, but CUDA buffer sources
+         * require hw_frames_ctx during initialization. Allocate, set all
+         * parameters (including the frame pool), then initialize explicitly. */
+        c->buf_src = avfilter_graph_alloc_filter(c->graph,
+                avfilter_get_by_name("buffer"), "in");
+        if (!c->buf_src) goto fail;
 
-        AVBufferSrcParameters *bp = av_buffersrc_parameters_alloc();
+        bp = av_buffersrc_parameters_alloc();
+        if (!bp) goto fail;
+        bp->format = first->format;
+        bp->width = first->width;
+        bp->height = first->height;
+        bp->time_base = vst->time_base;
+        bp->sample_aspect_ratio = (AVRational){1, 1};
         bp->hw_frames_ctx = first->hw_frames_ctx;
         AV(av_buffersrc_parameters_set(c->buf_src, bp));
-        av_free(bp);
+        av_freep(&bp);
+        AV(avfilter_init_str(c->buf_src, NULL));
 
         AV(avfilter_graph_create_filter(&c->buf_sink,
                 avfilter_get_by_name("buffersink"), "out", NULL, NULL,
@@ -819,6 +855,10 @@ static int init_resize(enc_ctx *c, AVFrame *first)
     }
     return 0;
 fail:
+    av_freep(&bp);
+    avfilter_graph_free(&c->graph);
+    c->buf_src = NULL;
+    c->buf_sink = NULL;
     return -1;
 }
 
@@ -924,12 +964,12 @@ static int emit_output(enc_ctx *c, AVFrame *cuda_out)
         double elapsed_sec = (double)(now_us - c->start_time_us) / 1000000.0;
         double cur_fps = (elapsed_sec > 0.001) ? ((double)c->out_frames / elapsed_sec) : 0.0;
 
-        int pct = c->src_frames_est ? (int)(c->out_frames * 100 /
-                  (c->src_frames_est * (c->rife ? c->rnum : 1) /
-                   (c->rife ? c->rden : 1))) : 0;
-        progress("encode", c->out_frames,
-                 c->src_frames_est * (c->rife ? c->rnum : 1) /
-                 (c->rife ? c->rden : 1), cur_fps, pct > 100 ? 100 : pct);
+        long long total = c->src_frames_est * (c->rife ? c->rnum : 1) /
+                          (c->rife ? c->rden : 1);
+        int pct = total ? (int)(c->out_frames * 100 / total) : 0;
+        progress("encode", c->out_frames, total, cur_fps,
+                 pct > 100 ? 100 : pct,
+                 estimate_eta(c->out_frames, total, cur_fps));
     }
     rc = 0;
 done:
@@ -1318,7 +1358,7 @@ static int run(enc_ctx *c)
     }
     int64_t total_time_us = (c->start_time_us > 0) ? (av_gettime_relative() - c->start_time_us) : 0;
     double avg_fps = (total_time_us > 1000) ? ((double)c->out_frames / (total_time_us / 1000000.0)) : 0.0;
-    progress("encode", c->out_frames, c->out_frames, avg_fps, 100);
+    progress("encode", c->out_frames, c->out_frames, avg_fps, 100, 0);
     rc = 0;
 done:
 fail:

@@ -7,3 +7,6 @@ fixtures/*.png
 fixtures/*.mkv
 sanity/saxpy
 *.engine
+/MEMORY.md
+build-win-release/
+build-win-trt11*/
