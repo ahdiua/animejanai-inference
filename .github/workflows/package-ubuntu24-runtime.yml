@@ -42,7 +42,7 @@ jobs:
       PACKAGE_VERSION: ${{ inputs.release_tag || github.ref_name }}-${{ github.sha }}
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Build self-contained runtime archive
         run: |
@@ -58,7 +58,7 @@ jobs:
           tar --zstd -tf dist/*.tar.zst | sed -n '1,160p'
 
       - name: Upload Actions artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: animejanai-ubuntu24-x86_64-sm${{ matrix.gpu_arch }}
           path: |
@@ -79,7 +79,7 @@ jobs:
       contents: write
     steps:
       - name: Download runtime archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: animejanai-ubuntu24-x86_64-sm*
           path: release-assets
@@ -129,7 +129,7 @@ jobs:
 
       - name: Check out cleanup script
         if: steps.release.outputs.prerelease == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: cleanup-source
 
