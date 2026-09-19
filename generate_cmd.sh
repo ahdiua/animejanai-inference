@@ -303,6 +303,9 @@ probe_input_video() {
 
 # 3. 选择/匹配 TensorRT Engine 模型 (自动真实路径去重)
 select_engine() {
+    # An explicitly selected engine must always use direct mode, even if a
+    # previous profile selection enabled configuration-based model loading.
+    USE_RUNTIME_CONFIG=0
     echo -e "${BOLD}${CYAN}[步骤 2/8] 选择超分 TensorRT Engine 模型${NC}"
 
     local search_dirs=("$MODELS_DIR" "$PROJECT_ROOT" "$HOME" "/root/models" "/root")

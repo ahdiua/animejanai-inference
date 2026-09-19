@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Output selection regression tests; no GPU or encoding required."""
 import os
+import json
 from pathlib import Path
 import shlex
 import subprocess
@@ -35,6 +36,35 @@ class OutputPathTests(unittest.TestCase):
             return result.stdout + result.stderr
         values = result_file.read_bytes().decode().split('\0')[:-1]
         return values[:-1], values[-1]
+
+    def test_selected_engine_overrides_config_in_generated_command(self):
+        engine = self.directory / '2x_APISR_RRDB_GAN_fp16_1080p.engine'
+        engine.write_bytes(b'fixture')
+        argv_file = self.directory / 'argv.json'
+        encoder = self.directory / 'fake_encode'
+        encoder.write_text('#!/usr/bin/env python3\nimport json, sys\n'
+                           + f'open({str(argv_file)!r}, "w").write(json.dumps(sys.argv[1:]))\n')
+        encoder.chmod(0o755)
+        q = shlex.quote
+        body = SOURCE + f"\nPROJECT_ROOT={q(str(self.directory))}\n"
+        body += f"MODELS_DIR={q(str(self.directory))}\n"
+        # Isolate engine discovery from the machine's real model directories.
+        body += f"find() {{ printf '%s\\n' {q(str(engine))}; }}\n"
+        body += "USE_RUNTIME_CONFIG=1\nselect_engine <<< 1 || exit $?\n"
+        body += f"INPUT_VIDEOS=({q(self.inputs[0])})\n"
+        body += f"OUTPUT_VIDEOS=({q(str(self.directory / 'out.mkv'))})\n"
+        body += "SOURCE_WIDTHS=(1920)\nSOURCE_HEIGHTS=(1080)\nIS_CLIP=0\nRIFE_ENABLED=0\n"
+        body += f"AJI_ENCODE_BIN={q(str(encoder))}\n"
+        body += "generate_final_command_and_script || exit $?\n"
+        body += f"bash {q(str(self.directory / 'run_encode.sh'))}\n"
+        result = subprocess.run(['bash', '-c', body], capture_output=True,
+                                text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        args = json.loads(argv_file.read_text())
+        self.assertEqual(args[args.index('--engine') + 1], str(engine))
+        self.assertNotIn('--conf', args)
+        self.assertNotIn('--trtexec', args)
+        self.assertNotIn('--slot', args)
 
     def test_batch_default_needs_one_path_answer(self):
         outputs, overwrite = self.select('\n\n')

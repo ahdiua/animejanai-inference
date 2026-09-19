@@ -127,7 +127,7 @@ static void loge(const char *fmt, ...)
 static void aji_log_cb(void *opaque, int level, const char *msg)
 {
     (void)opaque;
-    if (level <= 2)
+    if (level <= 2 || strncmp(msg, "[engine-build]", 14) == 0)
         loge("[aji:%d] %s", level, msg);
 }
 
@@ -481,7 +481,9 @@ static int init_aji(enc_ctx *c)
     c->aji = aji_create(&p);
     if (!c->aji) { loge("aji_create failed"); return -1; }
 
-    progress("build_engine", 0, 0, 0, 0, -1);
+    progress("init_engine", 0, 0, 0, 0, -1);
+    if (c->o.engine)
+        loge("Loading existing upscale engine: %s", c->o.engine);
     int ow = 0, oh = 0;
     int act = aji_configure(c->aji, c->src_w, c->src_h, av_q2d(c->out_fps),
                             &ow, &oh);
@@ -489,7 +491,7 @@ static int init_aji(enc_ctx *c)
         loge("aji_configure: %d: %s", act, aji_last_error(c->aji));
         return -1;
     }
-    progress("build_engine", 0, 0, 0, 100, 0);
+    progress("init_engine", 0, 0, 0, 100, 0);
     loge("%s", aji_current_log(c->aji));
 
     if (act == 0) {

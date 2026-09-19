@@ -605,11 +605,16 @@ bool build_engine(aji_ctx *c, const std::string &onnx_name,
     c->log_steps.push_back("Building TensorRT engine for " + onnx_name +
                            " for " + spec.res +
                            " (first play at this resolution)");
+    c->logger.log(nvinfer1::ILogger::Severity::kINFO,
+        ("[engine-build] Starting trtexec for " + onnx_name + " (" + spec.res +
+         "); log: " + spec.log_path).c_str());
     if (!run_build_spec(spec, &c->build_child)) {
         c->set_error("trtexec failed building engine for %s (see %s)",
                      onnx_name.c_str(), spec.log_path.c_str());
         return false;
     }
+    c->logger.log(nvinfer1::ILogger::Severity::kINFO,
+        ("[engine-build] Completed: " + engine_path).c_str());
     return true;
 }
 
