@@ -623,38 +623,48 @@ select_output_path() {
     echo -e "${BOLD}${CYAN}[步骤 5/8] 设置输出文件路径 (Output Destination)${NC}"
 
     OUTPUT_VIDEOS=()
-    local existing canonical_output
-    for INPUT_VIDEO in "${INPUT_VIDEOS[@]}"; do
-        printf '\n输入视频: %s\n' "$INPUT_VIDEO"
-        local dir_name="$(dirname "$INPUT_VIDEO")"
-        local base_name="$(basename "$INPUT_VIDEO")"
-        local raw_name="${base_name%.*}"
+    local existing canonical_output user_out overwrite_choice
+    local batch_dir='' suffix='' dir_name base_name raw_name default_out
+    if [ "$IS_CLIP" -eq 1 ]; then
+        suffix="_clip_${CLIP_DURATION}s"
+    fi
+    if [ "$RIFE_ENABLED" -eq 1 ]; then
+        suffix+="_rife${RIFE_FACTOR}x"
+    fi
+    if [ "$UPSCALE_ENABLED" -eq 1 ] || [ "$RIFE_ENABLED" -eq 0 ]; then
+        suffix+="_upscaled"
+    fi
+    suffix+=".mkv"
 
-        local default_out=""
-        if [ "$IS_CLIP" -eq 1 ]; then
-            if [ "$RIFE_ENABLED" -eq 1 ] && [ "$UPSCALE_ENABLED" -eq 1 ]; then
-                default_out="${dir_name}/${raw_name}_clip_${CLIP_DURATION}s_rife${RIFE_FACTOR}x_upscaled.mkv"
-            elif [ "$RIFE_ENABLED" -eq 1 ]; then
-                default_out="${dir_name}/${raw_name}_clip_${CLIP_DURATION}s_rife${RIFE_FACTOR}x.mkv"
-            else
-                default_out="${dir_name}/${raw_name}_clip_${CLIP_DURATION}s_upscaled.mkv"
-            fi
-        else
-            if [ "$RIFE_ENABLED" -eq 1 ] && [ "$UPSCALE_ENABLED" -eq 1 ]; then
-                default_out="${dir_name}/${raw_name}_rife${RIFE_FACTOR}x_upscaled.mkv"
-            elif [ "$RIFE_ENABLED" -eq 1 ]; then
-                default_out="${dir_name}/${raw_name}_rife${RIFE_FACTOR}x.mkv"
-            else
-                default_out="${dir_name}/${raw_name}_upscaled.mkv"
+    if [ "${#INPUT_VIDEOS[@]}" -gt 1 ]; then
+        printf '已选择 %s 个视频，统一设置输出位置。\n' "${#INPUT_VIDEOS[@]}"
+        printf '默认文件夹：各输入视频所在文件夹。\n默认命名：原文件名（去掉扩展名）+ %s\n' "$suffix"
+        read -rp "回车使用默认文件夹和后缀，或输入统一输出文件夹（应用到所有视频，保留默认后缀）: " user_out || return 1
+        if [ -n "$user_out" ]; then
+            batch_dir=$(printf '%s\n' "$user_out" | sed -e "s/^['\"]//" -e "s/['\"]$//")
+            [ -n "$batch_dir" ] || { echo "[错误] 输出文件夹不能为空。" >&2; return 1; }
+            batch_dir=$(readlink -m -- "$batch_dir") || return 1
+            if [ -e "$batch_dir" ] && [ ! -d "$batch_dir" ]; then
+                printf '[错误] 输出位置不是文件夹: %s\n' "$batch_dir" >&2
+                return 1
             fi
         fi
+    fi
 
-        echo -e "默认推荐输出路径: ${BOLD}${default_out}${NC}"
-        read -rp "是否使用此输出路径？回车默认确认，或直接输入新路径: " user_out || return 1
-        if [ -n "$user_out" ]; then
-            OUTPUT_VIDEO=$(printf '%s\n' "$user_out" | sed -e "s/^['\"]//" -e "s/['\"]$//")
-        else
-            OUTPUT_VIDEO="$default_out"
+    for INPUT_VIDEO in "${INPUT_VIDEOS[@]}"; do
+        dir_name=$(dirname -- "$INPUT_VIDEO")
+        base_name=$(basename -- "$INPUT_VIDEO")
+        raw_name=${base_name%.*}
+        default_out="${batch_dir:-$dir_name}/${raw_name}${suffix}"
+        OUTPUT_VIDEO="$default_out"
+
+        if [ "${#INPUT_VIDEOS[@]}" -eq 1 ]; then
+            printf '\n输入视频: %s\n' "$INPUT_VIDEO"
+            printf '默认推荐输出路径: %b%s%b\n' "$BOLD" "$default_out" "$NC"
+            read -rp "是否使用此输出路径？回车默认确认，或直接输入新路径: " user_out || return 1
+            if [ -n "$user_out" ]; then
+                OUTPUT_VIDEO=$(printf '%s\n' "$user_out" | sed -e "s/^['\"]//" -e "s/['\"]$//")
+            fi
         fi
 
         canonical_output=$(readlink -m -- "$OUTPUT_VIDEO") || return 1
@@ -666,10 +676,13 @@ select_output_path() {
         done
         OUTPUT_VIDEOS+=("$canonical_output")
     done
+    if [ -n "$batch_dir" ]; then
+        mkdir -p -- "$batch_dir" || return 1
+    fi
     INPUT_VIDEO=${INPUT_VIDEOS[0]}
     OUTPUT_VIDEO=${OUTPUT_VIDEOS[0]}
 
-    read -rp "若输出文件已存在，是否默认自动覆盖？[Y/n, 默认 Y]: " overwrite_choice
+    read -rp "若输出文件已存在，是否默认自动覆盖？[Y/n, 默认 Y]: " overwrite_choice || return 1
     overwrite_choice=${overwrite_choice:-Y}
     if [[ "$overwrite_choice" =~ ^[Yy]$ ]]; then
         OVERWRITE_FLAG="--overwrite"
