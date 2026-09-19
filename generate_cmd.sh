@@ -812,24 +812,44 @@ select_optional_flags() {
     echo ""
 }
 
+# 用单引号保留特殊字符，避免 %q 将路径和提示文字显示成大量反斜杠。
+write_shell_word() {
+    if [[ "$1" =~ ^[a-zA-Z0-9_./:=,+@%-]+$ ]]; then
+        printf '%s' "$1"
+    else
+        printf "'%s'" "${1//\'/\'\\\'\'}"
+    fi
+}
+
 # 输出可直接由 Bash 执行的命令，保留空格、引号及 $ 等文件名字符。
 write_shell_command() {
-    printf '%q ' "$@"
+    local word separator=''
+    for word in "$@"; do
+        printf '%s' "$separator"
+        write_shell_word "$word"
+        separator=' '
+    done
     printf '\n'
 }
 
 # 9. 生成最终命令与独立脚本；set -e 保证任务失败时停止队列。
 generate_final_command_and_script() {
     local gen_script_path="${PROJECT_ROOT}/run_encode.sh"
-    local i effective_input
+    local i effective_input arg
     local cmd_args=()
 
     {
         printf '#!/usr/bin/env bash\nset -euo pipefail\n\n'
-        printf 'export PATH=%q:"$PATH"\n' "${CUDA_BIN_DIR}:${FFMPEG_INSTALL_DIR}/bin"
-        printf 'export LD_LIBRARY_PATH=%q:"${LD_LIBRARY_PATH:-}"\n' "${PROJECT_ROOT}/build:${FFMPEG_INSTALL_DIR}/lib:${CUDA_LIB_DIR}"
+        printf 'export PATH='
+        write_shell_word "${CUDA_BIN_DIR}:${FFMPEG_INSTALL_DIR}/bin"
+        printf ':"$PATH"\n'
+        printf 'export LD_LIBRARY_PATH='
+        write_shell_word "${PROJECT_ROOT}/build:${FFMPEG_INSTALL_DIR}/lib:${CUDA_LIB_DIR}"
+        printf ':"${LD_LIBRARY_PATH:-}"\n'
         if [ -f "$NVENC_FIX_SO" ]; then
-            printf 'export LD_PRELOAD=%q"${LD_PRELOAD:+ $LD_PRELOAD}"\n' "$NVENC_FIX_SO"
+            printf 'export LD_PRELOAD='
+            write_shell_word "$NVENC_FIX_SO"
+            printf '"${LD_PRELOAD:+ $LD_PRELOAD}"\n'
         fi
         if [ "$IS_CLIP" -eq 1 ]; then
             # 每次执行使用独立临时目录；失败退出时也清理片段。
@@ -844,8 +864,13 @@ EOF
             effective_input=${INPUT_VIDEOS[$i]}
             if [ "$IS_CLIP" -eq 1 ]; then
                 write_shell_command printf '%s\n' "正在截取测试片段（${CLIP_START}，${CLIP_DURATION} 秒）..."
-                printf '%q ' ffmpeg -y -ss "$CLIP_START" -i "$effective_input" -t "$CLIP_DURATION" -c copy
-                printf '"$clip_dir/clip.mkv"\n'
+                printf 'ffmpeg -y -ss '
+                write_shell_word "$CLIP_START"
+                printf ' \\\n    -i '
+                write_shell_word "$effective_input"
+                printf ' \\\n    -t '
+                write_shell_word "$CLIP_DURATION"
+                printf ' -c copy "$clip_dir/clip.mkv"\n'
             fi
             cmd_args=("--output" "${OUTPUT_VIDEOS[$i]}")
             if [ "$USE_RUNTIME_CONFIG" -eq 1 ]; then
@@ -873,13 +898,22 @@ EOF
             [ -n "$OVERWRITE_FLAG" ] && cmd_args+=("${OVERWRITE_FLAG}")
             [ ${#EXTRA_FLAGS[@]} -gt 0 ] && cmd_args+=("${EXTRA_FLAGS[@]}")
 
-            printf '%q ' "$AJI_ENCODE_BIN" --input
+            write_shell_word "$AJI_ENCODE_BIN"
+            printf ' \\\n    --input '
             if [ "$IS_CLIP" -eq 1 ]; then
-                printf '"$clip_dir/clip.mkv" '
+                printf '"$clip_dir/clip.mkv"'
             else
-                printf '%q ' "$effective_input"
+                write_shell_word "$effective_input"
             fi
-            write_shell_command "${cmd_args[@]}"
+            for arg in "${cmd_args[@]}"; do
+                if [[ "$arg" == --* ]]; then
+                    printf ' \\\n    '
+                else
+                    printf ' '
+                fi
+                write_shell_word "$arg"
+            done
+            printf '\n'
         done
         printf '\n'
         write_shell_command printf '%s\n' "✔ 全部 ${#INPUT_VIDEOS[@]} 个视频处理完成！"
@@ -890,13 +924,17 @@ EOF
     echo -e "${BOLD}${GREEN}✔ 已生成 ${#INPUT_VIDEOS[@]} 个视频的串行任务脚本，未自动执行。${NC}"
     echo "全部视频共用处理参数；任一任务失败时停止后续任务。"
     echo -e "\n${BOLD}${YELLOW}方式一：运行独立脚本${NC}"
+    echo '前台运行：'
     write_shell_command bash "$gen_script_path"
-    printf 'nohup bash %q > encode.log 2>&1 &\n' "$gen_script_path"
-    echo "查看进度: tail -f encode.log"
+    printf '\n后台运行（与前台运行二选一）：\nnohup bash '
+    write_shell_word "$gen_script_path"
+    printf ' > encode.log 2>&1 &\n'
+    printf '查看进度：\ntail -f encode.log\n'
     echo -e "\n${BOLD}${YELLOW}方式二：复制以下完整命令执行（包含串行队列）${NC}"
     # 子 Shell 限定 set/trap 的作用域，手动粘贴执行不会退出用户的终端。
     printf '(\n'
-    cat "$gen_script_path"
+    # shebang 只用于独立脚本，不需要放进复制执行的子 Shell。
+    tail -n +2 "$gen_script_path"
     printf ')\n'
 }
 
