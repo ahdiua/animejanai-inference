@@ -923,19 +923,31 @@ EOF
     print_header
     echo -e "${BOLD}${GREEN}✔ 已生成 ${#INPUT_VIDEOS[@]} 个视频的串行任务脚本，未自动执行。${NC}"
     echo "全部视频共用处理参数；任一任务失败时停止后续任务。"
+    printf '%b\n' "${YELLOW}以下两种方式任选一种；青色为可复制命令，黄色为操作指引。${NC}"
     echo -e "\n${BOLD}${YELLOW}方式一：运行独立脚本${NC}"
-    echo '前台运行：'
+    printf '%b\n' "${YELLOW}前台运行：只复制下面一行。${NC}"
+    printf '%b' "$CYAN"
     write_shell_command bash "$gen_script_path"
-    printf '\n后台运行（与前台运行二选一）：\nnohup bash '
+    printf '%b\n' "$NC"
+    printf '%b\n' "${YELLOW}后台运行：只复制下面一行，与前台运行二选一。${NC}"
+    printf '%b' "$CYAN"
+    printf 'nohup bash '
     write_shell_word "$gen_script_path"
     printf ' > encode.log 2>&1 &\n'
-    printf '查看进度：\ntail -f encode.log\n'
+    printf '%b\n' "$NC"
+    printf '%b\n' "${YELLOW}查看后台进度：只复制下面一行。${NC}"
+    printf '%btail -f encode.log\n%b' "$CYAN" "$NC"
     echo -e "\n${BOLD}${YELLOW}方式二：复制以下完整命令执行（包含串行队列）${NC}"
+    printf '%b\n' "${YELLOW}从单独的左括号 ( 开始，到最后单独的右括号 ) 结束，整段一次复制。"
+    printf '%b\n' "必须包含这两行括号；不要复制黄色标记行，也不要逐行执行。${NC}"
+    printf '\n%b\n' "${BOLD}${YELLOW}# ==================== 开始复制（下一行起） ====================${NC}"
+    printf '%b' "$CYAN"
     # 子 Shell 限定 set/trap 的作用域，手动粘贴执行不会退出用户的终端。
     printf '(\n'
     # shebang 只用于独立脚本，不需要放进复制执行的子 Shell。
     tail -n +2 "$gen_script_path"
     printf ')\n'
+    printf '%b\n\n' "${NC}${BOLD}${YELLOW}# ==================== 结束复制（上一行止） ====================${NC}"
 }
 
 # 主执行流
