@@ -229,11 +229,23 @@ get_available_cuda_packages() {
     apt-cache pkgnames 2>/dev/null | grep -E '^cuda-nvcc-[0-9]+-[0-9]+$' | sed 's/cuda-nvcc-//' | tr '-' '.' | sort -V -r
 }
 
-# 卸载并彻底清理旧版 CUDA 软件包（用户主动选择清理时调用）
+# 同时检查包名和版本号；NCCL/TensorRT 的 CUDA 版本只出现在版本号中。
+get_old_cuda_packages() {
+    dpkg-query -W -f='${binary:Package}\t${Version}\t${db:Status-Abbrev}\n' | awk '
+        $3 ~ /^ii/ && $1 ~ /^(cuda($|-)|libcu|libnccl|libnvinfer|libnvonnxparsers|python3-libnvinfer|tensorrt($|-)|nsight-)/ {
+            name = $1
+            sub(/:[^:]+$/, "", name)
+            if (name ~ /-(10|11|12)(-|$)/ || $2 ~ /[+]cuda(10|11|12)([.~-]|$)/)
+                print $1
+        }
+    '
+}
+
+# 卸载并清理可识别的旧版 CUDA 软件包（用户主动选择清理时调用）
 purge_old_cuda_packages() {
     echo -e "${CYAN}正在扫描并清理系统中残留的旧版本 CUDA 软件包 (CUDA < 13.x)...${NC}"
     local old_pkgs
-    old_pkgs=$(dpkg -l 2>/dev/null | awk '/^ii/ {print $2}' | grep -E '^(cuda|libcu|nsight)' | grep -E -- '-(12-[0-9]|11-[0-9]|10-[0-9])' || echo "") || return 1
+    old_pkgs=$(get_old_cuda_packages) || return 1
     
     if [ -n "$old_pkgs" ]; then
         echo -e "${YELLOW}检测到以下旧版本 CUDA 软件包，正在通过 apt 彻底卸载以释放空间：${NC}"
@@ -245,7 +257,7 @@ purge_old_cuda_packages() {
         run_as_root apt-get autoremove -y --purge || return 1
         echo -e "${GREEN}✔ 旧版本 CUDA 软件包卸载完成！${NC}"
     else
-        echo -e "${GREEN}✔ 系统中未发现冗余的早期 CUDA 软件包。${NC}"
+        echo -e "${GREEN}✔ 未发现包名或版本号明确标记为 CUDA 10/11/12 的已安装软件包。${NC}"
     fi
 
     for old_dir in /usr/local/cuda-12.* /usr/local/cuda-11.* /usr/local/cuda-10.*; do

@@ -134,6 +134,46 @@ fetch_verified https://example.test/file "$AUDIT_DIR/download" "$(printf '%064d'
         self.assertNotIn('UNEXPECTED_ROOT_CALL', result.stderr)
         self.assertIn('13.2', result.stdout)
 
+    def test_old_cuda_packages_include_shared_config_and_version_suffixes(self):
+        result = self.run_shell("""dpkg-query() { cat <<'EOF'
+cuda-nvcc-12-6 12.6.77-1 ii
+cuda-toolkit-12-config-common 12.6.77-1 ii
+libcudnn9-cuda-12:amd64 9.6.0-1 ii
+libcudnn9-dev-cuda-12 9.6.0-1 ii
+libnccl2 2.23.4-1+cuda12.6 ii
+libnvinfer10 10.7.0-1+cuda12.6 ii
+libnvonnxparsers10 10.7.0-1+cuda12.6 ii
+cuda-nvcc-11-8 11.8-1 ii
+cuda-nvcc-10-2 10.2-1 ii
+cuda-nvcc-13-2 13.2.86-1 ii
+cuda-toolkit-13-config-common 13.4.92-1 ii
+cuda-toolkit-config-common 13.4.92-1 ii
+libnvinfer11 11.2.1-1+cuda13.3 ii
+libnvinfer10 10.16.1-1+cuda13.2 ii
+libnccl2 2.31.2-1+cuda13.4 ii
+libcuda1 580.0-1 ii
+nvidia-driver-580 580.0-1 ii
+libcurl4 8.5.0-1 ii
+libcutensor2 2.0.2.5-1 ii
+nsight-compute-2024.3.2 2024.3.2-1 ii
+cuda-nvcc-12-9 12.9-1 rc
+EOF
+}
+get_old_cuda_packages""")
+        self.assertEqual(result.stdout.splitlines(), [
+            'cuda-nvcc-12-6', 'cuda-toolkit-12-config-common',
+            'libcudnn9-cuda-12:amd64', 'libcudnn9-dev-cuda-12',
+            'libnccl2', 'libnvinfer10', 'libnvonnxparsers10',
+            'cuda-nvcc-11-8', 'cuda-nvcc-10-2'])
+
+    def test_old_cuda_scan_failure_stops_cleanup(self):
+        result = self.run_shell('dpkg-query() { return 7; }; purge_old_cuda_packages', 1)
+        self.assertNotIn('UNEXPECTED_ROOT_CALL', result.stderr)
+
+    def test_old_cuda_scan_can_be_empty(self):
+        result = self.run_shell('dpkg-query() { :; }; get_old_cuda_packages')
+        self.assertEqual(result.stdout, '')
+
     def test_cuda_wrong_major_rejected(self):
         self.executable('cuda/bin/nvcc', "printf 'release 14.0, V14.0.0\\n'\n")
         self.run_shell('CUDA_ROOT="$AUDIT_DIR/cuda"; check_cuda_toolkit', 1)
