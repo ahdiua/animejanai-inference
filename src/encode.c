@@ -213,7 +213,6 @@ typedef struct {
     AVFrame  *out;       /* aji output (or decoded, passthrough) CUDA frame */
     AVFrame  *in_ref;    /* decoded input kept alive across the async infer */
     uint64_t  ticket;
-    int64_t   pts;       /* output PTS in the video stream time_base */
 } slot;
 
 typedef struct {
@@ -227,6 +226,8 @@ typedef struct {
     CUcontext        cuctx;          /* shared context (from libav) */
     int              ctx_pushed;
     int              nvdec;          /* decoding on the GPU */
+    AVBufferRef     *decode_pool;    /* normalized NV12/P010 CUDA uploads */
+    struct SwsContext *decode_sws;   /* software decode format conversion */
 
     /* libaji */
     aji_ctx        *aji;
@@ -256,6 +257,7 @@ typedef struct {
     int             *smap;           /* input stream idx -> output idx (-1) */
     AVRational       out_tb;         /* video stream time_base */
     AVRational       out_fps;
+    AVRational       src_sar;
     int              opened;         /* header written */
     AVPacket       **aux_buf;        /* aux packets seen before header */
     int              aux_n, aux_cap;
@@ -282,24 +284,37 @@ typedef struct {
     int64_t  src_frames_seen;
     int64_t  scene_dupes;
     int64_t  start_time_us;
+    int64_t  next_input_pts;         /* fallback when decoder has no PTS */
     int      color_space, color_range, color_pri, color_trc, chroma_loc;
 } enc_ctx;
 
 /* forward decls */
-static int emit_output(enc_ctx *c, AVFrame *cuda_out);
+static int emit_output(enc_ctx *c, AVFrame *cuda_out,
+                       int64_t pts, int64_t duration);
 static int drain_encoder(enc_ctx *c, int flush);
 
 /* ---- decoder: force NVDEC's CUDA output format --------------------------- */
 
-static enum AVPixelFormat g_hw_pixfmt = AV_PIX_FMT_CUDA;
-
 static enum AVPixelFormat get_hw_format(AVCodecContext *ctx,
                                         const enum AVPixelFormat *fmts)
 {
-    (void)ctx;
+    enc_ctx *c = ctx->opaque;
     for (const enum AVPixelFormat *p = fmts; *p != AV_PIX_FMT_NONE; p++)
-        if (*p == g_hw_pixfmt)
+        if (*p == AV_PIX_FMT_CUDA)
             return *p;
+    /* Hardware initialization often happens on the first packet, after
+     * avcodec_open2 has succeeded. FFmpeg retries negotiation without the
+     * failed hardware format; allow that retry to select software in auto. */
+    if (c->o.decoder == DEC_AUTO) {
+        for (const enum AVPixelFormat *p = fmts; *p != AV_PIX_FMT_NONE; p++) {
+            const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(*p);
+            if (d && !(d->flags & AV_PIX_FMT_FLAG_HWACCEL)) {
+                loge("NVDEC unavailable; falling back to CPU decode");
+                c->nvdec = 0;
+                return *p;
+            }
+        }
+    }
     return AV_PIX_FMT_NONE;
 }
 
@@ -375,16 +390,9 @@ fail:
     return -1;
 }
 
-/* Resolve the output chroma + bit depth from --pix-fmt. Sets the final
- * encoder pix_fmt + flags, then picks the libaji output format and CUDA pool
- * sw_format.
- *
- * libaji constraint: aji_infer's output format must equal the input format or
- * be YUV444P16 (it won't, e.g., turn NV12 into P010). So we use a direct
- * NV12/P010 output only when it exactly matches the source 4:2:0 format
- * (enabling NVENC zero-copy); for every other request (bit-depth change,
- * chroma change, or 4:4:4) we route through libaji's 16-bit 4:4:4
- * intermediate and downconvert to the target with swscale on the host. */
+/* Resolve the encoder format and libaji output pool from --pix-fmt. Libaji
+ * converts between NV12/P010 on the GPU; 4:4:4 uses a 16-bit intermediate
+ * that the software-encoding path downloads and converts. */
 static void resolve_pixfmt(enc_ctx *c)
 {
     int nvenc = c->o.vcodec && strstr(c->o.vcodec, "nvenc");
@@ -429,10 +437,12 @@ static int open_decoder(enc_ctx *c)
     if (!c->dec) { loge("avcodec_alloc_context3 failed"); return -1; }
     AV(avcodec_parameters_to_context(c->dec, vst->codecpar));
     c->dec->pkt_timebase = vst->time_base;
+    c->dec->opaque = c;
 
     int want_hw = (c->o.decoder != DEC_CPU) && !c->o.no_zerocopy;
     if (want_hw) {
         c->dec->hw_device_ctx = av_buffer_ref(c->hw_device);
+        if (!c->dec->hw_device_ctx) { loge("hw_device reference failed"); goto fail; }
         c->dec->get_format = get_hw_format;
     }
     int r = avcodec_open2(c->dec, codec, NULL);
@@ -442,8 +452,10 @@ static int open_decoder(enc_ctx *c)
         c->dec->get_format = NULL;
         avcodec_free_context(&c->dec);
         c->dec = avcodec_alloc_context3(codec);
+        if (!c->dec) { loge("avcodec_alloc_context3 failed"); goto fail; }
         AV(avcodec_parameters_to_context(c->dec, vst->codecpar));
         c->dec->pkt_timebase = vst->time_base;
+        c->dec->opaque = c;
         want_hw = 0;
         r = avcodec_open2(c->dec, codec, NULL);
     }
@@ -452,6 +464,110 @@ static int open_decoder(enc_ctx *c)
     return 0;
 fail:
     return -1;
+}
+
+/* Normalize every decoded frame before handing its planes to libaji. CPU
+ * decoders normally emit planar YUV, whereas libaji expects CUDA NV12/P010.
+ * NVDEC can also produce other formats (e.g. P016 or 4:4:4), which need the
+ * same conversion instead of being silently interpreted as NV12/P010.
+ * On success this may replace *frame; on failure ownership is unchanged. */
+static int prepare_decoded_frame(enc_ctx *c, AVFrame **frame)
+{
+    AVFrame *src = *frame;
+    AVFrame *download = NULL, *converted = NULL, *uploaded = NULL;
+    enum AVPixelFormat target = c->src_aji_fmt == AJI_FMT_P010
+                                   ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
+    if (src->width != c->src_w || src->height != c->src_h) {
+        loge("decoded frame dimensions changed: %dx%d (expected %dx%d)",
+             src->width, src->height, c->src_w, c->src_h);
+        goto fail;
+    }
+    /* A software transcode with no inference can consume the decoder's
+     * original host format directly, avoiding a pointless upload/download. */
+    if (c->passthrough && !c->rife && src->format != AV_PIX_FMT_CUDA &&
+        !(c->o.vcodec && strstr(c->o.vcodec, "nvenc")))
+        return 0;
+    if (src->format == AV_PIX_FMT_CUDA) {
+        if (!src->hw_frames_ctx) { loge("CUDA frame has no frame context"); goto fail; }
+        AVHWFramesContext *fc = (AVHWFramesContext *)src->hw_frames_ctx->data;
+        if (fc->sw_format == target && fc->device_ctx->type == AV_HWDEVICE_TYPE_CUDA) {
+            AVCUDADeviceContext *dc = (AVCUDADeviceContext *)fc->device_ctx->hwctx;
+            if (dc->cuda_ctx == c->cuctx)
+                return 0;
+        }
+        download = av_frame_alloc();
+        if (!download) goto fail;
+        AV(av_hwframe_transfer_data(download, src, 0));
+        AV(av_frame_copy_props(download, src));
+        src = download;
+    }
+
+    if (src->format != target) {
+        if (!sws_isSupportedInput(src->format)) {
+            loge("unsupported decoded pixel format: %s", av_get_pix_fmt_name(src->format));
+            goto fail;
+        }
+        converted = av_frame_alloc();
+        if (!converted) goto fail;
+        converted->format = target;
+        converted->width = src->width;
+        converted->height = src->height;
+        AV(av_frame_get_buffer(converted, 0));
+        AV(av_frame_copy_props(converted, src));
+        c->decode_sws = sws_getCachedContext(c->decode_sws,
+                src->width, src->height, src->format,
+                src->width, src->height, target, SWS_BICUBIC,
+                NULL, NULL, NULL);
+        if (!c->decode_sws) { loge("decode format conversion init failed"); goto fail; }
+
+        int matrix = aji_matrix_from_av(c->color_space);
+        int sws_matrix = matrix == AJI_MATRIX_BT601 ? SWS_CS_ITU601 :
+                         matrix == AJI_MATRIX_BT2020 ? SWS_CS_BT2020 : SWS_CS_ITU709;
+        const int *coeff = sws_getCoefficients(sws_matrix);
+        int full_range = (src->color_range == AVCOL_RANGE_JPEG) ||
+                        (src->color_range == AVCOL_RANGE_UNSPECIFIED &&
+                         c->color_range == AVCOL_RANGE_JPEG);
+        AV(sws_setColorspaceDetails(c->decode_sws, coeff, full_range,
+                                   coeff, full_range, 0, 1 << 16, 1 << 16));
+        int h = sws_scale(c->decode_sws, (const uint8_t *const *)src->data,
+                          src->linesize, 0, src->height,
+                          converted->data, converted->linesize);
+        if (h != src->height) { loge("decode format conversion failed"); goto fail; }
+        src = converted;
+    }
+
+    if (!c->decode_pool) {
+        c->decode_pool = av_hwframe_ctx_alloc(c->hw_device);
+        if (!c->decode_pool) goto fail;
+        AVHWFramesContext *fc = (AVHWFramesContext *)c->decode_pool->data;
+        fc->format = AV_PIX_FMT_CUDA;
+        fc->sw_format = target;
+        fc->width = c->src_w;
+        fc->height = c->src_h;
+        AV(av_hwframe_ctx_init(c->decode_pool));
+    }
+    uploaded = av_frame_alloc();
+    if (!uploaded) goto fail;
+    AV(av_hwframe_get_buffer(c->decode_pool, uploaded, 0));
+    AV(av_hwframe_transfer_data(uploaded, src, 0));
+    AV(av_frame_copy_props(uploaded, *frame));
+    av_frame_free(frame);
+    *frame = uploaded;
+    av_frame_free(&converted);
+    av_frame_free(&download);
+    return 0;
+fail:
+    av_frame_free(&uploaded);
+    av_frame_free(&converted);
+    av_frame_free(&download);
+    return -1;
+}
+
+static void cleanup_decoder_frames(enc_ctx *c)
+{
+    av_buffer_unref(&c->decode_pool);
+    sws_freeContext(c->decode_sws);
+    c->decode_sws = NULL;
 }
 
 /* ---- libaji init --------------------------------------------------------- */
@@ -535,7 +651,11 @@ static int init_aji_pool(enc_ctx *c)
     if (!c->aji_pool) { loge("av_hwframe_ctx_alloc failed"); return -1; }
     AVHWFramesContext *fc = (AVHWFramesContext *)c->aji_pool->data;
     fc->format            = AV_PIX_FMT_CUDA;
-    fc->sw_format         = c->sw_fmt;
+    /* RIFE-only chains interpolate source frames without an upscale format
+     * conversion. emit_output converts their result to the requested format. */
+    fc->sw_format         = c->passthrough
+        ? (c->src_aji_fmt == AJI_FMT_P010 ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12)
+        : c->sw_fmt;
     fc->width             = c->up_w;     /* aji writes at the upscale dims */
     fc->height            = c->up_h;
     /* cover in-flight ring/RIFE frames plus those the encoder holds
@@ -582,6 +702,8 @@ static void fill_aji_frame(enc_ctx *c, aji_frame *f, AVFrame *av, int output)
     f->height = av->height;
     /* input mirrors the source format; output uses the --pix-fmt selection */
     f->format = output ? c->out_aji_fmt : c->src_aji_fmt;
+    if (output && c->passthrough)
+        f->format = c->src_aji_fmt;
     f->matrix = aji_matrix_from_av(c->color_space);
     f->range  = aji_range_from_av(c->color_range);
     f->siting = aji_siting_from_av(c->chroma_loc);
@@ -658,6 +780,17 @@ static void inject_profile(const char *vcodec, enum out_pixfmt pf,
         av_dict_set(opts, "profile", p, 0);
 }
 
+/* Preserve the source display aspect even when resize rounding changes the
+ * ratio of stored pixel dimensions. */
+static AVRational output_sample_aspect_ratio(enc_ctx *c, int w, int h)
+{
+    AVRational sar = c->src_sar;
+    if (sar.num <= 0 || sar.den <= 0)
+        sar = (AVRational){1, 1};
+    return av_mul_q(sar, av_mul_q((AVRational){c->src_w, w},
+                                  (AVRational){h, c->src_h}));
+}
+
 static int open_encoder(enc_ctx *c, AVFrame *first)
 {
     const AVCodec *codec = avcodec_find_encoder_by_name(c->o.vcodec);
@@ -669,9 +802,12 @@ static int open_encoder(enc_ctx *c, AVFrame *first)
     int w = first->width, h = first->height;
     c->enc->width  = w;
     c->enc->height = h;
-    c->out_tb = av_inv_q(c->out_fps);
     c->enc->time_base = c->out_tb;
     c->enc->framerate = c->out_fps;
+    c->enc->sample_aspect_ratio = output_sample_aspect_ratio(c, w, h);
+#ifdef AV_CODEC_FLAG_FRAME_DURATION
+    c->enc->flags |= AV_CODEC_FLAG_FRAME_DURATION;
+#endif
     c->enc->colorspace            = c->color_space;
     c->enc->color_range           = c->color_range;
     c->enc->color_primaries       = c->color_pri;
@@ -718,9 +854,13 @@ static int open_output(enc_ctx *c)
     AVStream *vs = avformat_new_stream(c->ofmt, NULL);
     if (!vs) { loge("new video stream failed"); return -1; }
     c->vout = vs->index;
+    AVStream *vin = c->ifmt->streams[c->vstream];
+    AV(av_dict_copy(&vs->metadata, vin->metadata, 0));
+    vs->disposition = vin->disposition;
 
     /* aux streams (stream-copy) */
     c->smap = av_malloc_array(c->ifmt->nb_streams, sizeof(int));
+    if (!c->smap) { loge("stream map allocation failed"); return -1; }
     for (unsigned i = 0; i < c->ifmt->nb_streams; i++) c->smap[i] = -1;
     for (unsigned i = 0; i < c->ifmt->nb_streams; i++) {
         if ((int)i == c->vstream) continue;
@@ -728,16 +868,25 @@ static int open_output(enc_ctx *c)
         enum AVMediaType t = in->codecpar->codec_type;
         if (t == AVMEDIA_TYPE_AUDIO && c->o.no_audio) continue;
         if (t == AVMEDIA_TYPE_SUBTITLE && c->o.no_subs) continue;
-        /* Matroska and standard containers only support video, audio, and subtitle streams.
-         * Filter out non-audio non-subtitle streams (e.g. data streams, timed metadata, tmcd) */
-        if (t != AVMEDIA_TYPE_AUDIO && t != AVMEDIA_TYPE_SUBTITLE)
+        /* Matroska stores arbitrary attachments, including ASS fonts. Codec
+         * support queries do not report attachment support, so check the
+         * container explicitly (WebM does not support attachments). */
+        if (t == AVMEDIA_TYPE_ATTACHMENT &&
+            strcmp(c->ofmt->oformat->name, "matroska") != 0) {
+            loge("warning: skipping attachment stream %u: %s does not support attachments",
+                 i, c->ofmt->oformat->name);
+            continue;
+        }
+        if (t != AVMEDIA_TYPE_AUDIO && t != AVMEDIA_TYPE_SUBTITLE &&
+            t != AVMEDIA_TYPE_ATTACHMENT)
             continue;
         AVStream *out = avformat_new_stream(c->ofmt, NULL);
         if (!out) { loge("new aux stream failed"); return -1; }
         AV(avcodec_parameters_copy(out->codecpar, in->codecpar));
         out->codecpar->codec_tag = 0;
         out->time_base = in->time_base;
-        av_dict_copy(&out->metadata, in->metadata, 0);
+        out->disposition = in->disposition;
+        AV(av_dict_copy(&out->metadata, in->metadata, 0));
         c->smap[i] = out->index;
     }
 
@@ -773,6 +922,7 @@ static int finalize_output(enc_ctx *c)
     AV(avcodec_parameters_from_context(vs->codecpar, c->enc));
     vs->time_base = c->enc->time_base;
     vs->avg_frame_rate = c->out_fps;
+    vs->sample_aspect_ratio = c->enc->sample_aspect_ratio;
 
     if (!(c->ofmt->oformat->flags & AVFMT_NOFILE)) {
         if (!c->o.overwrite) {
@@ -782,10 +932,9 @@ static int finalize_output(enc_ctx *c)
         AV(avio_open(&c->ofmt->pb, c->o.output, AVIO_FLAG_WRITE));
     }
 
-    AVDictionary *mopt = NULL;
-    av_dict_set_int(&mopt, "max_interleave_delta", 0, 0);
-    int r = avformat_write_header(c->ofmt, &mopt);
-    av_dict_free(&mopt);
+    /* Keep FFmpeg's finite interleave bound. Setting it to zero makes sparse
+     * subtitle tracks retain the intervening video/audio packets in memory. */
+    int r = avformat_write_header(c->ofmt, NULL);
     if (r < 0) { AV(r); }
     c->opened = 1;
     for (int i = 0; i < c->aux_n; i++) {
@@ -795,7 +944,7 @@ static int finalize_output(enc_ctx *c)
         out->stream_index = oidx;
         av_packet_rescale_ts(out, c->ifmt->streams[in_idx]->time_base,
                              c->ofmt->streams[oidx]->time_base);
-        av_interleaved_write_frame(c->ofmt, out);
+        AV(av_interleaved_write_frame(c->ofmt, out));
         av_packet_free(&c->aux_buf[i]);
     }
     c->aux_n = 0;
@@ -821,7 +970,6 @@ static int init_resize(enc_ctx *c, AVFrame *first)
             loge("--final-resize requires a CUDA frame with hw_frames_ctx");
             goto fail;
         }
-        AVStream *vst = c->ifmt->streams[c->vstream];
         /* create_filter initializes immediately, but CUDA buffer sources
          * require hw_frames_ctx during initialization. Allocate, set all
          * parameters (including the frame pool), then initialize explicitly. */
@@ -834,8 +982,9 @@ static int init_resize(enc_ctx *c, AVFrame *first)
         bp->format = first->format;
         bp->width = first->width;
         bp->height = first->height;
-        bp->time_base = vst->time_base;
-        bp->sample_aspect_ratio = (AVRational){1, 1};
+        bp->time_base = c->out_tb;
+        bp->sample_aspect_ratio = output_sample_aspect_ratio(c, first->width,
+                                                            first->height);
         bp->hw_frames_ctx = first->hw_frames_ctx;
         AV(av_buffersrc_parameters_set(c->buf_src, bp));
         av_freep(&bp);
@@ -884,23 +1033,24 @@ static int resize_needed(enc_ctx *c)
 
 /* ---- emit one finished output frame: resize -> encode -> mux ------------- */
 
-/* Emit one finished output frame. Frames arrive in display order (the
- * non-RIFE ring drains FIFO; RIFE emits base then phases in order), so we
- * assign the monotonic CFR PTS here and own the emitted-frame count. */
-static int emit_output(enc_ctx *c, AVFrame *cuda_out)
+/* PTS/duration use out_tb and retain the source timeline, including VFR gaps.
+ * Explicit timing lets scene duplicates share pixels without changing the
+ * timestamps of frame objects retained by the pipeline or encoder. */
+static int emit_output(enc_ctx *c, AVFrame *cuda_out,
+                       int64_t pts, int64_t duration)
 {
-    int64_t pts = c->out_frames;
     AVFrame *to_encode = NULL;
     AVFrame *resized = NULL;
+    AVFrame *download = NULL;
     int rc = -1;
 
-    /* Zero-copy only when the libaji output is a CUDA NV12/P010 frame NVENC
-     * can read directly. Anything routed through the YUV444P16 intermediate
-     * (bit-depth/chroma change or 4:4:4) is downloaded and converted with
-     * swscale, then handed to the encoder (NVENC uploads host frames itself;
-     * software encoders consume them directly). */
+    /* Check the actual pool, including passthrough where source bit depth
+     * may differ from --pix-fmt. Mismatches need conversion before NVENC. */
+    AVHWFramesContext *frames = cuda_out->hw_frames_ctx
+        ? (AVHWFramesContext *)cuda_out->hw_frames_ctx->data : NULL;
     int zerocopy = is_nvenc(c->o.vcodec) &&
-                   c->out_aji_fmt != AJI_FMT_YUV444P16;
+                   cuda_out->format == AV_PIX_FMT_CUDA && frames &&
+                   frames->sw_format == c->out_pixfmt;
 
     if (zerocopy && resize_needed(c)) {
         if (init_resize(c, cuda_out) < 0) goto done;
@@ -916,13 +1066,15 @@ static int emit_output(enc_ctx *c, AVFrame *cuda_out)
          * The encoder isn't open yet on the first frame, so derive the target
          * pixfmt/dims from the context, not from c->enc. */
         AVFrame *host = cuda_out;
-        AVFrame *dl = NULL;
         if (cuda_out->format == AV_PIX_FMT_CUDA) {
-            dl = av_frame_alloc();
-            AV(av_hwframe_transfer_data(dl, cuda_out, 0));
-            host = dl;
+            download = av_frame_alloc();
+            if (!download) goto done;
+            AV(av_hwframe_transfer_data(download, cuda_out, 0));
+            host = download;
         }
         AVFrame *sw = av_frame_alloc();
+        if (!sw) goto done;
+        resized = sw;
         sw->format = c->out_pixfmt;
         sw->width  = c->out_w;
         sw->height = c->out_h;
@@ -930,13 +1082,10 @@ static int emit_output(enc_ctx *c, AVFrame *cuda_out)
         c->sws = sws_getCachedContext(c->sws, host->width, host->height,
                     host->format, sw->width, sw->height, sw->format,
                     SWS_BICUBIC, NULL, NULL, NULL);
-        if (!c->sws) { loge("sws_getContext failed"); av_frame_free(&sw);
-                       av_frame_free(&dl); goto done; }
-        sws_scale(c->sws, (const uint8_t *const *)host->data, host->linesize,
-                  0, host->height, sw->data, sw->linesize);
-        av_frame_free(&dl);
+        if (!c->sws) { loge("sws_getContext failed"); goto done; }
+        AV(sws_scale(c->sws, (const uint8_t *const *)host->data, host->linesize,
+                     0, host->height, sw->data, sw->linesize));
         to_encode = sw;
-        resized = sw;                  /* freed below */
     }
 
     if (!c->opened) {
@@ -951,6 +1100,14 @@ static int emit_output(enc_ctx *c, AVFrame *cuda_out)
         AVFrame *sendf = av_frame_clone(to_encode);
         if (!sendf) { loge("av_frame_clone failed"); goto done; }
         sendf->pts = pts;
+        sendf->duration = duration;
+        sendf->time_base = c->out_tb;
+        sendf->sample_aspect_ratio = c->enc->sample_aspect_ratio;
+        sendf->color_range = c->color_range;
+        sendf->colorspace = c->color_space;
+        sendf->color_primaries = c->color_pri;
+        sendf->color_trc = c->color_trc;
+        sendf->chroma_location = c->chroma_loc;
         int sret = avcodec_send_frame(c->enc, sendf);
         av_frame_free(&sendf);
         if (sret < 0) { AV(sret); }
@@ -975,9 +1132,11 @@ static int emit_output(enc_ctx *c, AVFrame *cuda_out)
     }
     rc = 0;
 done:
+    av_frame_free(&download);
     av_frame_free(&resized);
     return rc;
 fail:
+    av_frame_free(&download);
     av_frame_free(&resized);
     return -1;
 }
@@ -1015,7 +1174,7 @@ static int ring_reclaim(enc_ctx *c, slot *s)
             return -1;
         }
     }
-    int r = emit_output(c, s->out);
+    int r = emit_output(c, s->out, s->out->pts, s->out->duration);
     av_frame_free(&s->out);
     av_frame_free(&s->in_ref);
     s->ticket = 0;
@@ -1038,7 +1197,10 @@ static int push_upscale(enc_ctx *c, AVFrame *dec)
     if (c->ring_count == c->ring_depth) {
         slot *s = &c->ring[(c->ring_head - c->ring_count + MAX_RING)
                            % MAX_RING];
-        if (ring_reclaim(c, s) < 0) return -1;
+        if (ring_reclaim(c, s) < 0) {
+            av_frame_free(&dec);
+            return -1;
+        }
         c->ring_count--;
     }
 
@@ -1053,20 +1215,26 @@ static int push_upscale(enc_ctx *c, AVFrame *dec)
         s->ticket = 0;
     } else {
         AVFrame *out = av_frame_alloc();
-        if (av_hwframe_get_buffer(c->aji_pool, out, 0) < 0) {
+        if (!out || av_hwframe_get_buffer(c->aji_pool, out, 0) < 0) {
             loge("hwframe_get_buffer failed"); av_frame_free(&out);
+            av_frame_free(&s->in_ref);
             return -1;
         }
         out->color_range = c->color_range;
         out->colorspace  = c->color_space;
         out->chroma_location = c->chroma_loc;
+        out->pts = dec->pts;
+        out->duration = dec->duration;
+        out->time_base = c->out_tb;
         aji_frame in_f, out_f;
         fill_aji_frame(c, &in_f, dec, 0);
         fill_aji_frame(c, &out_f, out, 1);
         int ret = aji_infer(c->aji, &in_f, &out_f, c->stream);
         if (ret != AJI_OK) {
             loge("aji_infer: %d: %s", ret, aji_last_error(c->aji));
+            cudaStreamSynchronize(c->stream);
             av_frame_free(&out);
+            av_frame_free(&s->in_ref);
             return -1;
         }
         s->out = out;
@@ -1080,28 +1248,63 @@ static int push_upscale(enc_ctx *c, AVFrame *dec)
 
 /* ---- RIFE: one decode -> interpolate/upscale -> one encode ---------------- */
 
+/* RIFE's scene decision is synchronous, but its final crop can still be
+ * queued. Wait before an encoder on another CUDA stream consumes it. */
+static int wait_inference(enc_ctx *c)
+{
+    uint64_t ticket = aji_flush(c->aji, c->stream);
+    if (ticket ? aji_wait(c->aji, ticket) != AJI_OK
+               : cudaStreamSynchronize(c->stream) != cudaSuccess) {
+        loge("waiting for inference failed: %s", aji_last_error(c->aji));
+        return -1;
+    }
+    return 0;
+}
+
 static AVFrame *upscale_one(enc_ctx *c, AVFrame *dec)
 {
+    if (c->passthrough) {
+        if (wait_inference(c) < 0) return NULL;
+        return av_frame_clone(dec);
+    }
     AVFrame *out = av_frame_alloc();
-    if (av_hwframe_get_buffer(c->aji_pool, out, 0) < 0) {
+    if (!out || av_hwframe_get_buffer(c->aji_pool, out, 0) < 0) {
         av_frame_free(&out);
         return NULL;
     }
+    out->pts = dec->pts;
+    out->duration = dec->duration;
+    out->time_base = c->out_tb;
     aji_frame in_f, out_f;
     fill_aji_frame(c, &in_f, dec, 0);
     fill_aji_frame(c, &out_f, out, 1);
     int ret = aji_infer(c->aji, &in_f, &out_f, c->stream);
     if (ret != AJI_OK) {
         loge("aji_infer: %d: %s", ret, aji_last_error(c->aji));
+        cudaStreamSynchronize(c->stream);
         av_frame_free(&out);
         return NULL;
     }
-    uint64_t t = aji_flush(c->aji, c->stream);
-    if (t && aji_wait(c->aji, t) != AJI_OK) {
+    if (wait_inference(c) < 0) {
         av_frame_free(&out);
         return NULL;
     }
     return out;
+}
+
+/* Divide the actual source-frame interval, rather than assuming CFR. Input
+ * timestamps were rescaled to a time base fine enough for every phase. */
+static int emit_rife_phase(enc_ctx *c, AVFrame *frame, int phase)
+{
+    const int phases = c->rnum / c->rden;
+    int64_t delta = c->up_cur->pts - c->up_prev->pts;
+    if (delta <= 0) {
+        loge("RIFE requires increasing source timestamps");
+        return -1;
+    }
+    int64_t begin = av_rescale(phase, delta, phases);
+    int64_t end = av_rescale(phase + 1, delta, phases);
+    return emit_output(c, frame, c->up_prev->pts + begin, end - begin);
 }
 
 /* Default/legacy order: upscale each source frame, then interpolate the
@@ -1112,7 +1315,8 @@ static int push_rife_after(enc_ctx *c, AVFrame *dec)
     if (!dec) {
         /* emit the final upscaled frame, no successor to interpolate with */
         if (c->have_prev) {
-            if (emit_output(c, c->up_prev) < 0) return -1;
+            if (emit_output(c, c->up_prev, c->up_prev->pts,
+                             c->up_prev->duration) < 0) return -1;
         }
         return 0;
     }
@@ -1129,38 +1333,46 @@ static int push_rife_after(enc_ctx *c, AVFrame *dec)
     c->up_cur = up;
 
     /* emit base frame N (= up_prev) */
-    if (emit_output(c, c->up_prev) < 0) return -1;
+    if (emit_rife_phase(c, c->up_prev, 0) < 0) return -1;
 
     /* interpolation phases between N and N+1 */
-    double factor = (double)c->rnum / c->rden;
     int phases = c->rnum / c->rden;        /* integer factor: F-1 phases */
-    if (c->rnum % c->rden == 0) {
-        for (int k = 1; k < phases; k++) {
-            double t = (double)k / phases;
-            /* fresh pool buffer per phase: the encoder holds a ref to the
-             * previous one, so we must not overwrite it */
-            AVFrame *interp = av_frame_alloc();
-            if (av_hwframe_get_buffer(c->aji_pool, interp, 0) < 0) {
-                loge("hwframe_get_buffer (interp) failed");
-                av_frame_free(&interp); return -1;
-            }
-            aji_frame a, b, o;
-            fill_aji_frame(c, &a, c->up_prev, 1);
-            fill_aji_frame(c, &b, c->up_cur, 1);
-            fill_aji_frame(c, &o, interp, 1);
-            int ret = aji_infer_rife(c->aji, &a, &b, t, &o, c->stream);
-            AVFrame *emit = interp;
-            if (ret == AJI_SCENE) { emit = c->up_prev; c->scene_dupes++; }
-            else if (ret != AJI_OK) {
-                loge("aji_infer_rife: %d: %s", ret, aji_last_error(c->aji));
-                av_frame_free(&interp); return -1;
-            }
-            int er = emit_output(c, emit);
-            av_frame_free(&interp);
-            if (er < 0) return -1;
+    int scene = 0;
+    for (int k = 1; k < phases; k++) {
+        if (scene) {
+            c->scene_dupes++;
+            if (emit_rife_phase(c, c->up_prev, k) < 0) return -1;
+            continue;
         }
-    } else {
-        (void)factor;   /* rational factors: handled in a later revision */
+        double t = (double)k / phases;
+        /* fresh pool buffer per phase: the encoder holds a ref to the
+         * previous one, so we must not overwrite it */
+        AVFrame *interp = av_frame_alloc();
+        if (!interp || av_hwframe_get_buffer(c->aji_pool, interp, 0) < 0) {
+            loge("hwframe_get_buffer (interp) failed");
+            av_frame_free(&interp); return -1;
+        }
+        aji_frame a, b, o;
+        fill_aji_frame(c, &a, c->up_prev, 1);
+        fill_aji_frame(c, &b, c->up_cur, 1);
+        fill_aji_frame(c, &o, interp, 1);
+        int ret = aji_infer_rife(c->aji, &a, &b, t, &o, c->stream);
+        AVFrame *emit = interp;
+        if (ret == AJI_SCENE) {
+            emit = c->up_prev;
+            scene = 1;
+            c->scene_dupes++;
+        } else if (ret != AJI_OK) {
+            loge("aji_infer_rife: %d: %s", ret, aji_last_error(c->aji));
+            cudaStreamSynchronize(c->stream);
+            av_frame_free(&interp); return -1;
+        }
+        if (ret == AJI_OK && wait_inference(c) < 0) {
+            av_frame_free(&interp); return -1;
+        }
+        int er = emit_rife_phase(c, emit, k);
+        av_frame_free(&interp);
+        if (er < 0) return -1;
     }
 
     av_frame_free(&c->up_prev);
@@ -1186,20 +1398,23 @@ static AVFrame *prepare_rife_input(enc_ctx *c, AVFrame *dec)
     aji_frame in_f, out_f;
     fill_aji_frame(c, &in_f, dec, 0);
     fill_aji_frame(c, &out_f, work, 0);
+    work->pts = dec->pts;
+    work->duration = dec->duration;
+    work->time_base = c->out_tb;
     int ret = aji_resize(c->aji, &in_f, &out_f, c->stream);
-    av_frame_free(&dec);
     if (ret != AJI_OK) {
         loge("aji_resize: %d: %s", ret, aji_last_error(c->aji));
+        cudaStreamSynchronize(c->stream);
+        av_frame_free(&dec);
         av_frame_free(&work);
         return NULL;
     }
-    uint64_t ticket = aji_flush(c->aji, c->stream);
-    if (ticket && aji_wait(c->aji, ticket) != AJI_OK) {
-        loge("aji_wait after pre-RIFE resize failed: %s",
-             aji_last_error(c->aji));
+    if (wait_inference(c) < 0) {
+        av_frame_free(&dec);
         av_frame_free(&work);
         return NULL;
     }
+    av_frame_free(&dec);
     return work;
 }
 
@@ -1212,7 +1427,7 @@ static int push_rife_before(enc_ctx *c, AVFrame *dec)
         if (c->have_prev) {
             AVFrame *up = upscale_one(c, c->up_prev);
             if (!up) return -1;
-            int er = emit_output(c, up);
+            int er = emit_output(c, up, up->pts, up->duration);
             av_frame_free(&up);
             if (er < 0) return -1;
         }
@@ -1230,17 +1445,22 @@ static int push_rife_before(enc_ctx *c, AVFrame *dec)
 
     AVFrame *base_up = upscale_one(c, c->up_prev);
     if (!base_up) return -1;
-    int er = emit_output(c, base_up);
-    av_frame_free(&base_up);
-    if (er < 0) return -1;
+    int er = emit_rife_phase(c, base_up, 0);
+    if (er < 0) { av_frame_free(&base_up); return -1; }
 
     const int phases = c->rnum / c->rden;
+    int scene = 0;
     for (int k = 1; k < phases; k++) {
+        if (scene) {
+            c->scene_dupes++;
+            if (emit_rife_phase(c, base_up, k) < 0) goto fail;
+            continue;
+        }
         AVFrame *interp = av_frame_alloc();
         if (!interp || av_hwframe_get_buffer(c->rife_pool, interp, 0) < 0) {
             loge("hwframe_get_buffer (source RIFE) failed");
             av_frame_free(&interp);
-            return -1;
+            goto fail;
         }
         aji_frame a, b, o;
         fill_aji_frame(c, &a, c->up_prev, 0);
@@ -1248,28 +1468,35 @@ static int push_rife_before(enc_ctx *c, AVFrame *dec)
         fill_aji_frame(c, &o, interp, 0);
         int ret = aji_infer_rife(c->aji, &a, &b,
                                  (double)k / phases, &o, c->stream);
-        AVFrame *source = interp;
         if (ret == AJI_SCENE) {
-            source = c->up_prev;
+            scene = 1;
             c->scene_dupes++;
+            av_frame_free(&interp);
+            if (emit_rife_phase(c, base_up, k) < 0) goto fail;
+            continue;
         } else if (ret != AJI_OK) {
             loge("aji_infer_rife: %d: %s", ret, aji_last_error(c->aji));
+            cudaStreamSynchronize(c->stream);
             av_frame_free(&interp);
-            return -1;
+            goto fail;
         }
 
-        AVFrame *up = upscale_one(c, source);
+        AVFrame *up = upscale_one(c, interp);
         av_frame_free(&interp);
-        if (!up) return -1;
-        er = emit_output(c, up);
+        if (!up) goto fail;
+        er = emit_rife_phase(c, up, k);
         av_frame_free(&up);
-        if (er < 0) return -1;
+        if (er < 0) goto fail;
     }
 
+    av_frame_free(&base_up);
     av_frame_free(&c->up_prev);
     c->up_prev = c->up_cur;
     c->up_cur = NULL;
     return 0;
+fail:
+    av_frame_free(&base_up);
+    return -1;
 }
 
 static int push_rife(enc_ctx *c, AVFrame *dec)
@@ -1279,6 +1506,45 @@ static int push_rife(enc_ctx *c, AVFrame *dec)
 }
 
 /* ---- main demux/decode loop ---------------------------------------------- */
+
+static void set_frame_timing(enc_ctx *c, AVFrame *frame)
+{
+    AVStream *vst = c->ifmt->streams[c->vstream];
+    const int phases = c->rife ? c->rnum / c->rden : 1;
+    if (c->src_frames_seen == 0) {
+        c->out_tb = av_div_q(vst->time_base, (AVRational){phases, 1});
+        c->src_sar = av_guess_sample_aspect_ratio(c->ifmt, vst, frame);
+        if (c->src_sar.num <= 0 || c->src_sar.den <= 0)
+            c->src_sar = (AVRational){1, 1};
+        c->next_input_pts = vst->start_time == AV_NOPTS_VALUE ? 0
+            : av_rescale_q(vst->start_time, vst->time_base, c->out_tb);
+    }
+    int64_t pts = frame->best_effort_timestamp;
+    if (pts == AV_NOPTS_VALUE)
+        pts = frame->pts;
+    frame->pts = pts == AV_NOPTS_VALUE ? c->next_input_pts
+        : av_rescale_q(pts, vst->time_base, c->out_tb);
+    AVRational source_fps = av_div_q(c->out_fps, (AVRational){phases, 1});
+    frame->duration = frame->duration > 0
+        ? av_rescale_q(frame->duration, vst->time_base, c->out_tb)
+        : av_rescale_q(1, av_inv_q(source_fps), c->out_tb);
+    if (frame->duration < 1)
+        frame->duration = 1;
+    frame->time_base = c->out_tb;
+    c->next_input_pts = frame->pts + frame->duration;
+}
+
+/* Takes ownership on every path, including upload failures. */
+static int process_decoded_frame(enc_ctx *c, AVFrame *frame)
+{
+    set_frame_timing(c, frame);
+    if (prepare_decoded_frame(c, &frame) < 0) {
+        av_frame_free(&frame);
+        return -1;
+    }
+    c->src_frames_seen++;
+    return c->rife ? push_rife(c, frame) : push_upscale(c, frame);
+}
 
 static int run(enc_ctx *c)
 {
@@ -1296,13 +1562,7 @@ static int run(enc_ctx *c)
                     break;
                 }
                 if (r < 0) { av_frame_free(&fr); AV(r); }
-                /* fr is owned by the pipeline now */
-                c->src_frames_seen++;
-                if (c->rife) {
-                    if (push_rife(c, fr) < 0) goto done;
-                } else {
-                    if (push_upscale(c, fr) < 0) goto done;
-                }
+                if (process_decoded_frame(c, fr) < 0) goto done;
             }
         } else if (c->smap && c->smap[pkt->stream_index] >= 0) {
             AVStream *in = c->ifmt->streams[pkt->stream_index];
@@ -1311,8 +1571,9 @@ static int run(enc_ctx *c)
             if (c->opened) {
                 out->stream_index = oidx;
                 av_packet_rescale_ts(out, in->time_base, c->ofmt->streams[oidx]->time_base);
-                av_interleaved_write_frame(c->ofmt, out);
+                int r = av_interleaved_write_frame(c->ofmt, out);
                 av_packet_free(&out);
+                AV(r);
             } else {
                 /* header not written yet: buffer with input stream_index */
                 out->stream_index = pkt->stream_index;
@@ -1334,9 +1595,7 @@ static int run(enc_ctx *c)
         int r = avcodec_receive_frame(c->dec, fr);
         if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) { av_frame_free(&fr); break; }
         if (r < 0) { av_frame_free(&fr); AV(r); }
-        c->src_frames_seen++;
-        if (c->rife) { if (push_rife(c, fr) < 0) goto done; }
-        else         { if (push_upscale(c, fr) < 0) goto done; }
+        if (process_decoded_frame(c, fr) < 0) goto done;
     }
 
     /* flush pipeline */
@@ -1372,6 +1631,9 @@ fail:
 
 static void cleanup(enc_ctx *c)
 {
+    /* Keep all input/output allocations alive until queued work has stopped,
+     * including when the encoder failed before the ring could be drained. */
+    if (c->stream) cudaStreamSynchronize(c->stream);
     for (int i = 0; i < c->ring_count; i++) {
         slot *s = &c->ring[(c->ring_head - 1 - i + MAX_RING) % MAX_RING];
         av_frame_free(&s->out);
@@ -1390,6 +1652,7 @@ static void cleanup(enc_ctx *c)
     if (c->stream) cudaStreamDestroy(c->stream);
     av_buffer_unref(&c->aji_pool);
     av_buffer_unref(&c->rife_pool);
+    cleanup_decoder_frames(c);
     if (c->enc) avcodec_free_context(&c->enc);
     if (c->dec) avcodec_free_context(&c->dec);
     if (c->ofmt) {
@@ -1398,8 +1661,8 @@ static void cleanup(enc_ctx *c)
         avformat_free_context(c->ofmt);
     }
     if (c->ifmt) avformat_close_input(&c->ifmt);
-    av_buffer_unref(&c->hw_device);
     if (c->ctx_pushed) { CUcontext old; cuCtxPopCurrent(&old); }
+    av_buffer_unref(&c->hw_device);
 }
 
 /* ---- CLI ----------------------------------------------------------------- */
@@ -1556,7 +1819,8 @@ int main(int argc, char **argv)
     }
 
     if (resize_needed(&c)) compute_final_dims(&c);
-    if (!c.passthrough && init_aji_pool(&c) < 0) goto out;
+    if ((!c.passthrough || (c.rife && !c.rife_first)) &&
+        init_aji_pool(&c) < 0) goto out;
     if (init_rife_pool(&c) < 0) goto out;
     if (open_decoder(&c) < 0) goto out;
     if (open_output(&c) < 0) goto out;

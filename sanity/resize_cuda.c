@@ -18,6 +18,10 @@ static int check_resize(enum AVPixelFormat format)
     int result = 1;
     c.up_w = 7680;
     c.up_h = 4320;
+    c.src_w = c.up_w;
+    c.src_h = c.up_h;
+    c.src_sar = (AVRational){1, 1};
+    c.out_tb = (AVRational){1001, 24000};
     c.out_w = 3840;
     c.out_h = 2160;
     c.sw_fmt = format;

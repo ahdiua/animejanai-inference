@@ -1266,7 +1266,9 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
     // smaller frame (order: resize -> RIFE -> upscale). The filter applies it
     // to source frames via aji_resize; the upscale chain then starts here at
     // the work resolution. Rife-after and no-RIFE paths are unaffected.
-    const bool rife_first_mode = chain->rife && !c->rife_model_dir.empty() &&
+    const bool rife_requested = chain->rife && chain->rife_factor_den > 0 &&
+                                chain->rife_factor_num > chain->rife_factor_den;
+    const bool rife_first_mode = rife_requested && !c->rife_model_dir.empty() &&
                                  chain->rife_before_upscale;
     if (rife_first_mode && !chain->models.empty()) {
         int ww, wh;
@@ -1358,8 +1360,6 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
                 }
             }
         }
-        max_bytes = std::max(max_bytes, (size_t)3 * cw * ch * 2);
-
         if (m.name.empty())
             continue;
 
@@ -1393,10 +1393,9 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
                  "Applied Model: %s;    New Video Resolution: %dx%d",
                  m.name.c_str(), cw, ch);
         c->log_steps.push_back(buf);
-        max_bytes = std::max(max_bytes, (size_t)3 * cw * ch * 2);
     }
 
-    if (chain->rife) {
+    if (rife_requested) {
         if (!c->rife_model_dir.empty()) {
             // RIFE-first interpolates at the work resolution (source, or the
             // hoisted pre-RIFE downscale); the upscale models then run on every
@@ -1417,6 +1416,23 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         }
     }
 
+    if (c->has_pre_resize && !c->rife.enabled) {
+        // A pending or failed background RIFE build leaves callers feeding
+        // source-resolution frames to aji_infer. Keep the resize inside the
+        // chain until RIFE is ready, transferring ownership of its plan.
+        c->steps.insert(c->steps.begin(),
+                        {Step::RESIZE, c->work_w, c->work_h, -1,
+                         c->pre_resize_plan});
+        c->pre_resize_plan = nullptr;
+        c->has_pre_resize = false;
+        char buf[160];
+        snprintf(buf, sizeof(buf),
+                 "Applied Resize Before Upscale: %dx%d", c->work_w, c->work_h);
+        c->log_steps[0] = buf;
+        c->pre_src_w = c->pre_src_h = 0;
+        c->work_w = c->work_h = 0;
+    }
+
     finalize_log(c);
 
     if (!any_model && c->steps.empty() && !c->has_pre_resize) {
@@ -1427,6 +1443,10 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         return 0;
     }
 
+    // A resize may grow the image before a later resize (including maxShapes)
+    // shrinks it. Account for every intermediate tensor, not just model I/O.
+    for (const Step &st : c->steps)
+        max_bytes = std::max(max_bytes, (size_t)3 * st.out_w * st.out_h * 2);
     if (!ensure_buffers(c, max_bytes))
         return AJI_ERR_CUDA;
 
@@ -1764,7 +1784,7 @@ static int run_chain(aji_ctx *c, const aji_frame *in, const aji_frame *out,
 
 extern "C" AJI_EXPORT int aji_pre_resize(aji_ctx *c, int *work_w, int *work_h)
 {
-    if (!c || !c->has_pre_resize)
+    if (!c || !c->active || !c->rife.enabled || !c->has_pre_resize)
         return 0;
     if (work_w)
         *work_w = c->work_w;
