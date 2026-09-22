@@ -106,7 +106,10 @@ uint64_t aji_flush(aji_ctx *c, void *s) { return 1; }
 int aji_wait(aji_ctx *c, uint64_t t) { complete_pending(); return AJI_OK; }
 const char *aji_last_error(aji_ctx *c) { return "unexpected test failure"; }
 cudaError_t CUDARTAPI cudaStreamSynchronize(cudaStream_t s) { abort(); }
-
+cudaError_t CUDARTAPI cudaEventRecord(cudaEvent_t e, cudaStream_t s) { abort(); }
+cudaError_t CUDARTAPI cudaStreamWaitEvent(cudaStream_t s, cudaEvent_t e,
+                                        unsigned int flags) { abort(); }
+const char *CUDARTAPI cudaGetErrorString(cudaError_t e) { abort(); }
 
 int main(int argc, char **argv)
 {

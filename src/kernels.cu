@@ -79,7 +79,7 @@ struct aji_plan {
     int dw = 0, dh = 0;        // resize: dst dims
     pass ph, pv;
     float *tmp0 = nullptr;     // after the first pass
-    float *tmp1 = nullptr;     // after the second pass (pre only)
+    float *tmp1 = nullptr;     // after the second pass (pre/odd-width post)
 };
 
 /* ---------------- device helpers ---------------- */
@@ -167,6 +167,7 @@ __global__ void k_pre_combine(const uint8_t *y_plane, ptrdiff_t y_stride,
 /* ---------------- post: RGB fp16 -> NV12/P010 ---------------- */
 
 // matrix + luma quantize; chroma (normalized units) to 2 planar fp32
+// Retained for odd widths, where the horizontal ratio is not 2:1.
 template <typename T>
 __global__ void k_post_matrix(const __half *src, int w, int h, aji_csp csp,
                               float qdiv, float qmax,
@@ -205,6 +206,64 @@ __global__ void k_h_f32(const float *src, int h, pass px, float *dst)
     for (int j = 0; j < px.taps; j++)
         a += wt[j] * sp[mirr(s0 + j, px.src)];
     dst[(size_t)blockIdx.z * px.dst * h + (size_t)y * px.dst + x] = a;
+}
+
+// Matrix + luma quantize + horizontal chroma downsample. Keep the matrix
+// results in shared fp32 storage so the arithmetic/rounding matches the old
+// separate matrix and horizontal passes without full-resolution UV scratch.
+template <typename T>
+__global__ void k_post_matrix_h(const __half *src, int w, int h, aji_csp csp,
+                                float qdiv, float qmax,
+                                uint8_t *y_plane, ptrdiff_t y_stride,
+                                pass px, float *dst)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int bx = blockIdx.x * blockDim.x;
+    // The even-width 2:1 weight table advances exactly two source pixels
+    // per output. Include the halo needed by every output in this block.
+    const int base = px.start[bx];
+    const int pitch = 2 * blockDim.x + px.taps;
+    const size_t plane = (size_t)w * h;
+    extern __shared__ float uv_tile[];
+    float *su = uv_tile + threadIdx.y * pitch;
+    float *sv = uv_tile + (blockDim.y + threadIdx.y) * pitch;
+
+    if (y < h) {
+        for (int lx = threadIdx.x; lx < pitch; lx += blockDim.x) {
+            const int rawx = base + lx;
+            const int sx = mirr(rawx, w);
+            const size_t idx = (size_t)y * w + sx;
+            const float r = __half2float(src[idx]);
+            const float g = __half2float(src[plane + idx]);
+            const float b = __half2float(src[2 * plane + idx]);
+            const float Y = csp.kr * r + (1.0f - csp.kr - csp.kb) * g + csp.kb * b;
+            su[lx] = (b - Y) / (2.0f * (1.0f - csp.kb));
+            sv[lx] = (r - Y) / (2.0f * (1.0f - csp.kr));
+
+            // Halo pixels are shared by adjacent blocks. Only their owner
+            // writes luma, including when source taps mirror at an edge.
+            if (rawx >= 2 * bx && rawx < w &&
+                rawx < 2 * (bx + (int)blockDim.x)) {
+                T *yrow = (T *)(y_plane + (size_t)y * y_stride);
+                yrow[rawx] = (T)quant(Y * csp.yscale + csp.yoff, qdiv, qmax);
+            }
+        }
+    }
+    __syncthreads();
+    // Partial blocks must participate in the load and barrier above.
+    if (x >= px.dst || y >= h)
+        return;
+    const float *wt = px.wt + (size_t)x * px.taps;
+    const int s0 = px.start[x] - base;
+    float u = 0.0f, v = 0.0f;
+    for (int j = 0; j < px.taps; j++) {
+        u += wt[j] * su[s0 + j];
+        v += wt[j] * sv[s0 + j];
+    }
+    const size_t idx = (size_t)y * px.dst + x;
+    dst[idx] = u;
+    dst[(size_t)px.dst * h + idx] = v;
 }
 
 // vertical chroma resample + quantize + interleave
@@ -400,10 +459,12 @@ extern "C" aji_plan *aji_post_plan_create(int format, int w, int h, int siting,
     const int cw = w >> 1, ch = h >> 1;
     double sx, sy;
     chroma_shifts(siting, false, &sx, &sy);
+    const int scratch_width = (w & 1) ? w : cw;
     if (!build_pass(&p->ph, w, cw, sx, filter) ||
         !build_pass(&p->pv, h, ch, sy, filter) ||
-        cudaMalloc(&p->tmp0, (size_t)2 * w * h * sizeof(float)) != cudaSuccess ||
-        cudaMalloc(&p->tmp1, (size_t)2 * cw * h * sizeof(float)) != cudaSuccess) {
+        cudaMalloc(&p->tmp0, (size_t)2 * scratch_width * h * sizeof(float)) != cudaSuccess ||
+        ((w & 1) && cudaMalloc(&p->tmp1, (size_t)2 * cw * h * sizeof(float))
+                       != cudaSuccess)) {
         aji_plan_destroy(p);
         return nullptr;
     }
@@ -472,23 +533,36 @@ extern "C" int aji_run_post(aji_plan *p, const void *src_f16,
     const bool p010 = p->format == AJI_FMT_P010;
     const float qdiv = p010 ? 64.0f : 1.0f;
     const float qmax = p010 ? 1023.0f : 255.0f;
-    if (p010) {
-        k_post_matrix<uint16_t><<<GRID(w, h, 1), 0, s>>>(
+    const size_t shared_bytes = (size_t)2 * BLOCK_Y *
+        (2 * BLOCK_X + p->ph.taps) * sizeof(float);
+    if (w & 1) {
+        if (p010) {
+            k_post_matrix<uint16_t><<<GRID(w, h, 1), 0, s>>>(
+                (const __half *)src_f16, w, h, *csp, qdiv, qmax,
+                (uint8_t *)y_plane, y_stride, p->tmp0);
+        } else {
+            k_post_matrix<uint8_t><<<GRID(w, h, 1), 0, s>>>(
+                (const __half *)src_f16, w, h, *csp, qdiv, qmax,
+                (uint8_t *)y_plane, y_stride, p->tmp0);
+        }
+        k_h_f32<<<GRID(cw, h, 2), 0, s>>>(p->tmp0, h, p->ph, p->tmp1);
+    } else if (p010) {
+        k_post_matrix_h<uint16_t><<<GRID(cw, h, 1), shared_bytes, s>>>(
             (const __half *)src_f16, w, h, *csp, qdiv, qmax,
-            (uint8_t *)y_plane, y_stride, p->tmp0);
+            (uint8_t *)y_plane, y_stride, p->ph, p->tmp0);
     } else {
-        k_post_matrix<uint8_t><<<GRID(w, h, 1), 0, s>>>(
+        k_post_matrix_h<uint8_t><<<GRID(cw, h, 1), shared_bytes, s>>>(
             (const __half *)src_f16, w, h, *csp, qdiv, qmax,
-            (uint8_t *)y_plane, y_stride, p->tmp0);
+            (uint8_t *)y_plane, y_stride, p->ph, p->tmp0);
     }
-    k_h_f32<<<GRID(cw, h, 2), 0, s>>>(p->tmp0, h, p->ph, p->tmp1);
+    const float *uvf = (w & 1) ? p->tmp1 : p->tmp0;
     if (p010) {
         k_uv_v_store<uint16_t><<<GRID(cw, ch, 1), 0, s>>>(
-            p->tmp1, cw, p->pv, *csp, qdiv, qmax,
+            uvf, cw, p->pv, *csp, qdiv, qmax,
             (uint8_t *)uv_plane, uv_stride);
     } else {
         k_uv_v_store<uint8_t><<<GRID(cw, ch, 1), 0, s>>>(
-            p->tmp1, cw, p->pv, *csp, qdiv, qmax,
+            uvf, cw, p->pv, *csp, qdiv, qmax,
             (uint8_t *)uv_plane, uv_stride);
     }
     return (int)cudaGetLastError();

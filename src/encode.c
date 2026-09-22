@@ -232,6 +232,7 @@ typedef struct {
     /* libaji */
     aji_ctx        *aji;
     cudaStream_t    stream;
+    cudaEvent_t     input_ready;
     int             src_w, src_h;
     int             up_w, up_h;      /* libaji upscale output (pool dims) */
     int             out_w, out_h;    /* final encode dims (after resize) */
@@ -292,6 +293,7 @@ typedef struct {
 static int emit_output(enc_ctx *c, AVFrame *cuda_out,
                        int64_t pts, int64_t duration);
 static int drain_encoder(enc_ctx *c, int flush);
+static int wait_frame_stream(enc_ctx *c, const AVFrame *frame);
 
 /* ---- decoder: force NVDEC's CUDA output format --------------------------- */
 
@@ -339,8 +341,14 @@ static int setup_cuda(enc_ctx *c)
         return -1;
     }
     c->ctx_pushed = 1;
-    if (cudaStreamCreate(&c->stream) != cudaSuccess) {
-        loge("cudaStreamCreate failed");
+    cudaError_t err = cudaStreamCreateWithFlags(&c->stream, cudaStreamNonBlocking);
+    if (err != cudaSuccess) {
+        loge("cudaStreamCreateWithFlags failed: %s", cudaGetErrorString(err));
+        return -1;
+    }
+    err = cudaEventCreateWithFlags(&c->input_ready, cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+        loge("cudaEventCreateWithFlags failed: %s", cudaGetErrorString(err));
         return -1;
     }
     return 0;
@@ -1058,6 +1066,10 @@ static int emit_output(enc_ctx *c, AVFrame *cuda_out,
                                         AV_BUFFERSRC_FLAG_KEEP_REF));
         resized = av_frame_alloc();
         AV(av_buffersink_get_frame(c->buf_sink, resized));
+        /* scale_cuda can release its input while its reads are still queued.
+         * Order subsequent inference after those reads before the caller
+         * returns cuda_out to its reusable frame pool. */
+        if (wait_frame_stream(c, cuda_out) < 0) goto done;
         to_encode = resized;
     } else if (zerocopy) {
         to_encode = cuda_out;          /* zero-copy CUDA frame straight in */
@@ -1534,11 +1546,37 @@ static void set_frame_timing(enc_ctx *c, AVFrame *frame)
     c->next_input_pts = frame->pts + frame->duration;
 }
 
+/* Order inference after work on a frame's actual device stream (which can
+ * differ from our own hwdevice's stream). A wait captures this recording,
+ * so the event can be reused while earlier frames remain in flight. */
+static int wait_frame_stream(enc_ctx *c, const AVFrame *frame)
+{
+    AVHWFramesContext *fc = (AVHWFramesContext *)frame->hw_frames_ctx->data;
+    AVCUDADeviceContext *dc = (AVCUDADeviceContext *)fc->device_ctx->hwctx;
+    cudaStream_t producer = (cudaStream_t)dc->stream;
+    CK(cudaEventRecord(c->input_ready, producer));
+    CK(cudaStreamWaitEvent(c->stream, c->input_ready, 0));
+    return 0;
+fail:
+    /* Do not release a frame while this stream may still be using it. */
+    cudaStreamSynchronize(producer);
+    return -1;
+}
+
+/* Nonblocking inference needs an explicit dependency on NVDEC/upload writes. */
+static int wait_decoded_frame(enc_ctx *c, const AVFrame *frame)
+{
+    if (c->passthrough && !c->rife)
+        return 0;
+    return wait_frame_stream(c, frame);
+}
+
 /* Takes ownership on every path, including upload failures. */
 static int process_decoded_frame(enc_ctx *c, AVFrame *frame)
 {
     set_frame_timing(c, frame);
-    if (prepare_decoded_frame(c, &frame) < 0) {
+    if (prepare_decoded_frame(c, &frame) < 0 ||
+        wait_decoded_frame(c, frame) < 0) {
         av_frame_free(&frame);
         return -1;
     }
@@ -1649,6 +1687,7 @@ static void cleanup(enc_ctx *c)
     av_free(c->aux_buf);
     av_free(c->smap);
     if (c->aji) aji_destroy(&c->aji);
+    if (c->input_ready) cudaEventDestroy(c->input_ready);
     if (c->stream) cudaStreamDestroy(c->stream);
     av_buffer_unref(&c->aji_pool);
     av_buffer_unref(&c->rife_pool);

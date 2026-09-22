@@ -34,7 +34,73 @@ uint64_t aji_flush(aji_ctx *c, void *s) { return 1; }
 int aji_wait(aji_ctx *c, uint64_t t) { return AJI_OK; }
 const char *aji_last_error(aji_ctx *c) { abort(); }
 
-cudaError_t CUDARTAPI cudaStreamSynchronize(cudaStream_t s) { abort(); }
+/* A real decode/encode on the CPU must never wait on a GPU. These substitutes
+ * also exercise input dependencies using distinct producer/consumer streams. */
+static int sync_test, sync_failure, record_calls, wait_calls, sync_calls;
+static cudaStream_t expected_producer, expected_consumer;
+static cudaEvent_t expected_event;
+cudaError_t CUDARTAPI cudaEventRecord(cudaEvent_t e, cudaStream_t s)
+{
+    assert(sync_test && s == expected_producer && e == expected_event);
+    assert(!record_calls && !wait_calls && !sync_calls);
+    record_calls++;
+    return sync_failure == 1 ? cudaErrorUnknown : cudaSuccess;
+}
+cudaError_t CUDARTAPI cudaStreamWaitEvent(cudaStream_t s, cudaEvent_t e,
+                                        unsigned int flags)
+{
+    assert(sync_test && s == expected_consumer && e == expected_event && !flags);
+    assert(record_calls == 1 && !wait_calls && !sync_calls);
+    wait_calls++;
+    return sync_failure == 2 ? cudaErrorUnknown : cudaSuccess;
+}
+cudaError_t CUDARTAPI cudaStreamSynchronize(cudaStream_t s)
+{
+    assert(sync_test && sync_failure && s == expected_producer);
+    assert(record_calls == 1 && wait_calls == (sync_failure == 2));
+    sync_calls++;
+    return cudaSuccess;
+}
+const char *CUDARTAPI cudaGetErrorString(cudaError_t e)
+{
+    assert(sync_test && e == cudaErrorUnknown);
+    return "injected dependency failure";
+}
+
+static int test_input_dependencies(void)
+{
+    enc_ctx c = {0};
+    AVCUDADeviceContext producer = {0}, unrelated = {0};
+    AVHWDeviceContext device = {.type = AV_HWDEVICE_TYPE_CUDA, .hwctx = &producer};
+    AVHWDeviceContext own_device = {.type = AV_HWDEVICE_TYPE_CUDA, .hwctx = &unrelated};
+    AVBufferRef own_ref = {.data = (uint8_t *)&own_device};
+    AVHWFramesContext frames = {.device_ctx = &device};
+    AVBufferRef frames_ref = {.data = (uint8_t *)&frames};
+    AVFrame frame = {.format = AV_PIX_FMT_CUDA, .hw_frames_ctx = &frames_ref};
+    c.hw_device = &own_ref;
+    c.stream = expected_consumer = (cudaStream_t)(uintptr_t)1;
+    c.input_ready = expected_event = (cudaEvent_t)(uintptr_t)2;
+    unrelated.stream = (CUstream)(uintptr_t)3;
+    sync_test = 1;
+    for (int nondefault = 0; nondefault < 2; nondefault++) {
+        producer.stream = nondefault ? (CUstream)(uintptr_t)4 : NULL;
+        expected_producer = (cudaStream_t)producer.stream;
+        for (c.passthrough = 0; c.passthrough < 2; c.passthrough++) {
+            for (c.rife = 0; c.rife < 2; c.rife++) {
+                for (sync_failure = 0; sync_failure < 3; sync_failure++) {
+                    record_calls = wait_calls = sync_calls = 0;
+                    int waits = !c.passthrough || c.rife;
+                    int r = wait_decoded_frame(&c, &frame);
+                    assert(r == (waits && sync_failure ? -1 : 0));
+                    assert(record_calls == waits);
+                    assert(wait_calls == (waits && sync_failure != 1));
+                    assert(sync_calls == (waits && sync_failure != 0));
+                }
+            }
+        }
+    }
+    return 0;
+}
 
 static int synthetic_rife(enc_ctx *c)
 {
@@ -79,6 +145,8 @@ static int synthetic_rife(enc_ctx *c)
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "stream-sync"))
+        return test_input_dependencies();
     if (argc < 4) return 2;
     enc_ctx c = {0};
     c.o.input = argv[2];
@@ -225,6 +293,11 @@ class EncoderMetadataTests(unittest.TestCase):
                                 '-show_data', '-of', 'json', str(output)],
                                check=True, text=True, capture_output=True)
         return json.loads(probe.stdout)['streams'], result
+
+    def test_inference_waits_on_frame_producer_stream(self):
+        result = subprocess.run([str(self.binary), 'stream-sync'],
+                                text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_matroska_preserves_fonts_metadata_dispositions_and_sar(self):
         streams, _ = self.mux('.mkv')
