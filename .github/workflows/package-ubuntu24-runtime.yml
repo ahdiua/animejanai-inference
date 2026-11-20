@@ -15,6 +15,8 @@ on:
       - '.github/workflows/package-ubuntu24-runtime.yml'
       - 'packaging/ubuntu24/**'
       - 'scripts/package-ubuntu24-runtime*.sh'
+      - 'scripts/runtime-models.tsv'
+      - 'scripts/model-assets.sh'
       - 'sanity/test_package_download.py'
       - 'scripts/prune-prereleases.py'
       - 'tools/convert_rife_fp16.py'
