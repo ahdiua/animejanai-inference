@@ -1,9 +1,10 @@
 /* TensorRT configuration regressions; requires CUDA but no real models.
  * Build from the project root:
  * cc -std=c11 -O2 -Iinclude -I/usr/local/cuda/include sanity/trt_configure.c \
- *   -Lbuild -Wl,-rpath,"$PWD/build" -laji_trt \
+ *   -Lbuild -Wl,-rpath,"$PWD/build" -laji \
  *   -L/usr/local/cuda/lib64 -lcudart -o /tmp/aji_trt_configure_test
- * Run both with and without AJI_NO_GRAPH=1:
+ * (On WSL, put /usr/lib/wsl/lib first in LD_LIBRARY_PATH if a native
+ * libcuda.so.1 is also installed.) Run both with and without AJI_NO_GRAPH=1:
  * compute-sanitizer --tool memcheck --error-exitcode 99 /tmp/aji_trt_configure_test
  * /bin/false substitutes for trtexec, so no ONNX files are parsed or built.
  */
@@ -118,6 +119,10 @@ static int check_case(const char *root, int resize, int rife_factor)
             aji_pre_resize(ctx, NULL, NULL) != 0 ||
             !infer_source(ctx, ow, oh))
             goto done;
+    } else if (rife_factor == 1 &&
+               strstr(aji_current_log(ctx), "rife_v")) {
+        fprintf(stderr, "factor 1 unexpectedly set up RIFE\n");
+        goto done;
     } else if (rife_factor == 1 && aji_poll(ctx)) {
         fprintf(stderr, "factor 1 unexpectedly started an engine build\n");
         goto done;

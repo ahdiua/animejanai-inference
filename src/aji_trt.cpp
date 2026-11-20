@@ -1368,7 +1368,11 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
     // RIFE-first would feed interpolated frames into the temporal model's
     // window; interpolate the upscaled frames instead.
     const bool rife_before = chain->rife_before_upscale && n_temporal == 0;
-    if (chain->rife && chain->rife_before_upscale && n_temporal)
+    // A factor of 1 (the conf default when only chain_N_rife=yes is set)
+    // adds no frames: don't build or run RIFE for it.
+    const bool rife_requested = chain->rife && chain->rife_factor_den > 0 &&
+                                chain->rife_factor_num > chain->rife_factor_den;
+    if (rife_requested && chain->rife_before_upscale && n_temporal)
         c->log_steps.push_back("RIFE before upscale is not supported with a "
                                "temporal model; interpolating after upscale");
 
@@ -1377,7 +1381,7 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
     // smaller frame (order: resize -> RIFE -> upscale). The filter applies it
     // to source frames via aji_resize; the upscale chain then starts here at
     // the work resolution. Rife-after and no-RIFE paths are unaffected.
-    const bool rife_first_mode = chain->rife && !c->rife_model_dir.empty() &&
+    const bool rife_first_mode = rife_requested && !c->rife_model_dir.empty() &&
                                  rife_before;
     if (rife_first_mode && !chain->models.empty()) {
         int ww, wh;
@@ -1619,7 +1623,7 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         max_bytes = std::max(max_bytes, (size_t)3 * cw * ch * 2);
     }
 
-    if (chain->rife) {
+    if (rife_requested) {
         if (!c->rife_model_dir.empty()) {
             // RIFE-first interpolates at the work resolution (source, or the
             // hoisted pre-RIFE downscale); the upscale models then run on every
@@ -1640,6 +1644,29 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         }
     }
 
+    if (c->has_pre_resize && !c->rife.enabled) {
+        // RIFE is still building in the background (or its build failed):
+        // aji_rife_before_upscale() and aji_pre_resize() report no RIFE, so
+        // callers feed source-resolution frames to aji_infer. Keep the
+        // hoisted resize inside the chain until RIFE is ready, moving its
+        // plan into the step.
+        Step st{Step::RESIZE, c->work_w, c->work_h, -1};
+        st.plan = c->pre_resize_plan;
+        c->steps.insert(c->steps.begin(), st);
+        c->pre_resize_plan = nullptr;
+        c->has_pre_resize = false;
+        for (std::string &line : c->log_steps) {
+            const std::string tag = " (before RIFE)";
+            if (line.size() > tag.size() &&
+                line.compare(line.size() - tag.size(), tag.size(), tag) == 0) {
+                line.erase(line.size() - tag.size());
+                break;
+            }
+        }
+        c->pre_src_w = c->pre_src_h = 0;
+        c->work_w = c->work_h = 0;
+    }
+
     finalize_log(c);
 
     if (!any_model && c->steps.empty() && !c->has_pre_resize) {
@@ -1650,6 +1677,12 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         return 0;
     }
 
+    // A resize can grow the image before a later one (the dynamic engine's
+    // maxShapes cap) shrinks it again within the same model's loop pass, so
+    // the per-model sizes above can miss an intermediate tensor. Every step
+    // writes its output to the ping-pong buffers: size them for the largest.
+    for (const Step &st : c->steps)
+        max_bytes = std::max(max_bytes, (size_t)3 * st.out_w * st.out_h * 2);
     if (!ensure_buffers(c, max_bytes))
         return AJI_ERR_CUDA;
     if (!c->temporal.st.empty() && !setup_temporal(c))
@@ -2514,7 +2547,7 @@ extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
 
 extern "C" AJI_EXPORT int aji_pre_resize(aji_ctx *c, int *work_w, int *work_h)
 {
-    if (!c || !c->has_pre_resize)
+    if (!c || !c->active || !c->rife.enabled || !c->has_pre_resize)
         return 0;
     if (work_w)
         *work_w = c->work_w;
