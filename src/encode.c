@@ -2003,14 +2003,44 @@ static AVBufferRef *make_pool(enc_ctx *c, enum AVPixelFormat sw, int w, int h,
 /* Allocate the frame pool that libaji writes its upscaled output into.
  * CUDA frames come from a libav hw_frames_ctx so the device pointers are
  * valid for NVENC (zero-copy) and carry a hw_frames_ctx for scale_cuda. */
+static void parse_vquality(const char *s, AVDictionary **d);
+
+/* How many frames of a fixed-size CUDA pool the encoder can hold at once.
+ * NVENC holds at most its input surfaces, which FFmpeg's nvenc sizes from
+ * the options: rc-lookahead + B-frame interval + 5 with a lookahead, else
+ * the B-frame interval + 4 (B-frames, when not given, counted at the most
+ * any preset uses), an explicit -surfaces when larger, at most 64; plus a
+ * little slack. Sizing for that instead of a flat 48 keeps a 4x model's 8K
+ * output pool from taking ~3 GB more VRAM than the encoder can use. Other
+ * encoders keep the flat 48. */
+static int encoder_held_frames(const enc_ctx *c)
+{
+    if (!is_nvenc(c->o.vcodec))
+        return 48;
+    AVDictionary *d = NULL;
+    parse_vquality(c->o.vquality, &d);
+    const AVDictionaryEntry *e;
+    int la = (e = av_dict_get(d, "rc-lookahead", NULL, 0)) ? atoi(e->value) : 0;
+    int bf = (e = av_dict_get(d, "bf", NULL, 0)) ? atoi(e->value) : 7;
+    int surfaces = (e = av_dict_get(d, "surfaces", NULL, 0)) ? atoi(e->value) : 0;
+    av_dict_free(&d);
+    if (bf < 0 || bf > 7) bf = 7;
+    if (la < 0) la = 0;
+    int n = la > 0 ? la + bf + 1 + 5 : bf + 1 + 4;
+    if (surfaces > n) n = surfaces;
+    if (n > 64) n = 64;
+    return n + 4;
+}
+
 static int init_aji_pool(enc_ctx *c)
 {
     /* cover in-flight ring/RIFE frames plus those the encoder holds
-     * (NVENC async depth + B-frames) — the CUDA pool is fixed-size. Held
-     * frame reuse keeps one more: the anchor's output, after its slot has
-     * gone (reused frames share its buffer and take none). */
+     * (encoder_held_frames) — the CUDA pool is fixed-size. Held frame
+     * reuse keeps one more: the anchor's output, after its slot has gone
+     * (reused frames share its buffer and take none). */
     c->aji_pool = make_pool(c, c->sw_fmt, c->up_w, c->up_h,
-                            c->ring_depth + 48 + (c->reuse ? 1 : 0));
+                            c->ring_depth + encoder_held_frames(c) +
+                            (c->reuse ? 1 : 0));
     return c->aji_pool ? 0 : -1;
 }
 
@@ -2621,7 +2651,8 @@ static AVFrame *final_resize_aji(enc_ctx *c, AVFrame *src)
         return NULL;
     const AVHWFramesContext *fc = (const AVHWFramesContext *)src->hw_frames_ctx->data;
     if (!c->final_pool) {
-        if (!(c->final_pool = make_pool(c, fc->sw_format, c->out_w, c->out_h, 48)) ||
+        if (!(c->final_pool = make_pool(c, fc->sw_format, c->out_w, c->out_h,
+                                         encoder_held_frames(c))) ||
             cudaStreamCreate(&c->final_stream) != cudaSuccess) {
             loge("final resize: CUDA setup failed; using scale_cuda");
             c->final_scale_cuda = 1;
