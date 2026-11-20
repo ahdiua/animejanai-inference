@@ -5,7 +5,7 @@
 # 特别集成：AutoDL 旧源清理、严格要求 CUDA Toolkit 13.x 与 TensorRT 11.x 自动部署、
 #          NVIDIA 官方源配置、TensorRT 11 强类型自动适配、
 #          BtbN FFmpeg (n8.1/master) Shared、NVENC 容器多卡修复补丁 (libnvenc_fix)、
-#          Python venv、3 大常用超分模型与 1 分钟快速验证
+#          Python venv、按 conf 布局下载模型（含 RIFE）与 1 分钟快速验证
 # ==============================================================================
 
 set -o pipefail
@@ -30,17 +30,7 @@ NVENC_FIX_SO="/opt/libnvenc_fix.so"
 NVENC_FIX_SRC_URL="https://raw.githubusercontent.com/flexgrip/nvidia-gpu-enumeration/1475091ae9e8fb23cc22d565adf932a488d00bcd/nvenc_fix.c"
 NVENC_FIX_SRC_MIRROR="https://ghproxy.net/https://raw.githubusercontent.com/flexgrip/nvidia-gpu-enumeration/1475091ae9e8fb23cc22d565adf932a488d00bcd/nvenc_fix.c"
 
-# AnimeJaNai 官方直链 (R2 CDN 高速直连下载，秒级获取无需解压)
-URL_ANIMEJANAI_V31_PERF="https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx"
-URL_ANIMEJANAI_V31_BAL="https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx"
-URL_ANIMEJANAI_V31_PERF_SHARP="https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1Sharp1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx"
-URL_ANIMEJANAI_V31_BAL_SHARP="https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1Sharp1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx"
-URL_ANIMEJANAI_SD_COMPACT="https://r2.ahdiua.com/2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo.onnx"
-URL_REALESRGAN_ANIMEVIDEO_V3="https://r2.ahdiua.com/realesr-animevideov3-v0.2.5.0-fp16-dynamic.onnx"
-
-# Real-ESRGAN Anime 6B 经典动漫模型 (Hugging Face / HF-Mirror)
-DEFAULT_ONNX_REALESRGAN_ANIME6B_URL="https://huggingface.co/deepghs/imgutils-models/resolve/main/real_esrgan/RealESRGAN_x4plus_anime_6B.onnx"
-DEFAULT_ONNX_REALESRGAN_ANIME6B_MIRROR="https://hf-mirror.com/deepghs/imgutils-models/resolve/main/real_esrgan/RealESRGAN_x4plus_anime_6B.onnx"
+# 模型的文件名、来源与 SHA256 见 scripts/runtime-models.tsv（与 Runtime 打包共用）。
 
 # FFmpeg 固定日期构建；更新 URL 时必须同时更新对应 SHA256。
 FFMPEG_TAR_N81_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-31-13-27/ffmpeg-n8.1.2-50-g1a748fe2cd-linux64-gpl-shared-8.1.tar.xz"
@@ -492,21 +482,23 @@ check_build_and_models() {
     fi
 
     if [ -d "$MODELS_DIR" ]; then
-        local onnx_count
-        onnx_count=$(find "$MODELS_DIR" -maxdepth 1 -name "*.onnx" 2>/dev/null | wc -l) || return 1
-        local engine_count
-        engine_count=$(find "$MODELS_DIR" -maxdepth 1 -name "*.engine" 2>/dev/null | wc -l) || return 1
-        echo -e "  - 模型目录 (${MODELS_DIR}): 找到 ${onnx_count} 个 ONNX 模型，${engine_count} 个 Engine 文件"
-        if [ "$onnx_count" -gt 0 ]; then
-            for m in "$MODELS_DIR"/*.onnx; do
-                [ -f "$m" ] && echo -e "    * ONNX: $(basename "$m") ($(du -h "$m" | cut -f1))"
-            done
-        fi
-        if [ "$engine_count" -gt 0 ]; then
-            for e in "$MODELS_DIR"/*.engine; do
-                [ -f "$e" ] && echo -e "    * Engine: $(basename "$e") ($(du -h "$e" | cut -f1))"
-            done
-        fi
+        load_model_assets || return 1
+        local row=() total=0 present=0 missing=()
+        while IFS=$'\t' read -r -u 3 -a row; do
+            total=$((total + 1))
+            if [ -s "$MODELS_DIR/${row[2]}" ]; then
+                present=$((present + 1))
+            else
+                missing+=("${row[2]}")
+            fi
+        done 3< <(aji_model_rows)
+        echo -e "  - 模型目录 (${MODELS_DIR}): 内置方案模型 ${present}/${total}"
+        local file
+        for file in "${missing[@]}"; do
+            echo -e "    * 缺失: ${file}"
+        done
+        [ ${#missing[@]} -eq 0 ] || echo -e "${YELLOW}ℹ 可运行 ./deploy.sh --models 下载缺失模型${NC}"
+        report_legacy_model_files
     else
         echo -e "  - 模型目录 (${MODELS_DIR}): 尚未创建"
     fi
@@ -711,7 +703,8 @@ setup_python_venv() {
         python3 -m venv "$VENV_DIR" || return 1
     fi
     "$VENV_DIR/bin/python3" -m pip install --upgrade pip || return 1
-    "$VENV_DIR/bin/python3" -m pip install --no-cache-dir numpy onnx tqdm py7zr || return 1
+    # Same pins as the runtime packager, so tools/prepare_apisr.py writes the same model.
+    "$VENV_DIR/bin/python3" -m pip install --no-cache-dir 'numpy==2.5.2' 'onnx==1.22.0' tqdm py7zr || return 1
     printf 'Python 虚拟环境配置完成: %s\n' "$VENV_DIR"
 }
 
@@ -748,7 +741,7 @@ build_project() (
 
     echo -e "\n${CYAN}3. 验证构建结果产物...${NC}"
     local missing=0
-    for bin in "${PROJECT_ROOT}/build/libaji.so" "${PROJECT_ROOT}/build/libaji_trt.so" "${PROJECT_ROOT}/build/aji_harness" "${PROJECT_ROOT}/build/aji_encode" "${PROJECT_ROOT}/build/aji_engine_path"; do
+    for bin in "${PROJECT_ROOT}/build/libaji.so" "${PROJECT_ROOT}/build/libaji_trt.so" "${PROJECT_ROOT}/build/aji_harness" "${PROJECT_ROOT}/build/aji_encode"; do
         if [ -f "$bin" ]; then
             echo -e "  - $(basename "$bin"): ${GREEN}✔ $(du -h "$bin" | cut -f1)${NC}"
         else
@@ -766,36 +759,47 @@ build_project() (
     fi
 )
 
-# 下载辅助函数（带镜像回退）
+# ---- 模型（与打包 Runtime 共用 scripts/runtime-models.tsv）---------------
+# 源码安装与 Runtime 包使用同一布局：$MODELS_DIR/<conf 中的模型名>.onnx 与
+# $MODELS_DIR/rife/rife_v<版本>.onnx。Engine 不再预构建：native kernel 直接运行
+# 支持的模型，其余模型由 backend 首次使用时构建并缓存。
+
+load_model_assets() {
+    # shellcheck source=scripts/model-assets.sh
+    source "$PROJECT_ROOT/scripts/model-assets.sh"
+}
+
 ensure_model_python() {
     [ -x "$VENV_DIR/bin/python3" ] || { echo "请先运行 --venv 配置模型校验环境。" >&2; return 1; }
-    "$VENV_DIR/bin/python3" -c 'import onnx' || return 1
+    "$VENV_DIR/bin/python3" -c 'import onnx, numpy' || return 1
 }
 
 download_model_file() {
     ensure_model_python || return 1
     printf '获取并校验模型: %s\n' "$4"
-    "$VENV_DIR/bin/python3" "$PROJECT_ROOT/scripts/download_model.py" "$2" "$1" --mirror "$3"
+    local sha_args=()
+    [ -z "${5:-}" ] || [ "$5" = "-" ] || sha_args=(--sha256 "$5")
+    "$VENV_DIR/bin/python3" "$PROJECT_ROOT/scripts/download_model.py" "$2" "$1" \
+        --mirror "$3" "${sha_args[@]}"
 }
 
-# 批量下载并提取 AnimeJaNai V3.1 官方高清超分模型
-# 批量下载 AnimeJaNai V3.1 官方超分模型 (直链秒级下载，无需解压)
-download_animejanai_models() {
-    local perf_dest="${MODELS_DIR}/performance.onnx"
-    local bal_dest="${MODELS_DIR}/balanced.onnx"
-    local perf_sharp_dest="${MODELS_DIR}/performance_sharp1.onnx"
-    local bal_sharp_dest="${MODELS_DIR}/balanced_sharp1.onnx"
-
-    echo -e "\n${CYAN}>>> 正在下载 AnimeJaNai V3.1 官方模型（含 Sharp1）(R2 直链秒级极速下载)...${NC}"
-    download_model_file "$perf_dest" "$URL_ANIMEJANAI_V31_PERF" "" "AnimeJaNai V3.1 Performance (2x)" || return 1
-    download_model_file "$bal_dest" "$URL_ANIMEJANAI_V31_BAL" "" "AnimeJaNai V3.1 Balanced (2x)" || return 1
-    download_model_file "$perf_sharp_dest" "$URL_ANIMEJANAI_V31_PERF_SHARP" "" "AnimeJaNai V3.1 Sharp1 Performance (2x)" || return 1
-    download_model_file "$bal_sharp_dest" "$URL_ANIMEJANAI_V31_BAL_SHARP" "" "AnimeJaNai V3.1 Sharp1 Balanced (2x)" || return 1
+fetch_https() {
+    local url="$1" destination="$2"
+    [[ "$url" == https://* ]] || return 1
+    if command -v curl >/dev/null; then
+        curl --fail --location --proto '=https' --proto-redir '=https' \
+            --connect-timeout 20 --max-time 1800 --retry 2 --output "$destination" "$url"
+    elif command -v wget >/dev/null; then
+        wget --https-only --timeout=30 --tries=3 -O "$destination" -- "$url"
+    else
+        echo "需要 curl 或 wget 下载依赖。" >&2
+        return 1
+    fi
 }
 
 prepare_apisr_model() (
     ensure_model_python || return 1
-    local target_path="${MODELS_DIR}/2x_APISR_RRDB_GAN_fp16.onnx" tmp_dir
+    local target_path="$1" tmp_dir
     if [ -s "$target_path" ]; then
         "$VENV_DIR/bin/python3" -c 'import onnx,sys; onnx.checker.check_model(sys.argv[1])' "$target_path" || return 1
         echo "已校验 APISR: $target_path"
@@ -816,228 +820,235 @@ prepare_apisr_model() (
     echo "APISR 模型已准备好。"
 )
 
-# 单模型 Engine 构建函数
-build_single_engine() (
-    local onnx_path="$1"
-    local opt_w="$2"
-    local opt_h="$3"
-    local engine_suffix="$4"
-
-    if [ ! -s "$onnx_path" ]; then
-        echo -e "${RED}[错误] ONNX 文件不存在或为空: ${onnx_path}${NC}"
-        return 1
+# RIFE: one archive (upstream's fp16 RIFE release) holds every version;
+# install_model_groups downloads it at most once into $RIFE_ARCHIVE_DIR.
+prepare_rife_model() (
+    local target="$1" file="$2" url="$3" sha="$4" archive tmp_dir
+    if aji_sha_ok "$target" "$sha"; then
+        echo "已校验 RIFE: $target"
+        return 0
     fi
-
-    activate_build_environment || return 1
-    resolve_tensorrt || return 1
-    prepend_path LD_LIBRARY_PATH "$TRT_LIB_DIR"
-    local model_basename
-    model_basename="$(basename "$onnx_path" .onnx)" || return 1
-    local engine_path="${MODELS_DIR}/${model_basename}_${engine_suffix}.engine"
-
-    ensure_model_python || return 1
-    local input_name
-    input_name=$("$VENV_DIR/bin/python3" - "$onnx_path" <<'PYONNX'
-import onnx, sys
-m = onnx.load(sys.argv[1])
-onnx.checker.check_model(m)
-print(m.graph.input[0].name)
-PYONNX
-) || return 1
-    [ -n "$input_name" ] || return 1
-
-    local build_log="${engine_path}.build.log"
-    local timing_cache="${MODELS_DIR}/${model_basename}.timing.cache"
-    # 可读名称不包含设备/版本信息，每次按当前环境构建，成功后才替换旧引擎。
-    local build_dir
-    build_dir=$(mktemp -d "$MODELS_DIR/.aji-engine.XXXXXX") || return 1
-    trap 'rm -rf -- "$build_dir"' EXIT
+    archive="$RIFE_ARCHIVE_DIR/$(basename -- "$url")"
+    if [ ! -s "$archive" ]; then
+        echo "获取上游 fp16 RIFE 模型包（约 320 MB，含全部版本）..."
+        fetch_https "$url" "$archive.part" && mv -f -- "$archive.part" "$archive" || return 1
+    fi
+    command -v 7z >/dev/null 2>&1 || ensure_model_python || return 1
+    tmp_dir=$(mktemp -d "$MODELS_DIR/.rife.XXXXXX") || return 1
+    trap 'rm -rf -- "$tmp_dir"' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    local temporary_engine="${build_dir}/${model_basename}_${engine_suffix}.engine"
-
-    echo -e "\n${CYAN}==============================================================================${NC}"
-    echo -e "正在调用 trtexec 为当前 GPU 构建 TensorRT Engine..."
-    echo -e "  - 输入 ONNX:   ${onnx_path}"
-    echo -e "  - 输入节点:     ${input_name}"
-    echo -e "  - 固定输入:     ${opt_w}x${opt_h} (min/opt/max: 1x3x${opt_h}x${opt_w})"
-    echo -e "  - 输出 Engine:  ${engine_path}"
-    echo -e "构建日志: ${build_log}；首次构建可能耗时较长。\n"
-
-    "$TRTEXEC_BIN" \
-        --onnx="$onnx_path" \
-        --minShapes="${input_name}:1x3x${opt_h}x${opt_w}" \
-        --optShapes="${input_name}:1x3x${opt_h}x${opt_w}" \
-        --maxShapes="${input_name}:1x3x${opt_h}x${opt_w}" \
-        --builderOptimizationLevel=5 \
-        --skipInference \
-        --timingCacheFile="$timing_cache" \
-        --saveEngine="$temporary_engine" 2>&1 | tee "$build_log"
-    local build_status=$?
-
-    if [ "$build_status" -eq 0 ] && [ -s "$temporary_engine" ]; then
-        mv -f -- "$temporary_engine" "$engine_path" || return 1
-        printf '%s (%sx%s)\n' "$model_basename" "$opt_w" "$opt_h" > "${engine_path}.label" || return 1
-        echo -e "\n${GREEN}✔ TensorRT Engine 构建成功！${NC}"
-        echo -e "  Engine 路径: ${BOLD}${engine_path}${NC} ($(du -h "$engine_path" | cut -f1))"
-        return 0
-    else
-        echo -e "\n${RED}[错误] trtexec 构建 Engine 失败！详情见 ${build_log}。${NC}"
-        return 1
-    fi
+    aji_rife_extract "$archive" "$file" "$target" "$VENV_DIR/bin/python3" "$tmp_dir" || return 1
+    echo "RIFE 已准备好: $target"
 )
 
-# 步骤 G: 下载超分 ONNX 模型并构建 TensorRT Engine
-download_and_build_engine() {
-    init_project_root || return 1
-    print_header
-    echo -e "${BOLD}${MAGENTA}[步骤] 下载超分模型 (ONNX) 并构建 TensorRT Engine${NC}\n"
+# One manifest row: group kind file sha url mirror.
+install_model_row() {
+    local _group="$1" kind="$2" file="$3" sha="$4" url="$5" mirror="$6"
+    local target="$MODELS_DIR/$file"
+    [ "$mirror" != "-" ] || mirror=""
+    case "$kind" in
+        onnx)
+            if aji_sha_ok "$target" "$sha"; then
+                printf '已存在并校验通过: %s\n' "$file"
+                return 0
+            fi
+            download_model_file "$target" "$url" "$mirror" "$file" "$sha" ;;
+        apisr) prepare_apisr_model "$target" ;;
+        rife) prepare_rife_model "$target" "$file" "$url" "$sha" ;;
+        *) echo "未知模型类型: $kind" >&2; return 1 ;;
+    esac
+}
 
+install_model_groups() (
+    local row=() failed=0
+    RIFE_ARCHIVE_DIR=$(mktemp -d "$MODELS_DIR/.rife-archive.XXXXXX") || return 1
+    trap 'rm -rf -- "$RIFE_ARCHIVE_DIR"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    while IFS=$'\t' read -r -u 3 -a row; do
+        install_model_row "${row[@]}" || failed=1
+    done 3< <(aji_model_rows "$@")
+    return "$failed"
+)
+
+# 自定义 ONNX：URL 或本地路径，放入 $MODELS_DIR，在生成器中选“自定义模型”。
+import_custom_model() {
+    local source="" name dest url_hash
+    load_model_assets || return 1
+    prompt_value source "请输入 ONNX 下载 URL 或本地路径: " || return 1
+    source=$(printf '%s\n' "$source" | sed -e "s/^['\"]//" -e "s/['\"]$//")
+    if [ -f "$source" ]; then
+        name=$(basename -- "$source")
+    else
+        name=$(basename -- "${source%%[?#]*}")
+    fi
+    if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*\.onnx$ ]]; then
+        url_hash=$(printf '%s' "$source" | sha256sum) || return 1
+        name="custom_${url_hash:0:16}.onnx"
+    fi
+    if aji_model_rows | cut -f3 | grep -Fxq -- "$name"; then
+        echo "文件名 ${name} 与内置方案的模型相同，请改名后再导入。" >&2
+        return 1
+    fi
+    dest="$MODELS_DIR/$name"
+    if [ -e "$dest" ]; then
+        echo "已存在同名模型: $dest" >&2
+        return 1
+    fi
+    if [ -f "$source" ]; then
+        ensure_model_python || return 1
+        "$VENV_DIR/bin/python3" -c 'import onnx,sys; onnx.checker.check_model(sys.argv[1])' "$source" || return 1
+        cp -- "$source" "$dest.part" && mv -f -- "$dest.part" "$dest" || return 1
+    else
+        download_model_file "$dest" "$source" "" "$name" || return 1
+    fi
+    echo -e "${GREEN}✔ 已导入: ${dest}${NC}"
+    echo "在 generate_cmd.sh 中选择“自定义模型”即可使用；Engine 会在首次运行时按需构建。"
+}
+
+# 步骤 G: 下载模型（Engine 首次使用时自动构建）
+download_models() {
+    init_project_root || return 1
+    load_model_assets || return 1
+    print_header
+    echo -e "${BOLD}${MAGENTA}[步骤] 下载超分 / 插帧模型${NC}"
+    echo -e "模型目录: ${MODELS_DIR}（与 Runtime 包的 onnx/ 布局相同）"
+    echo -e "Engine 无需预构建：native kernel 直接运行支持的模型，其余模型首次运行时自动构建并缓存。\n"
     mkdir -p "$MODELS_DIR" || return 1
 
-    local perf_onnx="${MODELS_DIR}/performance.onnx"
-    local balanced_onnx="${MODELS_DIR}/balanced.onnx"
-    local perf_sharp_onnx="${MODELS_DIR}/performance_sharp1.onnx"
-    local balanced_sharp_onnx="${MODELS_DIR}/balanced_sharp1.onnx"
-    local sd_compact_onnx="${MODELS_DIR}/sd_compact.onnx"
-    local animevideo_onnx="${MODELS_DIR}/realesr-animevideov3-v0.2.5.0-fp16-dynamic.onnx"
-    local anime6b_onnx="${MODELS_DIR}/realesrgan_anime6b.onnx"
+    echo -e "请选择要获取的模型："
+    echo -e "  ${BOLD}1)${NC} ${GREEN}全部（所有内置方案所需模型，推荐）${NC}"
+    echo -e "  ${BOLD}2)${NC} AnimeJaNai HD V3.1 Performance / Balanced（含 Sharp1）(Slot 1001-1003, 2001, 2002)"
+    echo -e "  ${BOLD}3)${NC} AnimeJaNai SD Compact (Slot 1001-1003 的 SD 链, 2003)"
+    echo -e "  ${BOLD}4)${NC} RealESRGAN AnimeVideo-v3 (4x, Slot 2004)"
+    echo -e "  ${BOLD}5)${NC} APISR 2x RRDB GAN (Slot 2005)"
+    echo -e "  ${BOLD}6)${NC} Real-ESRGAN x4plus Anime 6B (4x, Slot 2006)"
+    echo -e "  ${BOLD}7)${NC} RIFE v4.25 / v4.26 fp16 (Slot 2025, 2026, 3025, 3026 与自定义插帧)"
+    echo -e "  ${BOLD}8)${NC} 自定义 ONNX 模型（下载链接或本地路径）"
+    local model_choice=""
+    prompt_value model_choice "请输入选项 [1-8, 默认 1]: " 1 || return 1
+    valid_index "$model_choice" 1 8 || return 1
+    case "$((10#$model_choice))" in
+        1) install_model_groups ;;
+        2) install_model_groups hd ;;
+        3) install_model_groups sd ;;
+        4) install_model_groups animevideo ;;
+        5) install_model_groups apisr ;;
+        6) install_model_groups anime6b ;;
+        7) install_model_groups rife ;;
+        8) import_custom_model ;;
+    esac || return 1
+    report_legacy_model_files
+}
 
-    echo -e "请选择操作："
-    echo -e "  ${BOLD}1)${NC} ${GREEN}一键获取 AnimeJaNai V3.1 Performance + Balanced（含 Sharp1）模型 (2x, 极速推荐)${NC}"
-    echo -e "  ${BOLD}2)${NC} 获取 AnimeJaNai V3.1 Performance (2x, 极速偏画质 - 强烈推荐)"
-    echo -e "  ${BOLD}3)${NC} 获取 AnimeJaNai V3.1 Balanced (2x, 均衡推荐)"
-    echo -e "  ${BOLD}4)${NC} 获取 AnimeJaNai V3.1 Sharp1 (2x, 清晰锐化增强版)"
-    echo -e "  ${BOLD}5)${NC} 获取 AnimeJaNai SD Compact (2x, 标清老番修复版)"
-    echo -e "  ${BOLD}6)${NC} 获取 RealESRGAN AnimeVideo-v3 (原生 4x, 动漫视频轻量模型)"
-    echo -e "  ${BOLD}7)${NC} 下载 Real-ESRGAN Anime 6B (4x, 经典原版动漫模型)"
-    echo -e "  ${BOLD}8)${NC} 自定义 ONNX 模型下载链接 / 本地已有路径"
-    echo -e "  ${BOLD}9)${NC} 获取 APISR 2x RRDB GAN (FP16)"
-    local custom_input="" model_choice="" res_choice="" build_strat=""
-    prompt_value model_choice "请输入选项 [1-9, 默认 1]: " 1 || return 1
-    valid_index "$model_choice" 1 9 || return 1
-    model_choice=$((10#$model_choice))
+# ---- 旧安装迁移 -------------------------------------------------------------
+# 旧版 deploy.sh 用短文件名保存模型，并在 $MODELS_DIR 中手工构建可读名称的
+# Engine。新的 conf 布局按完整模型名查找；libaji 首次运行时会删除所有不带
+# 当前 ".trt-<版本>.gpu-<GPU>" 后缀的 *.engine。
 
-    local target_onnx_list=()
+LEGACY_MODEL_NAMES=(performance.onnx balanced.onnx performance_sharp1.onnx
+                    balanced_sharp1.onnx sd_compact.onnx realesrgan_anime6b.onnx)
 
-    case "$model_choice" in
-        1)
-            download_animejanai_models || return 1
-            target_onnx_list=("$perf_onnx" "$balanced_onnx" "$perf_sharp_onnx" "$balanced_sharp_onnx")
-            ;;
-        2)
-            download_model_file "$perf_onnx" "$URL_ANIMEJANAI_V31_PERF" "" "AnimeJaNai V3.1 Performance (2x)" || return 1
-            target_onnx_list=("$perf_onnx")
-            ;;
-        3)
-            download_model_file "$balanced_onnx" "$URL_ANIMEJANAI_V31_BAL" "" "AnimeJaNai V3.1 Balanced (2x)" || return 1
-            target_onnx_list=("$balanced_onnx")
-            ;;
-        4)
-            download_model_file "$perf_sharp_onnx" "$URL_ANIMEJANAI_V31_PERF_SHARP" "" "AnimeJaNai V3.1 Sharp1 Perf (2x)" || return 1
-            download_model_file "$balanced_sharp_onnx" "$URL_ANIMEJANAI_V31_BAL_SHARP" "" "AnimeJaNai V3.1 Sharp1 Bal (2x)" || return 1
-            target_onnx_list=("$perf_sharp_onnx" "$balanced_sharp_onnx")
-            ;;
-        5)
-            download_model_file "$sd_compact_onnx" "$URL_ANIMEJANAI_SD_COMPACT" "" "AnimeJaNai SD Compact (2x)" || return 1
-            target_onnx_list=("$sd_compact_onnx")
-            ;;
-        6)
-            download_model_file "$animevideo_onnx" "$URL_REALESRGAN_ANIMEVIDEO_V3" "" "RealESRGAN AnimeVideo-v3 (原生 4x)" || return 1
-            target_onnx_list=("$animevideo_onnx")
-            ;;
-        7)
-            download_model_file "$anime6b_onnx" "$DEFAULT_ONNX_REALESRGAN_ANIME6B_URL" "$DEFAULT_ONNX_REALESRGAN_ANIME6B_MIRROR" "Real-ESRGAN Anime 6B (4x)" || return 1
-            target_onnx_list=("$anime6b_onnx")
-            ;;
-        8)
-            prompt_value custom_input "请输入 ONNX 下载 URL 或本地绝对路径: " || return 1
-            if [ -f "$custom_input" ]; then
-                target_onnx_list=("$custom_input")
-            else
-                local url_hash custom_dest
-                url_hash=$(printf '%s' "$custom_input" | sha256sum) || return 1
-                custom_dest="${MODELS_DIR}/custom_${url_hash%% *}.onnx"
-                download_model_file "$custom_dest" "$custom_input" "" "Custom Model" || return 1
-                target_onnx_list=("$custom_dest")
+# Old engine artifacts: hand-built engines (not backend cache names) and
+# their .label/.build.log, timing caches and leftover build directories.
+legacy_engine_files() {
+    local dir file base
+    for dir in "$MODELS_DIR" "$MODELS_DIR/rife"; do
+        [ -d "$dir" ] || continue
+        while IFS= read -r -d '' file; do
+            base=$(basename -- "$file")
+            case "$base" in
+                *.trt-*.gpu-*.engine|*.trt-*.gpu-*.engine.onnxinfo) continue ;;
+            esac
+            printf '%s\0' "$file"
+        done < <(find "$dir" -maxdepth 1 \( -type f \( -name '*.engine' -o -name '*.engine.label' \
+                     -o -name '*.engine.build.log' -o -name '*.timing.cache' \) \
+                     -o -type d -name '.aji-engine.*' \) -print0 2>/dev/null | sort -z)
+    done
+}
+
+report_legacy_model_files() {
+    local legacy=() name files=()
+    for name in "${LEGACY_MODEL_NAMES[@]}"; do
+        [ -f "$MODELS_DIR/$name" ] && legacy+=("$name")
+    done
+    mapfile -d '' -t files < <(legacy_engine_files)
+    if [ ${#legacy[@]} -gt 0 ] || [ ${#files[@]} -gt 0 ]; then
+        echo -e "\n${YELLOW}ℹ 检测到旧版安装留下的文件（${#legacy[@]} 个短名称模型，${#files[@]} 个手工 Engine 相关文件）。"
+        echo -e "  运行 ./deploy.sh --migrate 可按校验和改名旧模型并清理旧 Engine。${NC}"
+    fi
+}
+
+migrate_legacy_models() {
+    init_project_root || return 1
+    load_model_assets || return 1
+    print_header
+    echo -e "${BOLD}${MAGENTA}[步骤] 迁移旧版模型与 Engine${NC}"
+    echo -e "模型目录: ${MODELS_DIR}\n"
+    [ -d "$MODELS_DIR" ] || { echo "模型目录不存在，无需迁移。"; return 0; }
+
+    local name path actual target row reply renamed=0 duplicates=() unknown=()
+    local -A by_sha=()
+    while IFS=$'\t' read -r -u 3 -a row; do
+        [ "${row[1]}" = onnx ] && [ "${row[3]}" != "-" ] && by_sha[${row[3]}]=${row[2]}
+    done 3< <(aji_model_rows)
+
+    for name in "${LEGACY_MODEL_NAMES[@]}"; do
+        path="$MODELS_DIR/$name"
+        [ -f "$path" ] || continue
+        actual=$(sha256sum < "$path") || return 1
+        actual=${actual%% *}
+        target=${by_sha[$actual]:-}
+        if [ -z "$target" ]; then
+            printf '  ? %s：内容与任何内置模型都不一致，需要重新下载对应模型\n' "$name"
+            unknown+=("$path")
+        elif [ -e "$MODELS_DIR/$target" ]; then
+            printf '  = %s：与已存在的 %s 相同（重复文件）\n' "$name" "$target"
+            duplicates+=("$path")
+        else
+            printf '  → %s 可改名为 %s\n' "$name" "$target"
+            prompt_value reply "    改名？[Y/n]: " Y || return 1
+            if [[ "${reply:-Y}" =~ ^[Yy]$ ]]; then
+                mv -n -- "$path" "$MODELS_DIR/$target" || return 1
+                renamed=$((renamed + 1))
             fi
-            ;;
-        9)
-            prepare_apisr_model || return 1
-            target_onnx_list=("${MODELS_DIR}/2x_APISR_RRDB_GAN_fp16.onnx")
-            ;;
-        *)
-            echo -e "${RED}无效输入，返回。${NC}"
-            return 1
-            ;;
-    esac
+        fi
+    done
+    [ "$renamed" -eq 0 ] || echo -e "${GREEN}✔ 已改名 ${renamed} 个模型。${NC}"
 
-    echo -e "\n请选择构建 Engine 的源视频优化分辨率 (optShapes/maxShapes)："
-    echo -e "  ${BOLD}1)${NC} 1080p (1920x1080 -> 2x 超分至 4K / 4x 超分至 8K) [标准推荐]"
-    echo -e "  ${BOLD}2)${NC} 720p  (1280x720  -> 2x 超分至 2K / 4x 超分至 4K)"
-    echo -e "  ${BOLD}3)${NC} 自定义分辨率 (如 960x540 或非标)"
-    echo -e "  ${BOLD}4)${NC} 暂不构建 Engine (仅下载模型)"
-    prompt_value res_choice "请输入选项 [1-4, 默认 1]: " 1 || return 1
-    valid_index "$res_choice" 1 4 || return 1
-    res_choice=$((10#$res_choice))
-
-    local opt_h=1080
-    local opt_w=1920
-    local engine_suffix="1080p"
-    case "$res_choice" in
-        1)
-            opt_h=1080
-            opt_w=1920
-            engine_suffix="1080p"
-            ;;
-        2)
-            opt_h=720
-            opt_w=1280
-            engine_suffix="720p"
-            ;;
-        3)
-            prompt_value opt_w "请输入源视频宽度 (Width, 如 1920): " || return 1
-            prompt_value opt_h "请输入源视频高度 (Height, 如 1080): " || return 1
-            engine_suffix="${opt_w}x${opt_h}"
-            ;;
-        4)
-            echo -e "${GREEN}✔ 模型获取完成，已跳过 Engine 构建。${NC}"
-            return 0
-            ;;
-    esac
-
-    valid_index "$opt_w" 2 65536 && valid_index "$opt_h" 2 65536 || return 1
-    opt_w=$((10#$opt_w)); opt_h=$((10#$opt_h))
-    if [ "$model_choice" = 9 ]; then
-        if ! [[ "$opt_w" =~ ^[0-9]+$ && "$opt_h" =~ ^[0-9]+$ ]] ||
-           (( 10#$opt_w < 2 || 10#$opt_h < 2 || 10#$opt_w % 2 || 10#$opt_h % 2 )); then
-            echo -e "${RED}APISR 要求输入宽高为不小于 2 的偶数。${NC}"
-            return 1
+    local old=("${duplicates[@]}" "${unknown[@]}")
+    if [ ${#old[@]} -gt 0 ]; then
+        echo -e "\n以下旧模型文件不再被任何方案使用："
+        du -ch -- "${old[@]}" | sed 's/^/    /'
+        prompt_value reply "删除这些文件？[y/N]: " N || return 1
+        if [[ "${reply:-N}" =~ ^[Yy]$ ]]; then
+            rm -f -- "${old[@]}" || return 1
+            echo -e "${GREEN}✔ 已删除。${NC}"
         fi
     fi
 
-    if [ ${#target_onnx_list[@]} -gt 1 ]; then
-        echo -e "\n检测到已获取多个模型，请选择构建策略："
-        echo -e "  ${BOLD}1)${NC} 为全部已获取模型构建 ${engine_suffix} Engine"
-        for i in "${!target_onnx_list[@]}"; do
-            local item_name
-            item_name="$(basename "${target_onnx_list[$i]}" .onnx)" || return 1
-            echo -e "  ${BOLD}$((i+2)))${NC} 仅为 ${item_name} 构建 Engine"
-        done
-        prompt_value build_strat "请输入选项 [1-$(( ${#target_onnx_list[@]} + 1 )), 默认 1]: " 1 || return 1
-        valid_index "$build_strat" 1 "$((${#target_onnx_list[@]}+1))" || return 1
-        build_strat=$((10#$build_strat))
-
-        if [ "$build_strat" -eq 1 ]; then
-            for onnx_item in "${target_onnx_list[@]}"; do
-                build_single_engine "$onnx_item" "$opt_w" "$opt_h" "$engine_suffix" || return 1
-            done
-        elif [ "$build_strat" -ge 2 ] && [ "$build_strat" -le "$(( ${#target_onnx_list[@]} + 1 ))" ]; then
-            local selected_onnx="${target_onnx_list[$((build_strat-2))]}"
-            build_single_engine "$selected_onnx" "$opt_w" "$opt_h" "$engine_suffix"
+    local engines=()
+    mapfile -d '' -t engines < <(legacy_engine_files)
+    if [ ${#engines[@]} -gt 0 ]; then
+        echo -e "\n以下是旧版手工构建的 Engine 及其附属文件（Engine 现在首次使用时自动构建）："
+        du -csh -- "${engines[@]}" | sed 's/^/    /'
+        echo -e "${YELLOW}即使不删除，下次用 ${MODELS_DIR} 运行 conf 方案时 libaji 也会删除其中的 *.engine。${NC}"
+        prompt_value reply "删除这些文件？[y/N]: " N || return 1
+        if [[ "${reply:-N}" =~ ^[Yy]$ ]]; then
+            rm -rf -- "${engines[@]}" || return 1
+            echo -e "${GREEN}✔ 已删除。${NC}"
         fi
-    elif [ ${#target_onnx_list[@]} -eq 1 ]; then
-        build_single_engine "${target_onnx_list[0]}" "$opt_w" "$opt_h" "$engine_suffix"
+    fi
+
+    local missing=0
+    while IFS=$'\t' read -r -u 3 -a row; do
+        [ -s "$MODELS_DIR/${row[2]}" ] || missing=$((missing + 1))
+    done 3< <(aji_model_rows)
+    if [ "$missing" -gt 0 ]; then
+        echo -e "\n${YELLOW}仍有 ${missing} 个内置方案模型缺失，可运行 ./deploy.sh --models 下载。${NC}"
+    else
+        echo -e "\n${GREEN}✔ 内置方案所需模型齐全。${NC}"
     fi
 }
 
@@ -1102,31 +1113,20 @@ run_test_clip() (
     echo -e "  - 视频编码: ${src_codec:-未知}"
     echo -e "  - 原始分辨率: ${src_width} x ${src_height}"
 
-    local engine_file=""
-    local available_engines=()
-    mapfile -d '' -t available_engines < <(find "$MODELS_DIR" -maxdepth 1 -type f -name "*.engine" -print0 2>/dev/null | sort -z)
-    if [ ${#available_engines[@]} -eq 0 ]; then
-        echo -e "${YELLOW}未在 ${MODELS_DIR} 找到现成的 .engine 文件！${NC}"
-        prompt_value engine_file "请输入自定义 Engine 文件路径: " || return 1
-        if [ ! -f "$engine_file" ]; then
-            echo -e "${RED}[错误] Engine 文件不存在，请先构建 Engine！${NC}"
+    # 内置 Performance 方案（Slot 1003），与生成器使用同一 conf 与模型布局
+    load_model_assets || return 1
+    local test_conf="${PROJECT_ROOT}/packaging/ubuntu24/runtime/animejanai.conf"
+    local test_slot=1003 trtexec_bin model
+    resolve_tensorrt || return 1
+    trtexec_bin=$TRTEXEC_BIN
+    for model in 2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx \
+                 2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo.onnx; do
+        if [ ! -s "$MODELS_DIR/$model" ]; then
+            echo -e "${RED}[错误] 缺少模型 ${MODELS_DIR}/${model}，请先运行 ./deploy.sh --models。${NC}"
             return 1
         fi
-    elif [ ${#available_engines[@]} -eq 1 ]; then
-        engine_file="${available_engines[0]}"
-        echo -e "${GREEN}✔ 自动匹配到 Engine: ${BOLD}${engine_file}${NC}"
-    else
-        echo -e "\n找到以下 Engine 文件，请选择："
-        for i in "${!available_engines[@]}"; do
-            echo -e "  ${BOLD}$((i+1)))${NC} ${available_engines[$i]}"
-        done
-        prompt_value engine_idx "请输入序号 [1-${#available_engines[@]}]: " 1 || return 1
-        valid_index "$engine_idx" 1 "${#available_engines[@]}" || return 1
-        engine_idx=$((10#$engine_idx))
-        engine_file="${available_engines[$((engine_idx-1))]}"
-    fi
+    done
 
-    [ -s "$engine_file" ] || { echo "无效 Engine 文件。" >&2; return 1; }
     local test_dir
     test_dir=$(mktemp -d "$PROJECT_ROOT/build/deploy-test.XXXXXX") || return 1
     local clip_input="$test_dir/input.mkv"
@@ -1153,7 +1153,7 @@ run_test_clip() (
     echo -e "  - 输入文件: ${clip_input}"
     echo -e "  - 输出文件: ${clip_output}"
     echo -e "  - 编码器:   ${vcodec}"
-    echo -e "  - Engine:   ${engine_file}"
+    echo -e "  - 方案:     Performance (Slot ${test_slot}，native kernel 优先，必要时自动构建 Engine)"
     if [ -n "$preload_fix" ]; then
         echo -e "  - LD_PRELOAD: ${preload_fix} (NVENC 容器多卡修复生效)"
     fi
@@ -1169,9 +1169,11 @@ run_test_clip() (
     "${encode_env[@]}" ./build/aji_encode \
         --input "$clip_input" \
         --output "$clip_output" \
-        --engine "$engine_file" \
-        --max-width "$src_width" \
-        --max-height "$src_height" \
+        --conf "$test_conf" \
+        --slot "$test_slot" \
+        --model-dir "$MODELS_DIR" \
+        --rife-model-dir "$MODELS_DIR/rife" \
+        --trtexec "$trtexec_bin" \
         --vcodec "$vcodec" \
         --overwrite
 
@@ -1249,7 +1251,7 @@ one_click_setup() {
 
     echo -e "\n${GREEN}==============================================================================${NC}"
     echo -e "${BOLD}${GREEN}🎉 一键环境安装与编译完全成功！${NC}"
-    echo -e "接下来您可以选择 [9] 下载模型构建 Engine，然后选择 [10] 运行 1 分钟测试。"
+    echo -e "接下来您可以选择 [9] 下载模型，然后选择 [10] 运行 1 分钟测试；Engine 无需预构建。"
     echo -e "${GREEN}==============================================================================${NC}"
 }
 
@@ -1271,14 +1273,15 @@ main_menu() {
         echo -e "  ${BOLD}[7]${NC}  创建并配置 Python 虚拟环境 (Setup Python .venv)"
         echo -e "  ${BOLD}[8]${NC}  编译 AnimeJaNai-Inference (CMake Build)"
         echo -e "  ----------------------------------------------------------------------"
-        echo -e "  ${BOLD}[9]${NC}  ${YELLOW}下载超分模型 (ONNX) 并构建 TensorRT Engine${NC} (Download Models & Build Engine)"
+        echo -e "  ${BOLD}[9]${NC}  ${YELLOW}下载超分 / 插帧模型${NC} (Download Models; engines build on first use)"
         echo -e "  ${BOLD}[10]${NC} ${MAGENTA}截取 1 分钟 example.mkv 进行超分测试${NC} (Run 1-Min Encode Test)"
         echo -e "  ----------------------------------------------------------------------"
         echo -e "  ${BOLD}[11]${NC} ${CYAN}一键清理系统中旧版 CUDA 软件包 (如 12.x/11.x 释放空间)${NC} (Purge Old CUDA Packages)"
         echo -e "  ${BOLD}[12]${NC} ${GREEN}交互式超分任务配置向导与命令生成器 (不自动执行)${NC} (Task Wizard & Generator)"
+        echo -e "  ${BOLD}[13]${NC} 迁移旧版模型文件名并清理旧 Engine (Migrate Legacy Models & Engines)"
         echo -e "  ${BOLD}[0]${NC}  退出 (Exit)"
         echo -e "${CYAN}------------------------------------------------------------------------------${NC}"
-        prompt_value choice "请输入选项数字 [0-12]: " || return 1
+        prompt_value choice "请输入选项数字 [0-13]: " || return 1
 
         case "$choice" in
             1) diagnose_all ;;
@@ -1289,7 +1292,7 @@ main_menu() {
             6) install_nvenc_fix ;;
             7) setup_python_venv ;;
             8) build_project ;;
-            9) download_and_build_engine ;;
+            9) download_models ;;
             10) run_test_clip ;;
             11) purge_old_cuda_packages ;;
             12) 
@@ -1299,6 +1302,7 @@ main_menu() {
                     echo -e "${RED}[错误] 未找到 generate_cmd.sh 脚本！${NC}"
                 fi
                 ;;
+            13) migrate_legacy_models ;;
             0) echo -e "\n${GREEN}感谢使用，再见！${NC}"; exit 0 ;;
             *) echo -e "\n${RED}无效选项，请重新输入！${NC}" ;;
         esac
@@ -1314,7 +1318,10 @@ show_help() {
 用法: ./deploy.sh [操作] [参数]
 无操作时打开交互菜单。
 操作: --check --all --repo --cuda --ffmpeg --nvenc-fix --venv --build
-      --engine --clean-cuda --test --gen --help
+      --models --migrate --clean-cuda --test --gen --help
+  --models   按 conf 布局下载模型到 ~/models（含 RIFE fp16）；不构建 Engine
+  --migrate  旧版短名称模型按校验和改名，列出并（确认后）删除旧 Engine
+  --engine   已废弃，等同 --models（Engine 现在首次使用时自动构建）
 参数:
   --project-root PATH     源码目录（默认脚本目录）
   --cuda-root PATH        CUDA Toolkit 13.x 根目录
@@ -1345,7 +1352,7 @@ main() {
                     --ffmpeg-variant) FFMPEG_VARIANT=$1 ;;
                 esac
                 shift ;;
-            --check|check|-c|--all|all|--install-all|--repo|--cuda|--ffmpeg|--nvenc-fix|--fix|--venv|--build|--engine|--models|--clean-cuda|--purge-cuda|--test|--run|--gen|--generate|--wizard)
+            --check|check|-c|--all|all|--install-all|--repo|--cuda|--ffmpeg|--nvenc-fix|--fix|--venv|--build|--engine|--models|--migrate|--clean-cuda|--purge-cuda|--test|--run|--gen|--generate|--wizard)
                 [ -z "$action" ] || { echo "每次只能指定一个操作。" >&2; return 2; }
                 action=$argument ;;
             *) echo "未知参数: $argument" >&2; return 2 ;;
@@ -1369,7 +1376,11 @@ main() {
         --nvenc-fix|--fix) install_nvenc_fix ;;
         --venv) setup_python_venv ;;
         --build) build_project ;;
-        --engine|--models) download_and_build_engine ;;
+        --engine)
+            echo "--engine 已废弃：Engine 现在首次使用时自动构建，改为下载模型。" >&2
+            download_models ;;
+        --models) download_models ;;
+        --migrate) migrate_legacy_models ;;
         --clean-cuda|--purge-cuda) purge_old_cuda_packages ;;
         --test) run_test_clip ;;
         --run|--gen|--generate|--wizard) bash "$PROJECT_ROOT/generate_cmd.sh" ;;

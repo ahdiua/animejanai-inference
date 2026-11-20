@@ -230,71 +230,116 @@ check_nvenc_and_patch && [ "$NVENC_PRELOAD" = "$NVENC_FIX_SO" ] && [ -z "${LD_PR
 ffmpeg() { echo 'cannot load libnvidia-encode' >&2; return 1; }
 check_nvenc_and_patch; [ "$NVENC_PATCH_NEEDED" = 0 ] && [ -z "$NVENC_PRELOAD" ]''')
 
-    def test_failed_model_download_cannot_report_download_only_success(self):
-        self.run_shell('''MODELS_DIR="$AUDIT_DIR/models"
-download_model_file() { return 7; }
-download_and_build_engine''', 1, '2\n4\n')
+    def test_failed_model_download_is_reported(self):
+        self.run_shell('''init_project_root() { PROJECT_ROOT="$PWD"; VENV_DIR="$AUDIT_DIR/venv"; }
+MODELS_DIR="$AUDIT_DIR/models"
+install_model_row() { return 7; }
+download_models''', 1, '2\n')
 
-    def test_custom_urls_get_different_destinations(self):
-        result = self.run_shell('''MODELS_DIR="$AUDIT_DIR/models"
+    def test_model_groups_follow_the_manifest(self):
+        result = self.run_shell('''init_project_root() { PROJECT_ROOT="$PWD"; VENV_DIR="$AUDIT_DIR/venv"; }
+MODELS_DIR="$AUDIT_DIR/models"
+install_model_row() { printf 'ROW=%s %s\\n' "$1" "$3"; }
+download_models''', 0, '7\n')
+        rows = [x for x in result.stdout.splitlines() if x.startswith('ROW=')]
+        self.assertEqual(rows, ['ROW=rife rife/rife_v4.26.onnx', 'ROW=rife rife/rife_v4.25.onnx'])
+
+    def test_custom_models_keep_names_and_never_overwrite(self):
+        models = self.directory / 'models'
+        models.mkdir()
+        (models / 'taken.onnx').write_bytes(b'existing')
+        body = '''init_project_root() { PROJECT_ROOT="$PWD"; VENV_DIR="$AUDIT_DIR/venv"; }
+init_project_root
+MODELS_DIR="$AUDIT_DIR/models"
 download_model_file() { printf 'DEST=%s\\n' "$1"; }
-download_and_build_engine
-download_and_build_engine''', 0, '8\nhttps://example.test/a.onnx\n4\n8\nhttps://example.test/b.onnx\n4\n')
-        destinations = [x for x in result.stdout.splitlines() if x.startswith('DEST=')]
-        self.assertEqual(len(destinations), 2)
-        self.assertNotEqual(*destinations)
+'''
+        result = self.run_shell(body + 'import_custom_model\nimport_custom_model\n', 0,
+                                'https://example.test/x/4x_Custom.onnx?download=1\n'
+                                'https://example.test/get?id=7\n')
+        destinations = [x[5:] for x in result.stdout.splitlines() if x.startswith('DEST=')]
+        self.assertEqual(destinations[0], str(models / '4x_Custom.onnx'))
+        self.assertRegex(destinations[1], r'/custom_[0-9a-f]{16}\.onnx$')
+        for name in ('taken.onnx', 'RealESRGAN_x4plus_anime_6B.onnx'):
+            with self.subTest(name=name):
+                self.run_shell(body + 'import_custom_model\n', 1, f'https://example.test/{name}\n')
+        self.assertEqual((models / 'taken.onnx').read_bytes(), b'existing')
 
-    def test_encode_failure_and_space_in_engine_path(self):
+    def test_test_clip_runs_a_conf_slot_and_propagates_failure(self):
         self.executable('build/aji_encode', '''printf '%s\\n' "$@" > "$AUDIT_DIR/encode-args"
 exit 7
 ''')
         (self.directory / 'example.mkv').write_text('fake')
-        (self.directory / 'models').mkdir()
-        (self.directory / 'models/my engine.engine').write_text('fake')
-        self.run_shell('''init_project_root() { PROJECT_ROOT="$AUDIT_DIR"; }
-MODELS_DIR="$AUDIT_DIR/models"
-ffprobe() { printf '1920\\n'; }
-ffmpeg() { printf fake > "${@: -1}"; }
-check_nvenc_and_patch() { NVENC_PRELOAD=''; return 0; }
+        models = self.directory / 'my models'
+        models.mkdir()
+        for name in ('2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx',
+                     '2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo.onnx'):
+            (models / name).write_text('fake')
+        self.run_shell(f'''init_project_root() {{ PROJECT_ROOT="$AUDIT_DIR"; }}
+load_model_assets() {{ source {str(ROOT / 'scripts/model-assets.sh')!r}; }}
+MODELS_DIR="$AUDIT_DIR/my models"
+resolve_tensorrt() {{ TRTEXEC_BIN=/opt/trt/trtexec; }}
+ffprobe() {{ printf '1920\\n'; }}
+ffmpeg() {{ printf fake > "${{@: -1}}"; }}
+check_nvenc_and_patch() {{ NVENC_PRELOAD=''; return 0; }}
 run_test_clip''', 1)
-        self.assertIn(str(self.directory / 'models/my engine.engine'), (self.directory / 'encode-args').read_text().splitlines())
+        args = (self.directory / 'encode-args').read_text().splitlines()
+        self.assertEqual(args[args.index('--slot') + 1], '1003')
+        self.assertEqual(args[args.index('--model-dir') + 1], str(models))
+        self.assertEqual(args[args.index('--rife-model-dir') + 1], str(models / 'rife'))
+        self.assertEqual(args[args.index('--trtexec') + 1], '/opt/trt/trtexec')
+        self.assertTrue(args[args.index('--conf') + 1].endswith('packaging/ubuntu24/runtime/animejanai.conf'))
+        self.assertNotIn('--engine', args)
 
-    def prepare_engine_builder(self, status=0):
-        self.executable('venv/bin/python3', "printf 'input\\n'\n")
-        self.executable('trtexec', f'''printf '%s\\n' "$@" > "$AUDIT_DIR/build-args"
-for arg; do
-    case "$arg" in --saveEngine=*) printf new-engine > "${{arg#*=}}" ;; esac
-done
-exit {status}
-''')
-        (self.directory / 'models').mkdir()
-        (self.directory / 'models/my model.onnx').write_bytes(b'onnx')
-        return '''MODELS_DIR="$AUDIT_DIR/models"
-VENV_DIR="$AUDIT_DIR/venv"
-activate_build_environment() { :; }
-resolve_tensorrt() { TRTEXEC_BIN="$AUDIT_DIR/trtexec"; TRT_LIB_DIR="$AUDIT_DIR"; }
-ensure_model_python() { :; }
+    def legacy_install(self):
+        import hashlib
+        models = self.directory / 'models'
+        models.mkdir()
+        manifest = [line.split('\t') for line in (ROOT / 'scripts/runtime-models.tsv').read_text().splitlines()
+                    if line and not line.startswith('#')]
+        self.assertTrue(manifest)
+        # A fake model under its legacy short name, with its digest pinned in a
+        # copy of the manifest so the migration can recognize it.
+        payload = b'performance model'
+        manifest = [row if row[2] != '2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx'
+                    else row[:3] + [hashlib.sha256(payload).hexdigest()] + row[4:] for row in manifest]
+        (self.directory / 'manifest.tsv').write_text('\n'.join('\t'.join(r) for r in manifest) + '\n')
+        (models / 'performance.onnx').write_bytes(payload)
+        (models / 'sd_compact.onnx').write_bytes(b'unknown')
+        for name in ('perf_1080p.engine', 'perf_1080p.engine.label', 'perf_1080p.engine.build.log',
+                     'perf.timing.cache', 'x.trt-11.4.0.gpu-rtx-sm89.engine',
+                     'x.trt-11.4.0.gpu-rtx-sm89.engine.onnxinfo'):
+            (models / name).write_text('x')
+        (models / '.aji-engine.tmp').mkdir()
+        return models, f'''init_project_root() {{ PROJECT_ROOT="$PWD"; }}
+load_model_assets() {{ source {str(ROOT / 'scripts/model-assets.sh')!r}; AJI_MODEL_MANIFEST="$AUDIT_DIR/manifest.tsv"; }}
+MODELS_DIR="$AUDIT_DIR/models"
 '''
 
-    def test_engine_uses_readable_names_without_cache_helper(self):
-        setup = self.prepare_engine_builder()
-        for width, height, suffix in ((1920, 1080, '1080p'), (1280, 720, '720p'), (960, 540, '960x540')):
-            with self.subTest(suffix=suffix):
-                engine = self.directory / f'models/my model_{suffix}.engine'
-                engine.write_bytes(b'old-engine')
-                self.run_shell(setup + f'build_single_engine "$MODELS_DIR/my model.onnx" {width} {height} {suffix}')
-                self.assertEqual(engine.read_bytes(), b'new-engine')
-                self.assertEqual(Path(str(engine) + '.label').read_text(), f'my model ({width}x{height})\n')
-                self.assertIn(f'--optShapes=input:1x3x{height}x{width}', (self.directory / 'build-args').read_text())
-        self.assertEqual(list((self.directory / 'models').glob('.aji-engine.*')), [])
+    def test_migration_renames_by_checksum_and_deletes_only_when_confirmed(self):
+        models, setup = self.legacy_install()
+        self.run_shell(setup + 'migrate_legacy_models', 0, 'y\nn\nn\n')
+        names = {p.name for p in models.iterdir()}
+        self.assertIn('2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx', names)
+        self.assertNotIn('performance.onnx', names)
+        self.assertTrue({'sd_compact.onnx', 'perf_1080p.engine', 'perf.timing.cache', '.aji-engine.tmp'} <= names)
+        self.run_shell(setup + 'migrate_legacy_models', 0, 'y\ny\n')
+        names = {p.name for p in models.iterdir()}
+        self.assertEqual(names, {'2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx',
+                                 'x.trt-11.4.0.gpu-rtx-sm89.engine',
+                                 'x.trt-11.4.0.gpu-rtx-sm89.engine.onnxinfo'})
 
-    def test_failed_engine_rebuild_preserves_existing_engine(self):
-        setup = self.prepare_engine_builder(status=7)
-        engine = self.directory / 'models/my model_1080p.engine'
-        engine.write_bytes(b'old-engine')
-        self.run_shell(setup + 'build_single_engine "$MODELS_DIR/my model.onnx" 1920 1080 1080p', 1)
-        self.assertEqual(engine.read_bytes(), b'old-engine')
-        self.assertEqual(list((self.directory / 'models').glob('.aji-engine.*')), [])
+    def test_migration_declined_rename_and_assume_yes_keep_files(self):
+        models, setup = self.legacy_install()
+        before = {p.name for p in models.iterdir()}
+        self.run_shell(setup + 'migrate_legacy_models', 0, 'n\ny\nn\n')
+        names = {p.name for p in models.iterdir()}
+        self.assertIn('performance.onnx', names)
+        self.assertNotIn('sd_compact.onnx', names)
+        self.assertIn('perf_1080p.engine', names)
+        self.run_shell(setup + 'ASSUME_DEFAULTS=1\nmigrate_legacy_models')
+        self.assertTrue({'perf_1080p.engine', 'perf.timing.cache', '.aji-engine.tmp'}
+                        <= {p.name for p in models.iterdir()})
+        self.assertTrue(before)
 
     def test_legacy_profile_migration_preserves_user_lines(self):
         home = self.directory / 'home'
@@ -343,6 +388,30 @@ install_environment_profile cuda "$AUDIT_DIR/home/.bashrc"
 LD_LIBRARY_PATH=:/old::/other:
 source "$AUDIT_DIR/generated-profile"
 [ "$LD_LIBRARY_PATH" = /opt/cuda/lib64:/old:/other ]""")
+
+
+class ManifestTests(unittest.TestCase):
+    """deploy.sh and the runtime packager share scripts/runtime-models.tsv;
+    every model a packaged or built-in slot names must be in it."""
+
+    def test_every_slot_model_is_in_the_manifest(self):
+        import re
+        rows = [line.split('\t') for line in (ROOT / 'scripts/runtime-models.tsv').read_text().splitlines()
+                if line and not line.startswith('#')]
+        self.assertTrue(all(len(r) == 6 for r in rows), rows)
+        files = {r[2] for r in rows}
+        conf = (ROOT / 'packaging/ubuntu24/runtime/animejanai.conf').read_text()
+        names = set(re.findall(r'^chain_\d+_model_\d+_name=(.+)$', conf, re.M))
+        builtin = (ROOT / 'src/aji_conf.cpp').read_text()
+        names |= set(re.findall(r'^const char \*(?:HD_BAL|HD_PERF|SD) = "([^"]+)";', builtin, re.M))
+        self.assertEqual(len(names), 8, names)
+        self.assertEqual({n + '.onnx' for n in names} - files, set())
+        for code in re.findall(r'^chain_\d+_rife_model=(\d+)$', conf, re.M):
+            self.assertIn(f'rife/rife_v{code[0]}.{code[1:]}.onnx', files)
+        generator = (ROOT / 'generate_cmd.sh').read_text()
+        for constant in ('HD_BAL_MODEL', 'HD_PERF_MODEL', 'SD_MODEL'):
+            value = re.search(rf'^{constant}="([^"]+)"', generator, re.M).group(1)
+            self.assertIn(value, names)
 
 
 class Response(io.BytesIO):
