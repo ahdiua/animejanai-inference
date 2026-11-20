@@ -958,8 +958,9 @@ legacy_engine_files() {
         [ -d "$dir" ] || continue
         while IFS= read -r -d '' file; do
             base=$(basename -- "$file")
+            # the backend's own cache files (and their build logs) stay
             case "$base" in
-                *.trt-*.gpu-*.engine|*.trt-*.gpu-*.engine.onnxinfo) continue ;;
+                *.trt-*.gpu-*.engine|*.trt-*.gpu-*.engine.*) continue ;;
             esac
             printf '%s\0' "$file"
         done < <(find "$dir" -maxdepth 1 \( -type f \( -name '*.engine' -o -name '*.engine.label' \

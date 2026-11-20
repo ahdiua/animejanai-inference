@@ -307,7 +307,8 @@ run_test_clip''', 1)
         (models / 'sd_compact.onnx').write_bytes(b'unknown')
         for name in ('perf_1080p.engine', 'perf_1080p.engine.label', 'perf_1080p.engine.build.log',
                      'perf.timing.cache', 'x.trt-11.4.0.gpu-rtx-sm89.engine',
-                     'x.trt-11.4.0.gpu-rtx-sm89.engine.onnxinfo'):
+                     'x.trt-11.4.0.gpu-rtx-sm89.engine.onnxinfo',
+                     'x.trt-11.4.0.gpu-rtx-sm89.engine.build.log'):
             (models / name).write_text('x')
         (models / '.aji-engine.tmp').mkdir()
         return models, f'''init_project_root() {{ PROJECT_ROOT="$PWD"; }}
@@ -326,7 +327,8 @@ MODELS_DIR="$AUDIT_DIR/models"
         names = {p.name for p in models.iterdir()}
         self.assertEqual(names, {'2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx',
                                  'x.trt-11.4.0.gpu-rtx-sm89.engine',
-                                 'x.trt-11.4.0.gpu-rtx-sm89.engine.onnxinfo'})
+                                 'x.trt-11.4.0.gpu-rtx-sm89.engine.onnxinfo',
+                                 'x.trt-11.4.0.gpu-rtx-sm89.engine.build.log'})
 
     def test_migration_declined_rename_and_assume_yes_keep_files(self):
         models, setup = self.legacy_install()
