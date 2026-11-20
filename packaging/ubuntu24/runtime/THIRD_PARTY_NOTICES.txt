@@ -15,5 +15,16 @@ RIFE ONNX source models
 AnimeJaNai models
   https://github.com/the-database/AnimeJaNai
 
+Real-ESRGAN AnimeVideo-v3 and Real-ESRGAN x4plus Anime 6B (BSD-3-Clause)
+  https://github.com/xinntao/Real-ESRGAN
+  RealESRGAN_x4plus_anime_6B.onnx is the ONNX export published by deepghs
+  (MIT): https://huggingface.co/deepghs/imgutils-models
+
+APISR 2x RRDB GAN (GPL-3.0)
+  https://github.com/Kiteretsu77/APISR
+  ONNX export: https://huggingface.co/Xenova/2x_APISR_RRDB_GAN_generator-onnx
+  2x_APISR_RRDB_GAN_fp16.onnx is that export with its input shape relaxed by
+  tools/prepare_apisr.py from this project's source.
+
 Package-specific copyright/license files collected during packaging are in
 the licenses/ directory when supplied by the upstream packages.

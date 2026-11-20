@@ -323,127 +323,63 @@ patchelf --set-rpath '$ORIGIN/../lib' "${STAGE_ROOT}/bin/trtexec.real"
 patchelf --set-rpath '$ORIGIN/../lib' "${STAGE_ROOT}/bin/ffmpeg.real"
 patchelf --set-rpath '$ORIGIN/../lib' "${STAGE_ROOT}/bin/ffprobe.real"
 
-copy_model() {
-    local relative_path="$1"
-    local url="$2"
-    local expected_sha="$3"
-    local local_path="${LOCAL_MODELS_DIR}/${relative_path}"
-    local staged_path="${STAGE_ROOT}/onnx/${relative_path}"
+# Models: the shared manifest (scripts/runtime-models.tsv) names every file,
+# its digest and source, the same list deploy.sh installs for source builds.
+# shellcheck source=scripts/model-assets.sh
+source "${PROJECT_ROOT}/scripts/model-assets.sh"
+
+MODEL_PYTHON="${WORK_DIR}/model-converter/bin/python"
+model_python() {
+    if [[ ! -x "${MODEL_PYTHON}" ]]; then
+        python3 -m venv "${WORK_DIR}/model-converter"
+        "${WORK_DIR}/model-converter/bin/pip" install --disable-pip-version-check \
+            --no-cache-dir 'numpy==2.5.2' 'onnx==1.22.0'
+    fi
+}
+
+stage_model() {
+    local kind="$1" file="$2" sha="$3" url="$4" mirror="$5"
+    local local_path="${LOCAL_MODELS_DIR}/${file}"
+    local staged_path="${STAGE_ROOT}/onnx/${file}"
     mkdir -p "$(dirname "${staged_path}")"
     if [[ -s "${local_path}" ]]; then
-        echo "Using local model: ${relative_path}"
+        echo "Using local model: ${file}"
         cp -aL "${local_path}" "${staged_path}"
     else
-        download "${url}" "${staged_path}"
+        case "${kind}" in
+            onnx)
+                download "${url}" "${staged_path}" ||
+                    { [[ "${mirror}" != "-" ]] && download "${mirror}" "${staged_path}"; }
+                ;;
+            apisr)
+                if [[ -s "${PROJECT_ROOT}/models/${file}" ]]; then
+                    cp -aL "${PROJECT_ROOT}/models/${file}" "${staged_path}"
+                else
+                    model_python
+                    "${MODEL_PYTHON}" "${PROJECT_ROOT}/tools/prepare_apisr.py" \
+                        --output "${staged_path}"
+                fi
+                ;;
+            rife)
+                # one archive holds every version: download it once
+                local archive
+                archive="${WORK_DIR}/$(basename "${url}")"
+                [[ -s "${archive}" ]] || download "${url}" "${archive}"
+                model_python
+                aji_rife_extract "${archive}" "${file}" "${staged_path}" \
+                    "${MODEL_PYTHON}" "$(mktemp -d "${WORK_DIR}/rife.XXXXXX")"
+                ;;
+        esac
     fi
-    if [[ -n "${expected_sha}" ]]; then
-        printf '%s  %s\n' "${expected_sha}" "${staged_path}" | sha256sum --check --status || {
-            echo "Checksum mismatch for ${relative_path}" >&2
-            exit 1
-        }
-    fi
-}
-
-copy_model \
-    "2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx" \
-    "https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx" \
-    "7b804d87320f37b7269d6e27796046fbd975e95e2aa1f65d5557f52a36282716"
-copy_model \
-    "2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx" \
-    "https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx" \
-    "b308e93c3dda3c4f9f968295b2b7b8d1c0583a711bca53a08d51134d9d1cbd5c"
-copy_model \
-    "2x_AnimeJaNai_HD_V3.1Sharp1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx" \
-    "https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1Sharp1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx" \
-    "72246eded3aab52f8d1a71613c0a1d900734b358d1820b62eb36f1ed376e1cf4"
-copy_model \
-    "2x_AnimeJaNai_HD_V3.1Sharp1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx" \
-    "https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1Sharp1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx" \
-    "dde763c8202cfebac5ec030ea6644f3ee339ea35bbda8a76e257405399552f0f"
-copy_model \
-    "2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo.onnx" \
-    "https://r2.ahdiua.com/2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo.onnx" \
-    "ded46591ddfaeb22b3daaf84ad7b36838335aa3efca66acfa36177ce4ab21eb5"
-copy_model \
-    "realesr-animevideov3-v0.2.5.0-fp16-dynamic.onnx" \
-    "https://r2.ahdiua.com/realesr-animevideov3-v0.2.5.0-fp16-dynamic.onnx" \
-    "d584ed9c21a2c2448d96d5e3e0a2d719a0e573d36eb4244cb07e68be96e3a0ab"
-
-prepare_apisr_model() {
-    local model_name="2x_APISR_RRDB_GAN_fp16.onnx"
-    local staged_path="${STAGE_ROOT}/onnx/${model_name}"
-    local candidate
-    for candidate in "${LOCAL_MODELS_DIR}/${model_name}" "${PROJECT_ROOT}/models/${model_name}"; do
-        if [[ -s "${candidate}" ]]; then
-            cp -aL "${candidate}" "${staged_path}"
-            return
-        fi
-    done
-    local python_env="${WORK_DIR}/apisr-converter"
-    python3 -m venv "${python_env}"
-    "${python_env}/bin/python" -m pip install --disable-pip-version-check onnx
-    "${python_env}/bin/python" "${PROJECT_ROOT}/tools/prepare_apisr.py" \
-        --output "${staged_path}"
-}
-
-prepare_apisr_model
-
-prepare_rife_model() {
-    local version="$1"
-    local expected_sha="$2"
-    local relative_path="rife/rife_v${version}.onnx"
-    local local_path="${LOCAL_MODELS_DIR}/${relative_path}"
-    local staged_path="${STAGE_ROOT}/onnx/${relative_path}"
-    if [[ -s "${local_path}" ]]; then
-        echo "Using local RIFE model: v${version}"
-        cp -aL "${local_path}" "${staged_path}"
-        printf '%s  %s\n' "${expected_sha}" "${staged_path}" \
-            | sha256sum --check --status || {
-                echo "Local RIFE v${version} is not the expected fp16 model." >&2
-                exit 1
-            }
-        return
-    fi
-
-    local archive="${WORK_DIR}/rife_v${version}.7z"
-    local source_dir="${WORK_DIR}/rife-v${version}-source"
-    download \
-        "https://github.com/AmusementClub/vs-mlrt/releases/download/external-models/rife_v${version}.7z" \
-        "${archive}"
-    mkdir -p "${source_dir}"
-    7z x -y -o"${source_dir}" "${archive}" >/dev/null
-    local source_model="${source_dir}/rife/rife_v${version}.onnx"
-    if [[ ! -s "${source_model}" ]]; then
-        echo "rife_v${version}.onnx was not found in the downloaded archive." >&2
+    if ! aji_sha_ok "${staged_path}" "${sha}"; then
+        echo "Checksum mismatch for ${file}" >&2
         exit 1
     fi
-
-    local python_env="${WORK_DIR}/model-converter"
-    if [[ ! -x "${python_env}/bin/python" ]]; then
-        python3 -m venv "${python_env}"
-        "${python_env}/bin/pip" install --disable-pip-version-check --no-cache-dir \
-            'numpy==2.5.2' 'onnx==1.22.0'
-    fi
-    local converter_input="${WORK_DIR}/converter-input-v${version}"
-    mkdir -p "${converter_input}"
-    cp -a "${source_model}" "${converter_input}/rife_v${version}.onnx"
-    "${python_env}/bin/python" "${PROJECT_ROOT}/tools/convert_rife_fp16.py" \
-        "${converter_input}" "${STAGE_ROOT}/onnx/rife" "rife_v${version}.onnx"
-    if [[ ! -s "${staged_path}" ]]; then
-        echo "RIFE v${version} fp16 conversion failed." >&2
-        exit 1
-    fi
-    printf '%s  %s\n' "${expected_sha}" "${staged_path}" \
-        | sha256sum --check --status || {
-            echo "Converted RIFE v${version} checksum mismatch." >&2
-            exit 1
-        }
 }
 
-prepare_rife_model "4.26" \
-    "fd6b06538898c9a94d20f0fe55febceadbcde5ad64952240733b7275ef4c9d59"
-prepare_rife_model "4.25" \
-    "de0fb71ae50fe082eb3903fd5cf752063dea5e9fd61e8bbf3c4577e11b877c9c"
+while IFS=$'\t' read -r -u 3 _group kind file sha url mirror; do
+    stage_model "${kind}" "${file}" "${sha}" "${url}" "${mirror}"
+done 3< <(aji_model_rows)
 
 cp -a "${PROJECT_ROOT}/packaging/ubuntu24/runtime/." "${STAGE_ROOT}/"
 cp -a "${PROJECT_ROOT}/generate_cmd.sh" "${STAGE_ROOT}/generate_cmd.sh"

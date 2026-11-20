@@ -28,9 +28,6 @@ elif has_option --conf "${arguments[@]}"; then
         || arguments+=(--model-dir "${RUNTIME_ROOT}/onnx")
     has_option --rife-model-dir "${arguments[@]}" \
         || arguments+=(--rife-model-dir "${RUNTIME_ROOT}/onnx/rife")
-elif has_option --rife-model "${arguments[@]}" \
-     && ! has_option --rife-model-dir "${arguments[@]}"; then
-    arguments+=(--rife-model-dir "${RUNTIME_ROOT}/onnx/rife")
 fi
 
 if ! has_option --trtexec "${arguments[@]}"; then

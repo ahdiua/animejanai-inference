@@ -1,0 +1,21 @@
+# Models for the packaged runtime and a source install, which share one layout:
+# <model dir>/<file>. File names are the ones animejanai.conf slots and the
+# built-in slots 1001-1003 (src/aji_conf.cpp) refer to. deploy.sh and
+# scripts/package-ubuntu24-runtime.sh both read this file.
+#
+# Tab-separated: group, kind, file, sha256, url, mirror ("-" = none).
+#   onnx   download <url> (or <mirror>) and check <sha256>
+#   apisr  tools/prepare_apisr.py, which pins its own source digest
+#   rife   the fp16 model from upstream's RIFE release archive at <url> (one
+#          archive holds every version; tools/convert_rife_fp16.py made them
+#          from vs-mlrt). <sha256> is the extracted model's.
+hd	onnx	2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx	7b804d87320f37b7269d6e27796046fbd975e95e2aa1f65d5557f52a36282716	https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx	-
+hd	onnx	2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx	b308e93c3dda3c4f9f968295b2b7b8d1c0583a711bca53a08d51134d9d1cbd5c	https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx	-
+hd	onnx	2x_AnimeJaNai_HD_V3.1Sharp1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx	72246eded3aab52f8d1a71613c0a1d900734b358d1820b62eb36f1ed376e1cf4	https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1Sharp1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx	-
+hd	onnx	2x_AnimeJaNai_HD_V3.1Sharp1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx	dde763c8202cfebac5ec030ea6644f3ee339ea35bbda8a76e257405399552f0f	https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1Sharp1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx	-
+sd	onnx	2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo.onnx	ded46591ddfaeb22b3daaf84ad7b36838335aa3efca66acfa36177ce4ab21eb5	https://r2.ahdiua.com/2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo.onnx	-
+animevideo	onnx	realesr-animevideov3-v0.2.5.0-fp16-dynamic.onnx	d584ed9c21a2c2448d96d5e3e0a2d719a0e573d36eb4244cb07e68be96e3a0ab	https://r2.ahdiua.com/realesr-animevideov3-v0.2.5.0-fp16-dynamic.onnx	-
+anime6b	onnx	RealESRGAN_x4plus_anime_6B.onnx	2648cab4c4343541c1aa291c6754e9e8edbe7a813fffc2a677423dd12cb6b7f7	https://huggingface.co/deepghs/imgutils-models/resolve/main/real_esrgan/RealESRGAN_x4plus_anime_6B.onnx	https://hf-mirror.com/deepghs/imgutils-models/resolve/main/real_esrgan/RealESRGAN_x4plus_anime_6B.onnx
+apisr	apisr	2x_APISR_RRDB_GAN_fp16.onnx	-	-	-
+rife	rife	rife/rife_v4.26.onnx	fd6b06538898c9a94d20f0fe55febceadbcde5ad64952240733b7275ef4c9d59	https://github.com/the-database/animejanai-inference/releases/download/models-rife-fp16-1/rife-fp16-1.7z	-
+rife	rife	rife/rife_v4.25.onnx	de0fb71ae50fe082eb3903fd5cf752063dea5e9fd61e8bbf3c4577e11b877c9c	https://github.com/the-database/animejanai-inference/releases/download/models-rife-fp16-1/rife-fp16-1.7z	-
