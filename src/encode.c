@@ -231,18 +231,43 @@ static void av_log_cb(void *p, int level, const char *fmt, va_list ap)
     vfprintf(g_log ? g_log : stderr, fmt, ap);
 }
 
+/* eta_seconds < 0: unknown (no frame total or no rate yet). Text mode
+ * appends eta=HH:MM:SS (or eta=unknown); JSON adds "eta_seconds" (or null).
+ * Both are additions at the end, so existing parsers keep working. */
 static void progress(const char *phase, long long frame, long long total,
-                     double fps, int pct)
+                     double fps, int pct, long long eta_seconds)
 {
     if (g_progress == PROG_NONE)
         return;
-    if (g_progress == PROG_JSON)
+    if (g_progress == PROG_JSON) {
         printf("{\"phase\":\"%s\",\"frame\":%lld,\"total\":%lld,"
-               "\"fps\":%.2f,\"pct\":%d}\n", phase, frame, total, fps, pct);
-    else
-        printf("PROGRESS phase=%s frame=%lld total=%lld fps=%.2f pct=%d\n",
-               phase, frame, total, fps, pct);
+               "\"fps\":%.2f,\"pct\":%d,\"eta_seconds\":", phase, frame,
+               total, fps, pct);
+        if (eta_seconds >= 0)
+            printf("%lld}\n", eta_seconds);
+        else
+            printf("null}\n");
+    } else if (eta_seconds >= 0) {
+        printf("PROGRESS phase=%s frame=%lld total=%lld fps=%.2f pct=%d "
+               "eta=%02lld:%02lld:%02lld\n", phase, frame, total, fps, pct,
+               eta_seconds / 3600, (eta_seconds % 3600) / 60,
+               eta_seconds % 60);
+    } else {
+        printf("PROGRESS phase=%s frame=%lld total=%lld fps=%.2f pct=%d "
+               "eta=unknown\n", phase, frame, total, fps, pct);
+    }
     fflush(stdout);
+}
+
+/* Seconds left at `fps` output frames per second, rounded up so the display
+ * never claims zero while work remains; -1 when it cannot be estimated. */
+static long long estimate_eta(long long frame, long long total, double fps)
+{
+    if (total <= 0 || frame < 0 || fps <= 0.0)
+        return -1;
+    if (frame >= total)
+        return 0;
+    return (long long)((double)(total - frame) / fps + 0.999999);
 }
 
 /* ---- colorimetry mapping (AVFrame/codecpar -> aji enums) ----------------- */
@@ -1855,7 +1880,7 @@ static int init_aji(enc_ctx *c)
 #endif
     if (!c->aji) { loge("aji_create failed"); return -1; }
 
-    progress("build_engine", 0, 0, 0, 0);
+    progress("build_engine", 0, 0, 0, 0, -1);
     if (c->o.engine)
         loge("Loading existing upscale engine: %s", c->o.engine);
     int ow = 0, oh = 0;
@@ -1865,7 +1890,7 @@ static int init_aji(enc_ctx *c)
         loge("aji_configure: %d: %s", act, aji_last_error(c->aji));
         return -1;
     }
-    progress("build_engine", 0, 0, 0, 100);
+    progress("build_engine", 0, 0, 0, 100, 0);
     loge("%s", aji_current_log(c->aji));
 
     if (act == 0) {
@@ -3272,8 +3297,9 @@ encode:
     if ((c->out_frames & 31) == 0) {
         const int64_t total = out_frames_est(c);
         int pct = total ? (int)(c->out_frames * 100 / total) : 0;
-        progress("encode", c->out_frames, total, encode_fps(c),
-                 pct > 100 ? 100 : pct);
+        const double fps = encode_fps(c);
+        progress("encode", c->out_frames, total, fps, pct > 100 ? 100 : pct,
+                 estimate_eta(c->out_frames, total, fps));
     }
     rc = 0;
 done:
@@ -4464,7 +4490,7 @@ static int run(enc_ctx *c)
     {   /* the last line: the whole encode's average */
         const int64_t dt = av_gettime_relative() - c->fps_t0;
         progress("encode", c->out_frames, c->out_frames,
-                 dt > 0 ? (double)c->out_frames * 1e6 / dt : 0, 100);
+                 dt > 0 ? (double)c->out_frames * 1e6 / dt : 0, 100, 0);
     }
     rc = 0;
     goto done;
