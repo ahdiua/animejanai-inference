@@ -370,6 +370,12 @@ bool build_engine(aji_ctx *c, const std::string &onnx_name,
     c->log_steps.push_back("Building " AJI_TRT_PRODUCT " engine for " + onnx_name +
                            " for " + spec.res +
                            " (first play at this resolution)");
+#ifdef AJI_TRTRTX
+    c->verbose("[engine-build] Starting TensorRT-RTX build for %s (%s); log: %s",
+#else
+    c->verbose("[engine-build] Starting trtexec for %s (%s); log: %s",
+#endif
+               onnx_name.c_str(), spec.res.c_str(), spec.log_path.c_str());
     if (!run_build_spec(spec, &c->build.child)) {
 #ifdef AJI_TRTRTX
         c->set_error("TensorRT-RTX engine build failed for %s (see %s)",
@@ -379,6 +385,7 @@ bool build_engine(aji_ctx *c, const std::string &onnx_name,
                      onnx_name.c_str(), spec.log_path.c_str());
         return false;
     }
+    c->verbose("[engine-build] Completed: %s", engine_path.c_str());
 #ifdef AJI_TRTRTX
     c->built_engines.insert(engine_path);
 #endif
