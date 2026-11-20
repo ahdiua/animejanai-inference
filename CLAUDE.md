@@ -2,6 +2,112 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## This fork: ahdiua/animejanai-inference
+
+`origin` is `ahdiua/animejanai-inference`; `upstream` is
+`the-database/animejanai-inference`. Develop on `dev`, integrate upstream there,
+then merge validated changes into `main` for fork releases. Push branches and
+release tags explicitly to `origin` only. Tags belong to each repository:
+creating `v0.9.1` in this fork does not create or change an upstream tag. Avoid
+`git push --mirror` or pushing all tags, since local tags can include upstream
+releases fetched for comparison.
+
+The fork was rebuilt on upstream `504f42b` (2026-11) instead of merging: upstream
+rewrote its history, so the old merge base was months back. `include/aji.h` is
+byte-identical to upstream (no fork ABI fields); the pre-rebuild `dev` history is
+an ancestor through a `merge -s ours`.
+
+This fork adds an offline encoding and Ubuntu runtime workflow:
+
+- `deploy.sh`: interactive dependency diagnosis, CUDA 13.x / TensorRT 11.x
+  deployment, the build, and model downloads into `~/models` in the conf layout
+  (`--models`, including the fp16 RIFE models). It does **not** build engines.
+  `--migrate` renames legacy short-name models by checksum and lists hand-built
+  engines for deletion (only after confirmation).
+- `generate_cmd.sh`: every profile runs through a conf slot (`--conf --slot
+  --model-dir --rife-model-dir --trtexec`), for a source install and the
+  runtime package alike. Custom RIFE (model, factor, order, threshold), custom
+  models and `native=off` go into a task conf (`run_encode.conf`, slot 9001)
+  beside the generated script. Serial queues for multiple videos; generation
+  does not execute the jobs.
+- `src/encode.c` additions over upstream: PROGRESS `eta=` / `eta_seconds`,
+  `[engine-build]` start/finish log lines, a finite muxer interleave bound
+  (sparse subtitles no longer buffer the encode), and CUDA frame pools sized
+  for what NVENC holds (8K output from 4x models fits in 12 GB). The generator
+  selects NVENC split encoding for Ada (2) and Blackwell (3).
+- `src/aji_trt.cpp` fixes: buffers sized for every step, deferred RIFE keeps
+  the pre-RIFE resize in the chain, RIFE factor 1 means no RIFE.
+- `src/kernels.cu`: fused postprocessing matrix + horizontal chroma pass.
+- Models: one manifest, `scripts/runtime-models.tsv` (read through
+  `scripts/model-assets.sh`), lists every packaged model with its SHA-256 and
+  source; `deploy.sh` and the runtime packager both use it. Layout:
+  `<model dir>/<conf model name>.onnx` and `<model dir>/rife/rife_v<ver>.onnx`.
+  Slots in `packaging/ubuntu24/runtime/animejanai.conf`: AnimeJaNai Sharp
+  (2001/2002), SD Compact (2003), native 4x RealESRGAN AnimeVideo-v3 (2004),
+  APISR 2x RRDB GAN (2005, `tools/prepare_apisr.py`), Real-ESRGAN x4plus
+  Anime 6B 4x (2006), RIFE v4.25/v4.26 alone (2025/2026) and after
+  Performance (3025/3026), plus the built-in 1001-1003.
+- Engines follow upstream unchanged: models the native kernels run (all the
+  packaged ones) need no engine; for a model that falls back to TensorRT the
+  backend builds and caches one on first use, and `clean_stale_engines`
+  removes every `*.engine` in the model/RIFE directories without the current
+  `.trt-<ver>.gpu-<gpu>` suffix, hand-named ones included. Native kernels and
+  held-frame reuse are on by default (RIFE chains never reuse); direct RIFE
+  (`--rife-*`) and `aji_engine_path` are gone.
+
+### Fork documentation and validation
+
+Read `DEPLOY.md` for deployment, `README.md` for user-facing runtime usage,
+`packaging/ubuntu24/README.md` for packaging, and `BENCHMARKS.md` for performance
+context. The platform guides below describe the inherited upstream engine
+build; the fork runtime package has its own workflow and assets.
+
+For local validation, run `cmake --build build -j`, `./build/aji_encode --help`,
+`ctest --test-dir build -L cpu` (and `-L gpu` with a GPU), shell syntax checks
+for changed scripts, and the fork tests: `sanity/test_generate_cmd.py`,
+`sanity/test_deploy.py`, `sanity/test_package_download.py`,
+`sanity/test_prune_prereleases.py`; with a GPU, `AJI_ENCODE_BIN=build/aji_encode`
+for `sanity/test_encode_decode.py` and `sanity/test_encode_mux.py`, plus the C/CUDA
+regressions `sanity/trt_configure.c` and `sanity/post_fusion.cu` (build lines
+in their headers). On WSL, put `/usr/lib/wsl/lib` first in `LD_LIBRARY_PATH`
+when a native `libcuda.so.1` is also installed. GPU or pixel-output changes
+need appropriate harness / parity or encoding checks; report when the GPU or
+the Windows/VapourSynth reference setup is unavailable. Keep local video
+inputs, generated task scripts and task confs, engines, model assets, build
+output, and experiment notes out of commits.
+
+### Fork runtime releases
+
+`.github/workflows/package-ubuntu24-runtime.yml` builds Ubuntu 24.04 x86_64
+archives for `sm89` (Ada) and `sm120` (Blackwell), with SHA-256 checksums. The
+packages include FFmpeg, CUDA/TensorRT runtime libraries, `trtexec`, the selected
+TensorRT builder resource, models, and launchers. The host still needs a
+compatible NVIDIA driver.
+
+The workflow runs on matching `dev` source changes, manual dispatch, or a
+`v*` tag push. Successful branch/manual runs publish prereleases; tag pushes
+publish stable releases in this fork. A manual `release_tag` remains a
+prerelease. Pushing `main` alone does not trigger this workflow. For a release,
+commit changes on `dev`, merge into `main`, create an annotated version tag on
+that merge, and push only the intended branches and tag to `origin`.
+
+After a successful prerelease upload, cleanup keeps the newest published
+prerelease and removes older prereleases, their assets, and their Git tags.
+Stable releases and drafts are excluded. `Prune old prereleases` can also be
+run manually, and runs when its workflow or script changes on `main` to apply
+the retention policy to existing releases. Publishing and cleanup share a
+concurrency group so they do not overlap. `scripts/prune-prereleases.py` defaults
+to a read-only preview; `--apply` performs deletions in `GITHUB_REPOSITORY` using
+`GH_TOKEN`. Release age is based on publication time, not commit time.
+
+`scripts/package-ubuntu24-runtime.sh` builds on Ubuntu 24.04;
+`scripts/package-ubuntu24-runtime-local.sh` wraps it in Docker/Podman elsewhere.
+The inherited upstream workflows stay as they are: `ci.yml` only builds and
+tests, `build-linux.yml` (manual) builds upstream's library bundle, and
+`notify-downstream.yml` / `runtime-packs.yml` need upstream's
+`JANAI_BUMP_TOKEN` and do nothing useful here. Upstream's TensorRT pins do not
+change the local installation or the fork runtime workflow.
+
 ## What this repo is
 
 `libaji` — a standalone C-ABI inference engine for real-time anime upscaling and RIFE frame
@@ -637,14 +743,14 @@ TensorRT per platform.
 `build-linux.yml` (the Linux release) runs the same action and `ctest -L cpu` before it
 publishes, so a Linux release can't ship a build that fails them.
 
-## Where the artifacts go
+## Where the upstream artifacts go
 
 | Platform | Built by | Asset |
 |---|---|---|
 | Linux | `.github/workflows/build-linux.yml`, dispatched with `release_tag` (no default; refuses a release that already has Linux assets unless `replace_assets=true`) | `aji-linux-x64.tar.zst`, `aji-encode-linux-x64.tar.zst` (aji_encode + libav, for VideoJaNai) |
 | Windows | **locally, by hand** (`docs/BUILD-WINDOWS.md`) | `aji-windows-x64.zip`, `aji-trtrtx-windows-x64.zip` (opt-in: `aji_trtrtx.dll` + TensorRT-RTX runtime, ~91 MB), `aji-trtrtx-backend-windows-x64.zip` (`aji_trtrtx.dll` alone, for apps that take the runtime from a shared pack) |
 
-All are attached to the **same release tag**, because the consumer derives every URL from one
+In the upstream release process, all are attached to the **same release tag**, because the consumer derives every URL from one
 `AjiVersion` constant. `the-database/mpv-AnimeJaNai`'s assembler downloads them in `InstallAji`
 and extracts them flat into `animejanai/inference/`. It does not take the TensorRT-RTX asset
 for now (mpv's background builds start each play with a short warm-up passthrough on
@@ -1030,8 +1136,11 @@ has no compatible base layer, so its colours come out wrong.
 
 ## Conventions
 
-- Commits: author `the-database`, short imperative subject, no co-author trailers.
-- `.gitignore` covers `build/`, `models/`, `*.engine`, and fixture binaries. The out-of-repo
+- Upstream commits: author `the-database`, short imperative subject, no co-author trailers.
+  Fork commits: the configured Git identity and focused Conventional Commit subjects,
+  e.g. `fix(encode): ...` or `docs(fork): ...`.
+- `.gitignore` covers `build/`, `build-deps/`, `build-runtime-*/`, `dist/`, `models/`,
+  `*.engine`, `/MEMORY.md`, and fixture binaries. The out-of-repo
   Windows build dirs (`build-win-release/` from `ci/windows/build-aji-release.bat`) are not in
   `.gitignore`; exclude them locally with `build-win-*/` in `.git/info/exclude`.
 - ONNX models for the DirectML backend must be **opset ≤ 21**: the bundled ORT DirectML EP only

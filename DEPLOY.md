@@ -15,8 +15,8 @@
 5. [Step 3：安装 TensorRT](#5-step-3安装-tensorrt)
 6. [Step 4：安装编译工具与 ffmpeg 开发库](#6-step-4安装编译工具与-ffmpeg-开发库)
 7. [Step 5：克隆并编译项目](#7-step-5克隆并编译项目)
-8. [Step 6：下载超分模型（ONNX）](#8-step-6下载超分模型onnx)
-9. [Step 7：构建 TensorRT Engine](#9-step-7构建-tensorrt-engine)
+8. [Step 6：获取模型（ONNX）](#8-step-6获取模型onnx)
+9. [Step 7：Engine 与缓存（无需手动构建）](#9-step-7engine-与缓存无需手动构建)
 10. [Step 8：运行超分（aji_encode）](#10-step-8运行超分aji_encode)
 11. [aji_encode 完整参数参考](#11-aji_encode-完整参数参考)
 12. [常见问题排错](#12-常见问题排错)
@@ -36,7 +36,7 @@ ffmpeg/NVDEC 硬件解码
 libaji (CUDA 色彩空间转换: NV12/P010 → FP16 RGB)
   │
   ▼
-TensorRT Engine 推理 (2× 超分辨率)
+native CUDA kernel 推理（不支持的模型回退 TensorRT Engine）
   │
   ▼
 libaji (CUDA 色彩空间转换: FP16 RGB → NV12/P010)
@@ -199,7 +199,7 @@ export PATH="/opt/ffmpeg/bin:$PATH"
 
 ```bash
 # 克隆代码
-git clone https://github.com/the-database/animejanai-inference.git
+git clone https://github.com/ahdiua/animejanai-inference.git
 cd animejanai-inference
 
 # 配置（根据 TensorRT 安装方式选择参数）
@@ -233,112 +233,77 @@ ls -lh build/libaji.so build/libaji_trt.so build/aji_harness build/aji_encode
 
 ---
 
-## 8. Step 6：获取超分模型（ONNX）
+## 8. Step 6：获取模型（ONNX）
 
-推荐常用超分模型：
+推荐直接使用 `./deploy.sh --models`（需要先 `./deploy.sh --venv`）。它按
+[`scripts/runtime-models.tsv`](scripts/runtime-models.tsv) 下载并校验 SHA256，与 Runtime
+打包使用同一份清单，文件名与 conf Slot 引用的名称一致：
 
-| 模型名称 | 用途 | 速度 / 倍率 | 输入节点名 |
-|----------|------|-------------|------------|
-| `2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx` (`performance.onnx`) | 2× 超分（极速偏画质 - 推荐） | ⚡⚡⚡ 最快 (2x) | `input` |
-| `2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx` (`balanced.onnx`) | 2× 超分（画质与速度均衡） | ⚡⚡ 均衡 (2x) | `input` |
-| `2x_AnimeJaNai_HD_V3.1Sharp1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx` (`balanced_sharp1.onnx`) | 2× 超分（清晰锐化版） | ⚡⚡ 锐化 (2x) | `input` |
-| `2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo.onnx` (`sd_compact.onnx`) | 2× 标清修复（适合 480p/老番） | ⚡⚡ 标清 (2x) | `input` |
-| `realesr-animevideov3-v0.2.5.0-fp16-dynamic.onnx` | AnimeVideo-v3 动漫视频轻量超分 | 原生 4x | `input` |
-| `RealESRGAN_x4plus_anime_6B.onnx` (`realesrgan_anime6b.onnx`) | 4× 经典原版动漫超分（线条强化与降噪） | ⚡ 经典 (4x) | `image.1` |
+```
+~/models/<conf 中的模型名>.onnx
+~/models/rife/rife_v<版本>.onnx
+```
 
-AnimeVideo-v3 使用官方 v0.2.5.0 的 `realesr-animevideov3.pth` 转换，
-输入/输出为 FP16 RGB NCHW，batch 和宽高动态，ONNX opset 17。
-`deploy.sh` 模型选项 6 自动下载并构建 Engine；Runtime 使用 Slot 2004，
-首次按输入尺寸构建 Engine 并缓存。原生 4× 表示 1080p → 8K；
-如需最终 4K，可在 `generate_cmd.sh` 的输出缩放设置中指定高度 2160。
-SHA256：`d584ed9c21a2c2448d96d5e3e0a2d719a0e573d36eb4244cb07e68be96e3a0ab`。
+| 文件 | Slot | 说明 |
+|------|------|------|
+| `2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx` | 1003, 3025, 3026 | 2× 超分（极速偏画质，推荐） |
+| `2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx` | 1001, 1002 | 2× 超分（画质与速度均衡） |
+| `2x_AnimeJaNai_HD_V3.1Sharp1_{Performance_SPANF3_b5f48,Balanced_SPANF3_b8f64}_unshuffle_fp16.onnx` | 2002 / 2001 | 2× 锐化版 |
+| `2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo.onnx` | 1001–1003 的 SD 链, 2003 | 2× 标清修复 |
+| `realesr-animevideov3-v0.2.5.0-fp16-dynamic.onnx` | 2004 | AnimeVideo-v3 原生 4× |
+| `2x_APISR_RRDB_GAN_fp16.onnx` | 2005 | APISR 2× RRDB GAN（`tools/prepare_apisr.py` 生成） |
+| `RealESRGAN_x4plus_anime_6B.onnx` | 2006 | Real-ESRGAN x4plus Anime 6B 原生 4×（fp32，动态 H/W） |
+| `rife/rife_v4.25.onnx`、`rife/rife_v4.26.onnx` | 2025, 2026, 3025, 3026, 自定义插帧 | fp16 RIFE，取自上游 `models-rife-fp16-1` 发布包 |
+
+原生 4× 表示 1080p → 8K；如需最终 4K，可在 `generate_cmd.sh` 的输出缩放中指定高度 2160。
+自定义 ONNX 可在 `--models` 菜单中通过 URL 或本地路径导入，保留原文件名，之后在生成器中
+选择“自定义模型”。
+
+手动下载时请使用上表的完整文件名（URL 与 SHA256 见清单），例如：
 
 ```bash
-# 创建模型目录
-mkdir -p ~/models
-
-# AnimeVideo-v3 (native 4x)
-wget -O ~/models/realesr-animevideov3-v0.2.5.0-fp16-dynamic.onnx "https://r2.ahdiua.com/realesr-animevideov3-v0.2.5.0-fp16-dynamic.onnx"
-
-# 1 & 2: 获取 AnimeJaNai 官方 V3.1 模型 (R2 CDN 高速直连秒级下载)
-wget -O ~/models/performance.onnx "https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx"
-wget -O ~/models/balanced.onnx "https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx"
-
-# 3: 下载原版 Real-ESRGAN Anime 6B (4x)
-wget -O ~/models/realesrgan_anime6b.onnx \
+mkdir -p ~/models/rife
+wget -O ~/models/2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx \
+  "https://r2.ahdiua.com/2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx"
+wget -O ~/models/RealESRGAN_x4plus_anime_6B.onnx \
   "https://huggingface.co/deepghs/imgutils-models/resolve/main/real_esrgan/RealESRGAN_x4plus_anime_6B.onnx"
 ```
 
 ---
 
-## 9. Step 7：构建 TensorRT Engine
+## 9. Step 7：Engine 与缓存（无需手动构建）
 
-> [!IMPORTANT]
-> **Engine 文件与 GPU 型号 + TensorRT 版本 + CUDA 版本绑定**，不能跨平台复用。
-> 每台新机器必须用 `trtexec` 从 ONNX 重新构建。构建约需 1-2 分钟。
+- **native kernel（默认开启）**：上游的手写 CUDA kernel 直接解析 ONNX，覆盖 SPAN/SPANF3、
+  Compact、ESRGAN(RRDB)、FDAT、HAT、DAT、RIFE 等结构，不需要 Engine。日志中出现
+  `Native kernels: <模型> (...)`。本 Fork 打包的全部模型都由 native 运行。
+- **回退 TensorRT**：native 识别不了的模型（日志 `Native kernels not used for <模型>: <原因>`），
+  由 backend 在首次处理某个分辨率时调用 `trtexec` 构建 Engine 并缓存到模型目录，日志打印
+  `[engine-build] Starting trtexec for ...` 与 `[engine-build] Completed: ...`；之后直接复用。
+  ONNX 内容变化时（`.onnxinfo` 记录）会自动重建。
+- **缓存清理**：每次首次 `aji_configure` 时，libaji 会删除模型目录和 RIFE 目录中所有不带当前
+  `.trt-<TensorRT 版本>.gpu-<GPU>` 后缀的 `*.engine`（连同 `.onnxinfo`），**手工命名的 Engine 也会被删**。
+  不要把自己的 Engine 放在模型目录里。
+- **对比 TensorRT 结果**：在 conf 的 `[global]` 写 `native=off`（生成器的可选项会自动写入任务配置）。
 
-```bash
-# 1. 为 AnimeJaNai 构建 Engine（输入节点为 input，以 1080p 为例）
-trtexec \
-  --onnx=~/models/performance.onnx \
-  --minShapes=input:1x3x1080x1920 \
-  --optShapes=input:1x3x1080x1920 \
-  --maxShapes=input:1x3x1080x1920 \
-  --builderOptimizationLevel=5 \
-  --skipInference \
-  --saveEngine=~/models/performance_1080p.engine
+### 从旧版部署迁移
 
-# 2. 为 Real-ESRGAN 构建 Engine（注意：其输入节点名称为 image.1）
-trtexec \
-  --onnx=~/models/realesrgan_anime6b.onnx \
-  --minShapes=image.1:1x3x1080x1920 \
-  --optShapes=image.1:1x3x1080x1920 \
-  --maxShapes=image.1:1x3x1080x1920 \
-  --builderOptimizationLevel=5 \
-  --skipInference \
-  --saveEngine=~/models/realesrgan_anime6b_1080p.engine
-```
-
-### 构建参数说明
-
-| 参数 | 说明 |
-|------|------|
-| `--minShapes` / `--optShapes` / `--maxShapes` | 三者设为相同的源视频分辨率，生成固定 shape Engine |
-| `--builderOptimizationLevel=5` | 使用 TensorRT 最高构建优化等级（构建会更慢） |
-| `--skipInference` | 仅构建 Engine，跳过推理基准 |
-| `--fp16` | （仅适用于 TensorRT 10 及以下版本）在 TensorRT 11+ 中已废弃 |
-
-### 不同源分辨率的 Engine 示例
+旧版 `deploy.sh` 用 `performance.onnx` 等短名称保存模型，并手工构建
+`performance_1080p.engine`（附带 `.label`、`.build.log`、`*.timing.cache`）。运行：
 
 ```bash
-# 720p 输入
-trtexec --onnx=~/models/performance.onnx \
-  --minShapes=input:1x3x720x1280 \
-  --optShapes=input:1x3x720x1280 \
-  --maxShapes=input:1x3x720x1280 \
-  --builderOptimizationLevel=5 \
-  --skipInference \
-  --saveEngine=~/models/performance_720p.engine
-
-# 1080p 输入
-trtexec --onnx=~/models/performance.onnx \
-  --minShapes=input:1x3x1080x1920 \
-  --optShapes=input:1x3x1080x1920 \
-  --maxShapes=input:1x3x1080x1920 \
-  --builderOptimizationLevel=5 \
-  --skipInference \
-  --saveEngine=~/models/performance_1080p.engine
+./deploy.sh --migrate
 ```
 
-> [!TIP]
-> 每个不同的源分辨率建议单独生成固定 shape Engine。如果改为不同的
-> `minShapes` / `optShapes` / `maxShapes`，将会生成通用性更高但速度较低的动态 Engine。
+它按校验和把短名称模型改名为 conf 名称（无法识别的旧文件会列出，确认后才删除），并列出旧的
+手工 Engine 及附属文件和占用空间，确认后才删除；`--yes` 时只改名，不删除任何文件。
 
 ---
 
 ## 10. Step 8：运行超分（aji_encode）
 
 ### 基本用法
+
+推荐用 `./generate_cmd.sh` 生成命令。手写命令时使用 conf Slot：
 
 ```bash
 cd animejanai-inference
@@ -347,8 +312,9 @@ cd animejanai-inference
 ./build/aji_encode \
   --input /path/to/input_video.mkv \
   --output /path/to/output_4k.mkv \
-  --engine ~/models/performance_1080p.engine \
-  --max-width 1920 --max-height 1080 \
+  --conf packaging/ubuntu24/runtime/animejanai.conf --slot 1003 \
+  --model-dir ~/models --rife-model-dir ~/models/rife \
+  --trtexec "$(command -v trtexec)" \
   --vcodec hevc_nvenc \
   --overwrite
 ```
@@ -356,19 +322,17 @@ cd animejanai-inference
 ### 截取片段测试（推荐先用短片段验证）
 
 ```bash
-# 截取 1 分钟测试片段（零消耗，只是流拷贝）
 ffmpeg -y -ss 00:01:00 -i input_video.mkv -t 60 -c copy test_clip.mkv
 
-# 对测试片段超分
 ./build/aji_encode \
   --input test_clip.mkv \
   --output test_clip_4k.mkv \
-  --engine ~/models/performance_1080p.engine \
-  --max-width 1920 --max-height 1080 \
+  --conf packaging/ubuntu24/runtime/animejanai.conf --slot 1003 \
+  --model-dir ~/models --rife-model-dir ~/models/rife \
+  --trtexec "$(command -v trtexec)" \
   --vcodec hevc_nvenc \
   --overwrite
 
-# 验证输出
 ffprobe -hide_banner test_clip_4k.mkv
 # 应显示：Video: hevc, 3840x2160 [SAR 1:1 DAR 16:9]
 ```
@@ -383,8 +347,8 @@ ffprobe -hide_banner test_clip_4k.mkv
 ./build/aji_encode \
   --input test_clip.mkv \
   --output test_clip_4k_av1.mkv \
-  --engine ~/models/performance_1080p.engine \
-  --max-width 1920 --max-height 1080 \
+  --conf packaging/ubuntu24/runtime/animejanai.conf --slot 1003 \
+  --model-dir ~/models --trtexec "$(command -v trtexec)" \
   --vcodec av1_nvenc \
   --vquality "-cq 20 -preset p6 -tune hq -split_encode_mode 2" \
   --pix-fmt yuv420p10 \
@@ -397,8 +361,8 @@ ffprobe -hide_banner test_clip_4k.mkv
 ./build/aji_encode \
   --input test_clip.mkv \
   --output test_clip_4k.mkv \
-  --engine ~/models/performance_1080p.engine \
-  --max-width 1920 --max-height 1080 \
+  --conf packaging/ubuntu24/runtime/animejanai.conf --slot 1003 \
+  --model-dir ~/models --trtexec "$(command -v trtexec)" \
   --vcodec libx265 \
   --overwrite
 ```
@@ -407,61 +371,37 @@ ffprobe -hide_banner test_clip_4k.mkv
 
 ## 11. aji_encode 完整参数参考
 
+完整列表以 `./build/aji_encode --help` 为准，常用参数：
+
 ```
-aji_encode --input <f> --output <f> [选项...]
+aji_encode --input <f> --output <f> --conf <c> --slot <N> --model-dir <d>
+           [--rife-model-dir <d>] [--trtexec <p>] [选项...]
 
-必选参数（直连模式）:
-  --input <file>          输入视频文件路径
-  --output <file>         输出视频文件路径
-  --engine <file>         TensorRT Engine 文件路径
-  --max-width <W>         输入视频的最大宽度
-  --max-height <H>        输入视频的最大高度
-
-可选参数:
-  --vcodec <codec>        视频编码器（默认 hevc_nvenc）
-                          可选：hevc_nvenc, av1_nvenc, h264_nvenc,
-                                libx265, libx264, ffv1
-  --vquality "<args>"     编码器质量参数
-  --pix-fmt <fmt>         输出像素格式（默认 yuv420p10）
-                          可选：yuv420p, yuv420p10, yuv444p, yuv444p10
-  --final-resize-height H 最终输出高度（缩小到指定高度）
-  --final-resize-factor % 最终输出缩放百分比
-  --decoder <mode>        解码模式：auto（默认）, nvdec, cpu
-  --overwrite             覆盖已有输出文件
-  --no-audio              不拷贝音轨
-  --no-subs               不拷贝字幕
-  --no-chapters           不拷贝章节信息
-  --progress <mode>       进度格式：line（默认，含 ETA）, json, none
+  --conf <file>           animejanai.conf 配置文件（Runtime：包内 animejanai.conf；
+                          源码：packaging/ubuntu24/runtime/animejanai.conf）
+  --slot <N>              Slot 编号（内置 1001-1003，打包 conf 2001-2006、2025/2026、3025/3026）
+  --model-dir <dir>       ONNX 模型目录（也是回退 TensorRT 时的 Engine 缓存目录）
+  --rife-model-dir <dir>  RIFE 模型目录（<model-dir>/rife）
+  --trtexec <path>        trtexec，回退 TensorRT 的模型首次使用时构建 Engine
+  --vcodec <codec>        hevc_nvenc（默认）, av1_nvenc, h264_nvenc, libx265, libx264, ffv1 等
+  --vquality "<args>"     编码器参数，如 "-cq 18 -preset p7 -tune hq -split_encode_mode 2"
+  --pix-fmt <fmt>         yuv420p10（默认）, yuv420p, yuv444p, yuv444p10
+  --final-resize-height H / --final-resize-factor %   AI 处理后缩放（Spline36）
+  --decoder <mode>        auto（默认）, nvdec, cpu
+  --pipeline-depth <N>    流水线深度；4x 模型建议 2 以降低显存
+  --no-reuse-held-frames  关闭静止帧复用（默认开启；RIFE 方案不复用）
+  --overwrite / --no-audio / --no-subs / --no-chapters
+  --progress <mode>       line（默认，含 fps 与 eta）, json（含 eta_seconds）, none
   --log <file>            日志输出到文件
-  --build-only            仅构建 Engine，不执行编码
-
-直连 Engine 模式的可选 RIFE 参数（与超分同一管道）:
-  --rife-model <name>     RIFE ONNX 文件名（不含 .onnx，如 rife_v4.26）
-  --rife-model-dir <dir>  RIFE ONNX 与 Engine 缓存目录
-  --rife-factor <N>       整数插帧倍率 2-8（默认 2）
-  --rife-order <order>    before（先插帧再超分，默认）或 after
-  --rife-scene-threshold  转场检测阈值（默认 0.150）
-
-配置模式（替代 --engine 直连模式）:
-  --conf <file>           animejanai.conf 配置文件路径
-  --slot <N>              配置 Slot 编号
-  --model-dir <dir>       ONNX 模型目录
-  --trtexec <path>        trtexec 可执行文件路径
-  --rife-model-dir <dir>  RIFE 插帧模型目录
-  --backend tensorrt      推理后端（默认 tensorrt）
+  --build-only            只构建需要的 Engine，不编码
 ```
 
-例如，使用同一次解码/编码完成 RIFE 2x 插帧与 2x 超分：
-
-```sh
-aji_encode --input input.mkv --output output.mkv \
-  --engine models/balanced_1080p.engine --max-width 1920 --max-height 1080 \
-  --rife-model-dir onnx/rife --rife-model rife_v4.26 \
-  --rife-factor 2 --rife-order before \
-  --decoder nvdec --vcodec hevc_nvenc --pix-fmt yuv420p10
-```
-
-首次运行会按 RIFE 工作分辨率构建并缓存 TensorRT Engine；后续任务直接复用。
+插帧只通过 conf 配置：使用 RIFE Slot（2025/2026/3025/3026），或在自定义 conf 中给 Slot 加
+`chain_1_rife=yes`、`chain_1_rife_model=426`、`chain_1_rife_factor_numerator=2`、
+`chain_1_rife_factor_denominator=1`、`chain_1_rife_before_upscale=yes|no`、
+`chain_1_rife_scene_detect_threshold=0.150`。倍率可以是分数（如 5/2）。`generate_cmd.sh`
+的自定义插帧会自动写出这样的任务配置。上游 `aji_encode` 仍保留 `--engine` 直连测试入口，
+本 Fork 的脚本不再使用。
 
 ---
 
@@ -489,16 +429,16 @@ CMake 会跳过 aji_encode 的编译，但 libaji.so 和 aji_harness 仍能正�
   cmake -B build -S . -DAJI_TRT_ROOT=$HOME/sdk/tensorrt/usr
 ```
 
-### Q4: trtexec 构建 Engine 时报 `CUDA out of memory`
+### Q4: 4x 模型（Slot 2004 / 2006）显存不足或速度很慢
 ```
-减小 --maxShapes 的分辨率，或关闭其他占用 GPU 显存的进程。
-4K Engine 构建约需 3-4 GB 显存。
+1080p 输入的 4x 输出为 8K。加 --pipeline-depth 2（生成器会自动添加），
+关闭其他占用显存的进程；必要时先缩小输入，或用 --final-resize-height 2160 输出 4K。
 ```
 
-### Q5: aji_encode 运行时报 `engine rejects input WxH`
+### Q5: 手工放在 ~/models 中的 .engine 消失了
 ```
-源视频分辨率超出了 Engine 的 --maxShapes。
-需要用更大的 --maxShapes 重新构建 Engine。
+libaji 会删除模型目录中所有不带当前 .trt-<版本>.gpu-<GPU> 后缀的 *.engine。
+Engine 现在首次使用时自动构建，不需要手工准备；旧安装请先运行 ./deploy.sh --migrate。
 ```
 
 ### Q6: aji_encode 运行时报 `libaji_trt.so: cannot open shared object file`
@@ -550,52 +490,33 @@ sudo apt update && sudo apt install -y \
 # sudo apt install -y tensorrt tensorrt-dev
 
 # 3. 克隆并编译
-git clone https://github.com/the-database/animejanai-inference.git
+git clone https://github.com/ahdiua/animejanai-inference.git
 cd animejanai-inference
 CUDACXX=/usr/local/cuda/bin/nvcc cmake -B build -S . \
     -DAJI_TRT_ROOT=/usr \
     -DCMAKE_CUDA_ARCHITECTURES=native
 cmake --build build -j$(nproc)
 
-# 4. 下载模型
-mkdir -p ~/models
-# wget -O ~/models/performance.onnx "<ONNX_DOWNLOAD_URL>"
+# 4. 下载模型（含 RIFE；Engine 首次使用时自动构建）
+./deploy.sh --venv
+./deploy.sh --models
 
-# 5. 构建 Engine（替换为你的模型路径）
-trtexec \
-    --onnx=~/models/performance.onnx \
-    --minShapes=input:1x3x1080x1920 \
-    --optShapes=input:1x3x1080x1920 \
-    --maxShapes=input:1x3x1080x1920 \
-    --builderOptimizationLevel=5 \
-    --skipInference \
-    --saveEngine=~/models/performance_1080p.engine
-
-# 6. 超分测试
+# 5. 超分测试
 # ./build/aji_encode \
 #     --input input.mkv --output output_4k.mkv \
-#     --engine ~/models/performance_1080p.engine \
-#     --max-width 1920 --max-height 1080 \
-#     --vcodec hevc_nvenc --overwrite
+#     --conf packaging/ubuntu24/runtime/animejanai.conf --slot 1003 \
+#     --model-dir ~/models --rife-model-dir ~/models/rife \
+#     --trtexec "$(command -v trtexec)" --vcodec hevc_nvenc --overwrite
 
-echo "✅ 部署完成！请参考上方注释的第 4-6 步下载模型并运行。"
+echo "✅ 部署完成！"
 ```
-## deploy 与自动缓存的引擎命名
-
-`deploy.sh` 使用可读的 `<模型名>_<分辨率>.engine` 命名，例如
-`performance_1080p.engine`、`balanced_720p.engine`、`performance_960x540.engine`。
-构建不再依赖 `build/aji_engine_path`，每次按当前 GPU 和 TensorRT 环境重新构建，
-成功后才替换同名引擎；构建失败保留原文件。
-这些引擎通过 `--engine` 直连模式使用；配置模式仍使用推理后端自己的哈希缓存名称。
-
-构建输出同时保存在 `.engine.build.log`；`.engine.label` 记录模型名和输入尺寸，
-供命令生成器展示。已有哈希名称引擎不会被自动改名或删除，仍可通过直连模式使用。
-引擎目录不进行基于文件名后缀的自动清理。
+## 模型下载
 
 模型下载优先使用 `aria2c`（最多 4 连接，失败重试），未安装或下载失败时回退到 Python。
 `--ffmpeg` / `--venv` 安装步骤会安装 `aria2`，已有环境也可运行 `sudo apt-get install -y aria2`。
 下载显式设置兼容 CDN 的 User-Agent，避免默认 `Python-urllib` 请求被返回 HTTP 403；
-模型地址要求 HTTPS，保留证书验证、ONNX 校验、下载收据和镜像回退，失败时打印对应 URL。
+模型地址要求 HTTPS，保留证书验证、ONNX 校验、下载收据、SHA256 与镜像回退，失败时打印对应 URL。
+RIFE 模型包（约 320 MB，含全部版本）只下载一次，解出所需版本后按固定 SHA256 校验。
 
 ## deploy.sh 的检测、版本选择与下载校验
 
@@ -614,7 +535,7 @@ echo "✅ 部署完成！请参考上方注释的第 4-6 步下载模型并运�
 CUDA 安装版本必须为 13.x，TensorRT 的安装包限定 11.x。编译时 CUDA 以
 `--cuda-root`、`CUDACXX`、PATH 的顺序选择；TensorRT 以 `--trt-root` 为准，
 未指定时依次检查 `/usr` 和 `~/sdk/tensorrt/usr`。可用 `--trtexec` 指定工具路径，
-其报告版本必须与所选开发头文件一致。CMake 和引擎构建使用同一组解析结果。
+其报告版本必须与所选开发头文件一致。CMake 与测试片段使用同一组解析结果。
 
 FFmpeg 固定到 BtbN `autobuild-2026-08-31-13-27` 的月底构建，支持 n8.1 与 master
 两个变体；NVENC 补丁固定到 `1475091ae9e8fb23cc22d565adf932a488d00bcd`。
@@ -628,7 +549,7 @@ ONNX 结构后才替换目标文件，并记录 `.download.json` 中的来源与
 该记录用于检查本地文件完整性和 URL 是否一致，不是发布者签名；辅助工具支持
 `--sha256` 传入可信摘要。无记录的旧下载会重新获取，自定义 URL 使用不同文件名。
 模型必须是包含全部权重的单文件 ONNX；外置权重模型请自行准备并通过本地路径使用。
-这些下载记录不改变引擎缓存的命名或复用规则。
+清单中的模型还会核对固定的 SHA256。
 
 安装会更新对应的 CUDA/FFmpeg profile，并迁移旧脚本写入 `.bashrc` 的已知环境变量行，
 保留其他用户配置。库搜索路径不包含空目录项。一分钟测试的输入和输出放在独立的

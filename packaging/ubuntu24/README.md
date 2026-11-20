@@ -60,12 +60,17 @@ preview, set `GITHUB_REPOSITORY=ahdiua/animejanai-inference` and run
 `python3 scripts/prune-prereleases.py`; add `--apply` with `GH_TOKEN` configured
 to perform the deletions.
 
-Engines built on first use are fixed to the video's working resolution
-(`minShapes=optShapes=maxShapes`) and use
-`--builderOptimizationLevel=5`. A different resolution gets its own cached
-engine.
+Models come from `scripts/runtime-models.tsv`, the manifest `deploy.sh
+--models` also installs from, and each staged file is checked against its
+pinned SHA-256. A model already in `--models-dir` (default `./onnx`, same
+relative paths) is used instead of downloading it. RIFE v4.25/v4.26 are
+extracted from upstream's `models-rife-fp16-1` archive (downloaded once).
+APISR 2x RRDB GAN (Slot 2005) is taken from `--models-dir`, then the
+repository `models/` directory, or else prepared by `tools/prepare_apisr.py`
+in an isolated Python environment. Real-ESRGAN x4plus Anime 6B (Slot 2006) is
+the deepghs ONNX export; its license and the other model sources are listed
+in `runtime/THIRD_PARTY_NOTICES.txt`.
 
-APISR 2x RRDB GAN is included as Slot 2005. Packaging first looks for
-`2x_APISR_RRDB_GAN_fp16.onnx` in `--models-dir`, then in the repository
-`models/` directory. Otherwise it uses `tools/prepare_apisr.py` to download,
-verify and adapt the pinned upstream export in an isolated Python environment.
+Every packaged model runs on libaji's native CUDA kernels, so none needs an
+engine. A model that falls back to TensorRT gets an engine built with the
+bundled `trtexec` on first use at each resolution and cached in `onnx/`.

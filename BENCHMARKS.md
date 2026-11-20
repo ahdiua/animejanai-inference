@@ -317,3 +317,103 @@ tensor-core peak on every card measured (A5000 ~67 of 111 TFLOPS, 4090 ~187 of ~
 Blackwell gain on 64 channels is mostly TensorRT's weaker sm_120 kernels, and on Ampere both are
 compute-bound, so native ties. The 48-channel Performance model is bound by memory traffic, which
 the fusion removes, and gains ~1.7x on all three generations. Nothing is slower than TensorRT.
+
+## CUDA postprocessing fusion and encoder stream dependencies (2026-09-22)
+
+> **Rebuild on upstream 504f42b (2026-11-20).** The postprocessing fusion was
+> ported (`src/kernels.cu`); on TensorRT 11.4 / CUDA 13.5 the same benchmark gave
+> 1920x1080 P010 0.108 -> 0.062 ms and 3840x2160 P010 0.618 -> 0.319 ms, all 872
+> parity cases byte-identical, and slot 2002 (native SPANF3) FFV1 encodes with
+> identical frame hashes. The encoder stream/event changes below were **not
+> ported**: upstream restructured those streams, and `sanity/encode_stream.c`
+> was removed with them.
+
+RTX 4070 SUPER (sm89), WSL2, CUDA 13.4, TensorRT 11.2.1, FFmpeg n9.0.1.
+These changes preserve the selected model, pixel format and encoder options.
+The reference is the code immediately before these two optimizations, including
+the preceding correctness fixes.
+
+The postprocessor combines the RGB-to-YUV matrix and horizontal chroma
+downsample in one kernel, retaining FP32 arithmetic in a shared-memory tile.
+The vertical downsample/quantization remains separate. Even-width plans need
+one half-width UV temporary instead of both a full-width and half-width
+temporary; odd widths retain the previous three-pass path.
+
+`sanity/post_fusion.cu --benchmark`, CUDA-event timing, seven paired samples of
+100 calls after warmup, alternating baseline/optimized order; medians:
+
+| output | previous postprocessing | fused postprocessing |
+|---|---:|---:|
+| 1920x1080 NV12 | 0.087828 ms | 0.064543 ms |
+| 1920x1080 P010 | 0.083912 ms | 0.060180 ms |
+| 3840x2160 NV12 | 0.567142 ms | 0.291903 ms |
+| 3840x2160 P010 | 0.595035 ms | 0.313212 ms |
+
+Each 4K postprocessing plan saves 66,355,200 bytes of CUDA allocations.
+The roughly 47% reduction for 4K P010 applies to postprocessing time, not
+whole-encoder throughput.
+
+The encoder uses a nonblocking inference stream. An event recorded on each
+normalized input frame's actual producer stream supplies the dependency from
+NVDEC or upload work; the existing completion ticket still protects output
+consumption. Final CUDA resize also records a dependency before its input
+allocation can be reused by inference, because the filter can return with
+reads still queued. `sanity/encode_stream.c` verified both input readiness and
+output reuse across 64 frames on default and custom producer streams.
+Omitting the waits produced 64 stale input frames or 63 stale reused outputs
+in each negative control. Normal tests passed; the input test also passed
+memcheck.
+
+End-to-end check: 160 frames of 1920x1080/24fps `testsrc2`, H.264 input,
+existing `balanced_1080p.engine`, NVDEC, 3840x2160 P010 output, HEVC NVENC,
+`-cq 18 -preset p7`, pipeline depth 4. Three runs per binary in alternating
+order; encoding-stage FPS excludes setup/engine load and includes encoder
+drain. The encoder options were identical for both binaries and no defaults
+were changed:
+
+| | runs (fps) | median (fps) |
+|---|---|---:|
+| before | 48.34, 48.21, 48.17 | 48.21 |
+| both optimizations | 48.90, 48.90, 48.84 | 48.90 |
+
+The measured total-throughput gain is 1.43% on this workload. Decoded output
+pixels have identical SHA256 hashes, and all 160 packet PTS/DTS/durations
+match. This is a short synthetic workload, not a general speedup guarantee.
+The same comparison with final `scale_cuda` resize from 4K to 1080p also
+produced identical pixels and packet timestamps for all 160 frames.
+
+Correctness validation:
+
+- `sanity/post_fusion.cu`: 872 cases, identical bytes, maximum error 0,
+  PSNR infinity, unchanged padding/guards. Includes NV12/P010, both filters,
+  three matrices, both ranges, all sitings, independent plane pitches, tiny
+  and partial blocks, odd widths, 1080p and 4K. The 864 small cases also passed
+  Compute Sanitizer memcheck, racecheck and synccheck without errors.
+- Full f1-f5 pre/post and four RGB resize comparisons: all 14 optimized raw
+  outputs were byte-identical to the baseline (576,463,680 bytes per sweep).
+  Goldens used native VapourSynth R79 / zimg 3.0.6, since the Windows R73
+  package was unavailable. The original fixture generator was used, with
+  local 10-bit anime at 480 seconds replacing the unavailable Tongari/Eva
+  source captures; fixture sizes and canonical lossless repacking were kept.
+- Metrics against those VS goldens were unchanged: PRE minimum PSNR
+  108.08 dB, max error 0.000976562; POST minimum PSNR 105.28 dB, max error
+  1 integer code value (f2/f3 exact); RGB resize minimum PSNR 76.26 dB,
+  max error 0.000976562. These differences already existed in the baseline.
+
+## CUDA frame pools for NVENC (fork, 2026-11-20)
+
+RTX 4070 SUPER (12 GB), WSL2, TensorRT 11.4.0.106, CUDA 13.5, FFmpeg n9.0.2.
+90 frames of 1920x1080 HEVC 10-bit anime, slot 2006 (Real-ESRGAN x4plus Anime
+6B, native kernels, 1080p -> 7680x4320 P010), `--pipeline-depth 2`,
+`hevc_nvenc -cq 18 -preset p7 -tune hq -split_encode_mode 2`:
+
+| upscale pool | fps | peak VRAM | NVDEC |
+|---|---:|---:|---|
+| ring + 48 (upstream) | 4.47 | 11976 MiB | out of memory, CPU decode |
+| ring + NVENC surfaces (fork) | 7.78 | 11967 MiB | yes |
+
+(The upstream-pool run was measured before TensorRT was upgraded from 11.2.1;
+the native kernels do not use TensorRT, and a ring + 16 pool on 11.2.1 gave
+7.83 fps.) The pool reserves FFmpeg nvenc's surface count for the given options
+(`rc-lookahead`, `bf`, `surfaces`) instead of a flat 48; 4K runs with
+`-rc-lookahead 32 -bf 4` and with `-surfaces 64` still complete.

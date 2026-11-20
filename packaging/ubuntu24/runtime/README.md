@@ -23,15 +23,17 @@ bash ./run_encode.sh
 ```
 
 `generate_cmd.sh` detects the extracted Runtime environment and presents an
-interactive menu for the input video, built-in Slot, full/clip processing,
-output path, encoder, quality, decoder and pixel format. It does not require an
-existing `.engine`: the generated `run_encode.sh` uses configuration mode, so
-the first run builds the required fixed-shape engines and later runs reuse the
-cache in `onnx/`.
+interactive menu for the input video, Slot, full/clip processing, output path,
+encoder, quality, decoder and pixel format. Every packaged model runs on
+libaji's native CUDA kernels, so no engine is needed; a model that falls back to
+TensorRT gets one built on first use and cached in `onnx/`.
 
-The generator automatically requests two-way HEVC/AV1 split-frame encoding on
-Ada/RTX 40 and three-way encoding on Blackwell/RTX 50. RIFE-only and combined
-upscale + RIFE 2x profiles can be selected from the same Slot menu.
+Besides the Slots, the generator offers a custom model (another ONNX file in
+`onnx/`) and custom RIFE (model, 2x / 5/2x / 4x, order, scene threshold) on any
+upscale Slot or alone; those, and the TensorRT comparison option (`native=off`),
+are written to a task conf `run_encode.conf` beside `run_encode.sh`. It
+requests two-way HEVC/AV1 split-frame encoding on Ada/RTX 40 and three-way
+encoding on Blackwell/RTX 50, and adds `--pipeline-depth 2` for 4x models.
 
 ## Manual command
 
@@ -51,13 +53,12 @@ To bypass the interactive generator, invoke the root launcher directly:
 
 Run the launchers from the extracted package root. They configure the bundled
 shared-library paths automatically; do not invoke the `.real` executables in
-`bin/` directly. The package directory must be writable because generated
-TensorRT engines are cached beside the models in `onnx/`.
+`bin/` directly. The package directory must be writable: engines for models
+that fall back to TensorRT are cached beside the models in `onnx/`, and libaji
+removes any other `*.engine` there.
 
-The default slot is `1003` (Performance). The first run at a new resolution
-builds and caches a fixed-shape TensorRT engine beside the ONNX model; later
-runs reuse it. Upscale and RIFE engines use `minShapes=optShapes=maxShapes` and
-TensorRT's maximum `builderOptimizationLevel=5`.
+The default slot is `1003` (Performance). Held-frame reuse is on by default
+(`--no-reuse-held-frames` turns it off; RIFE Slots never reuse).
 
 Useful slots:
 
@@ -71,6 +72,7 @@ Useful slots:
 | 2003 | SD Compact |
 | 2004 | RealESRGAN AnimeVideo-v3 (native 4x) |
 | 2005 | APISR RRDB GAN 2x (no RIFE) |
+| 2006 | Real-ESRGAN x4plus Anime 6B (native 4x) |
 | 2025 | RIFE v4.25 2x only |
 | 2026 | RIFE v4.26 2x only |
 | 3025 | Performance + RIFE v4.25 2x |
@@ -93,8 +95,12 @@ and `-split_encode_mode 3` on Blackwell/RTX 50. For example:
   --pix-fmt yuv420p10 --overwrite
 ```
 
-Direct Engine mode remains available by passing `--engine`, `--max-width` and
-`--max-height`. The root launchers set all relative runtime paths automatically.
+Interpolation is configured in conf Slots only. For other RIFE settings, copy
+`animejanai.conf`, add a Slot with `chain_1_rife=yes`, `chain_1_rife_model`
+(`426` = v4.26), `chain_1_rife_factor_numerator/denominator` and
+`chain_1_rife_before_upscale`, and pass `--conf my.conf --slot <N>`. For a
+TensorRT comparison, add `native=off` to its `[global]` section. The root
+launchers set all relative runtime paths automatically.
 Use `./ffmpeg`, `./ffprobe`, `./trtexec`, `./aji_harness` and
 `./aji_kernel_test` when invoking the bundled tools.
 
@@ -108,5 +114,5 @@ different GPU/TensorRT environments.
 
 Run `sha256sum -c SHA256SUMS` to verify all extracted files.
 
-APISR is available as option 12 in `generate_cmd.sh` or with `--slot 2005`.
-Input width and height must be even; the first encode builds an engine for that size.
+APISR is available in `generate_cmd.sh` or with `--slot 2005`; the generator
+requires even input width and height for it.
