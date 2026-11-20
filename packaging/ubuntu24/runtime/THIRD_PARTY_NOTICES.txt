@@ -1,0 +1,19 @@
+This runtime bundle contains redistributed third-party components.
+
+NVIDIA CUDA and TensorRT
+  https://docs.nvidia.com/cuda/eula/
+  https://docs.nvidia.com/deeplearning/tensorrt/sla/index.html
+
+FFmpeg and the libraries included by the BtbN GPL shared build
+  https://ffmpeg.org/legal.html
+  https://github.com/BtbN/FFmpeg-Builds
+
+RIFE ONNX source models
+  https://github.com/AmusementClub/vs-mlrt/releases/tag/external-models
+  https://github.com/hzwer/Practical-RIFE
+
+AnimeJaNai models
+  https://github.com/the-database/AnimeJaNai
+
+Package-specific copyright/license files collected during packaging are in
+the licenses/ directory when supplied by the upstream packages.

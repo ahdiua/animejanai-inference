@@ -1,10 +1,13 @@
 build/
 build-deps/
+build-runtime-*/
+dist/
 models/
 fixtures/*.raw
 fixtures/*.png
 fixtures/*.mkv
 sanity/saxpy
 *.engine
+/MEMORY.md
 build-win-release/
 build-win-trt11*/

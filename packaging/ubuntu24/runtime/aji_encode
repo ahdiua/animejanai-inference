@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+RUNTIME_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PATH="${RUNTIME_ROOT}/bin:${PATH}"
+export LD_LIBRARY_PATH="${RUNTIME_ROOT}/build:${RUNTIME_ROOT}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
+has_option() {
+    local wanted="$1"
+    shift
+    local argument
+    for argument in "$@"; do
+        [[ "${argument}" == "${wanted}" ]] && return 0
+    done
+    return 1
+}
+
+arguments=("$@")
+if ! has_option --conf "${arguments[@]}" && ! has_option --engine "${arguments[@]}"; then
+    arguments+=(--conf "${RUNTIME_ROOT}/animejanai.conf")
+    arguments+=(--model-dir "${RUNTIME_ROOT}/onnx")
+    arguments+=(--rife-model-dir "${RUNTIME_ROOT}/onnx/rife")
+    if ! has_option --slot "${arguments[@]}"; then
+        arguments+=(--slot "${AJI_SLOT:-1003}")
+    fi
+elif has_option --conf "${arguments[@]}"; then
+    has_option --model-dir "${arguments[@]}" \
+        || arguments+=(--model-dir "${RUNTIME_ROOT}/onnx")
+    has_option --rife-model-dir "${arguments[@]}" \
+        || arguments+=(--rife-model-dir "${RUNTIME_ROOT}/onnx/rife")
+elif has_option --rife-model "${arguments[@]}" \
+     && ! has_option --rife-model-dir "${arguments[@]}"; then
+    arguments+=(--rife-model-dir "${RUNTIME_ROOT}/onnx/rife")
+fi
+
+if ! has_option --trtexec "${arguments[@]}"; then
+    arguments+=(--trtexec "${RUNTIME_ROOT}/bin/trtexec.real")
+fi
+
+exec "${RUNTIME_ROOT}/build/aji_encode" "${arguments[@]}"
