@@ -2564,10 +2564,11 @@ static int finalize_output(enc_ctx *c)
         AV(avio_open(&c->ofmt->pb, c->o.output, AVIO_FLAG_WRITE));
     }
 
-    AVDictionary *mopt = NULL;
-    av_dict_set_int(&mopt, "max_interleave_delta", 0, 0);
-    int r = avformat_write_header(c->ofmt, &mopt);
-    av_dict_free(&mopt);
+    /* Keep libavformat's finite interleave bound (max_interleave_delta,
+     * 10 s by default). Zero waits for a packet from every stream before
+     * writing, so a sparse subtitle track (one sign at the start) keeps the
+     * whole encoded video in memory until the trailer. */
+    int r = avformat_write_header(c->ofmt, NULL);
     if (r < 0) { AV(r); }
     c->opened = 1;
 
